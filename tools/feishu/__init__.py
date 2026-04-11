@@ -3,6 +3,7 @@
 from . import ask_user_question  # noqa: F401
 from . import calendar  # noqa: F401
 from . import calendar_event  # noqa: F401
+from . import calendar_freebusy  # noqa: F401
 from . import docs  # noqa: F401
 from . import drive  # noqa: F401
 from . import im  # noqa: F401

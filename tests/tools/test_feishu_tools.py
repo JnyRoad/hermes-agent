@@ -24,6 +24,7 @@ def test_feishu_toolset_is_included_in_hermes_feishu():
     assert "feishu_im_user_message" in resolved
     assert "feishu_calendar_calendar" in resolved
     assert "feishu_calendar_event" in resolved
+    assert "feishu_calendar_freebusy" in resolved
     assert "feishu_task_task" in resolved
     assert "feishu_task_tasklist" in resolved
     assert "feishu_task_comment" in resolved
@@ -290,6 +291,26 @@ def test_feishu_calendar_event_delete_handler(monkeypatch):
     monkeypatch.setattr("tools.feishu.calendar_event.feishu_api_request", _fake_request)
     payload = json.loads(_handle_calendar_event({"action": "delete", "event_id": "evt_1"}))
     assert payload["success"] is True
+
+
+def test_feishu_calendar_freebusy_list_handler(monkeypatch):
+    from tools.feishu.calendar_freebusy import _handle_calendar_freebusy
+
+    monkeypatch.setattr(
+        "tools.feishu.calendar_freebusy.feishu_api_request",
+        lambda *a, **kw: {"data": {"freebusy_lists": [{"user_id": "ou_1", "busy": []}]}},
+    )
+    payload = json.loads(
+        _handle_calendar_freebusy(
+            {
+                "action": "list",
+                "time_min": "2024-03-01T10:00:00+08:00",
+                "time_max": "2024-03-01T11:00:00+08:00",
+                "user_ids": ["ou_1"],
+            }
+        )
+    )
+    assert payload["freebusy_lists"][0]["user_id"] == "ou_1"
 
 
 def test_feishu_task_task_create_handler(monkeypatch):
