@@ -20,6 +20,8 @@ def test_feishu_toolset_is_included_in_hermes_feishu():
     assert "feishu_search_doc_wiki" in resolved
     assert "feishu_fetch_doc" in resolved
     assert "feishu_ask_user_question" in resolved
+    assert "feishu_chat" in resolved
+    assert "feishu_chat_members" in resolved
     assert "feishu_im_user_search_messages" in resolved
     assert "feishu_im_user_message" in resolved
     assert "feishu_calendar_calendar" in resolved
@@ -72,6 +74,40 @@ def test_feishu_drive_file_list_handler(monkeypatch):
     )
     payload = json.loads(_handle_drive_file({"action": "list", "page_size": 10}))
     assert payload["files"][0]["name"] == "A"
+
+
+def test_feishu_chat_search_handler(monkeypatch):
+    from tools.feishu.chat import _handle_chat
+
+    monkeypatch.setattr(
+        "tools.feishu.chat.feishu_api_request",
+        lambda *a, **kw: {"data": {"items": [{"chat_id": "oc_1", "name": "研发群"}], "has_more": False}},
+    )
+    payload = json.loads(_handle_chat({"action": "search", "query": "研发"}))
+    assert payload["items"][0]["chat_id"] == "oc_1"
+
+
+def test_feishu_chat_get_handler(monkeypatch):
+    from tools.feishu.chat import _handle_chat
+
+    monkeypatch.setattr(
+        "tools.feishu.chat.feishu_api_request",
+        lambda *a, **kw: {"data": {"chat": {"chat_id": "oc_1", "name": "研发群"}}},
+    )
+    payload = json.loads(_handle_chat({"action": "get", "chat_id": "oc_1"}))
+    assert payload["chat"]["name"] == "研发群"
+
+
+def test_feishu_chat_members_handler(monkeypatch):
+    from tools.feishu.chat_members import _handle_chat_members
+
+    monkeypatch.setattr(
+        "tools.feishu.chat_members.feishu_api_request",
+        lambda *a, **kw: {"data": {"items": [{"member_id": "ou_1", "name": "Alice"}], "member_total": 1}},
+    )
+    payload = json.loads(_handle_chat_members({"chat_id": "oc_1"}))
+    assert payload["member_total"] == 1
+    assert payload["items"][0]["member_id"] == "ou_1"
 
 
 def test_feishu_drive_file_get_meta_handler(monkeypatch):

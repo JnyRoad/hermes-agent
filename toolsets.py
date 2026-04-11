@@ -213,6 +213,8 @@ TOOLSETS = {
             "feishu_drive_file",
             "feishu_wiki_space",
             "feishu_wiki_space_node",
+            "feishu_chat",
+            "feishu_chat_members",
             "feishu_calendar_calendar",
             "feishu_calendar_event",
             "feishu_calendar_event_attendee",
