@@ -251,7 +251,110 @@ def _handle_calendar_event(args: dict, **_kw) -> str:
             )
             return json.dumps({"success": True, "event_id": event_id}, ensure_ascii=False)
 
-        return tool_error("Unsupported action. Supported actions: create, list, get, patch, delete")
+        if action == "search":
+            query = str(args.get("query", "")).strip()
+            if not query:
+                return tool_error("Missing required parameter: query")
+            calendar_id = _calendar_id(args)
+            params = {
+                "page_size": max(1, min(int(args.get("page_size", 50) or 50), 500)),
+            }
+            page_token = str(args.get("page_token", "")).strip()
+            if page_token:
+                params["page_token"] = page_token
+            data = feishu_api_request(
+                "POST",
+                f"/open-apis/calendar/v4/calendars/{calendar_id}/events/search",
+                params=params,
+                json_body={"query": query},
+            )
+            payload = data.get("data") or {}
+            items = payload.get("items", [])
+            return json.dumps(
+                {
+                    "events": [_normalize_event_time_fields(item) for item in items if isinstance(item, dict)],
+                    "has_more": bool(payload.get("has_more", False)),
+                    "page_token": payload.get("page_token"),
+                },
+                ensure_ascii=False,
+            )
+
+        if action == "reply":
+            event_id = str(args.get("event_id", "")).strip()
+            rsvp_status = str(args.get("rsvp_status", "")).strip().lower()
+            if not event_id or not rsvp_status:
+                return tool_error("Parameters 'event_id' and 'rsvp_status' are required for reply.")
+            calendar_id = _calendar_id(args)
+            feishu_api_request(
+                "POST",
+                f"/open-apis/calendar/v4/calendars/{calendar_id}/events/{event_id}/reply",
+                json_body={"rsvp_status": rsvp_status},
+            )
+            return json.dumps({"success": True, "event_id": event_id, "rsvp_status": rsvp_status}, ensure_ascii=False)
+
+        if action == "instances":
+            event_id = str(args.get("event_id", "")).strip()
+            start_time = str(args.get("start_time", "")).strip()
+            end_time = str(args.get("end_time", "")).strip()
+            if not event_id or not start_time or not end_time:
+                return tool_error("Parameters 'event_id', 'start_time', and 'end_time' are required for instances.")
+            calendar_id = _calendar_id(args)
+            params = {
+                "start_time": _to_unix_seconds(start_time),
+                "end_time": _to_unix_seconds(end_time),
+                "page_size": max(1, min(int(args.get("page_size", 50) or 50), 500)),
+            }
+            page_token = str(args.get("page_token", "")).strip()
+            if page_token:
+                params["page_token"] = page_token
+            data = feishu_api_request(
+                "GET",
+                f"/open-apis/calendar/v4/calendars/{calendar_id}/events/{event_id}/instances",
+                params=params,
+            )
+            payload = data.get("data") or {}
+            items = payload.get("items", [])
+            return json.dumps(
+                {
+                    "instances": [_normalize_event_time_fields(item) for item in items if isinstance(item, dict)],
+                    "has_more": bool(payload.get("has_more", False)),
+                    "page_token": payload.get("page_token"),
+                },
+                ensure_ascii=False,
+            )
+
+        if action == "instance_view":
+            start_time = str(args.get("start_time", "")).strip()
+            end_time = str(args.get("end_time", "")).strip()
+            if not start_time or not end_time:
+                return tool_error("Parameters 'start_time' and 'end_time' are required for instance_view.")
+            calendar_id = _calendar_id(args)
+            params = {
+                "start_time": _to_unix_seconds(start_time),
+                "end_time": _to_unix_seconds(end_time),
+                "user_id_type": "open_id",
+                "page_size": max(1, min(int(args.get("page_size", 50) or 50), 500)),
+            }
+            page_token = str(args.get("page_token", "")).strip()
+            if page_token:
+                params["page_token"] = page_token
+            data = feishu_api_request(
+                "GET",
+                f"/open-apis/calendar/v4/calendars/{calendar_id}/events/instance_view",
+                params=params,
+            )
+            payload = data.get("data") or {}
+            items = payload.get("items", [])
+            return json.dumps(
+                {
+                    "events": [_normalize_event_time_fields(item) for item in items if isinstance(item, dict)],
+                    "has_more": bool(payload.get("has_more", False)),
+                    "page_token": payload.get("page_token"),
+                },
+                ensure_ascii=False,
+            )
+
+        return tool_error("Unsupported action. Supported actions: create, list, get, patch, delete, search, reply, instances, instance_view")
     except Exception as exc:
         logger.error("feishu_calendar_event error: %s", exc)
         return tool_error(f"Failed to execute feishu_calendar_event: {exc}")
@@ -259,17 +362,21 @@ def _handle_calendar_event(args: dict, **_kw) -> str:
 
 FEISHU_CALENDAR_EVENT_SCHEMA = {
     "name": "feishu_calendar_event",
-    "description": "Manage Feishu calendar events. Supported actions in Hermes now: create, list, get, patch, and delete.",
+    "description": "Manage Feishu calendar events. Supported actions in Hermes now: create, list, get, patch, delete, search, reply, instances, and instance_view.",
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["create", "list", "get", "patch", "delete"], "description": "Calendar event action."},
+            "action": {"type": "string", "enum": ["create", "list", "get", "patch", "delete", "search", "reply", "instances", "instance_view"], "description": "Calendar event action."},
             "calendar_id": {"type": "string", "description": "Calendar ID. Defaults to the primary calendar."},
             "event_id": {"type": "string", "description": "Event ID for get, patch, or delete action."},
             "summary": {"type": "string", "description": "Event summary for create or patch action."},
             "description": {"type": "string", "description": "Event description for create or patch action."},
             "start_time": {"type": "string", "description": "ISO 8601 start time for create, list, or patch action."},
             "end_time": {"type": "string", "description": "ISO 8601 end time for create, list, or patch action."},
+            "query": {"type": "string", "description": "Keyword query for search action."},
+            "page_size": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Page size for search, instances, or instance_view action."},
+            "page_token": {"type": "string", "description": "Pagination token for search, instances, or instance_view action."},
+            "rsvp_status": {"type": "string", "enum": ["accept", "decline", "tentative"], "description": "RSVP status for reply action."},
             "user_open_id": {"type": "string", "description": "Current user open_id for attendee backfill during create."},
             "attendees": {"type": "array", "description": "Attendees for create action.", "items": {"type": "object"}},
             "vchat": {"type": "object", "description": "Video meeting config for create action."},

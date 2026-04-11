@@ -294,6 +294,89 @@ def test_feishu_calendar_event_delete_handler(monkeypatch):
     assert payload["success"] is True
 
 
+def test_feishu_calendar_event_search_handler(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    def _fake_request(method, path, **kwargs):
+        if path == "/open-apis/calendar/v4/calendars/primary":
+            return {"data": {"calendars": [{"calendar": {"calendar_id": "cal_1"}}]}}
+        if path == "/open-apis/calendar/v4/calendars/cal_1/events/search":
+            return {"data": {"items": [{"event_id": "evt_2", "summary": "Match"}], "has_more": False}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr("tools.feishu.calendar_event.feishu_api_request", _fake_request)
+    payload = json.loads(_handle_calendar_event({"action": "search", "query": "Match"}))
+    assert payload["events"][0]["event_id"] == "evt_2"
+
+
+def test_feishu_calendar_event_reply_handler(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    def _fake_request(method, path, **kwargs):
+        if path == "/open-apis/calendar/v4/calendars/primary":
+            return {"data": {"calendars": [{"calendar": {"calendar_id": "cal_1"}}]}}
+        if path == "/open-apis/calendar/v4/calendars/cal_1/events/evt_1/reply":
+            return {"data": {}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr("tools.feishu.calendar_event.feishu_api_request", _fake_request)
+    payload = json.loads(_handle_calendar_event({"action": "reply", "event_id": "evt_1", "rsvp_status": "accept"}))
+    assert payload["success"] is True
+    assert payload["rsvp_status"] == "accept"
+
+
+def test_feishu_calendar_event_instances_handler(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    def _fake_request(method, path, **kwargs):
+        if path == "/open-apis/calendar/v4/calendars/primary":
+            return {"data": {"calendars": [{"calendar": {"calendar_id": "cal_1"}}]}}
+        if path == "/open-apis/calendar/v4/calendars/cal_1/events/evt_1/instances":
+            return {
+                "data": {
+                    "items": [{"event_id": "evt_1", "start_time": {"timestamp": "1710000000"}}],
+                    "has_more": False,
+                }
+            }
+        raise AssertionError(path)
+
+    monkeypatch.setattr("tools.feishu.calendar_event.feishu_api_request", _fake_request)
+    payload = json.loads(
+        _handle_calendar_event(
+            {
+                "action": "instances",
+                "event_id": "evt_1",
+                "start_time": "2024-03-01T10:00:00+08:00",
+                "end_time": "2024-03-01T11:00:00+08:00",
+            }
+        )
+    )
+    assert payload["instances"][0]["event_id"] == "evt_1"
+
+
+def test_feishu_calendar_event_instance_view_handler(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    def _fake_request(method, path, **kwargs):
+        if path == "/open-apis/calendar/v4/calendars/primary":
+            return {"data": {"calendars": [{"calendar": {"calendar_id": "cal_1"}}]}}
+        if path == "/open-apis/calendar/v4/calendars/cal_1/events/instance_view":
+            return {"data": {"items": [{"event_id": "evt_3"}], "has_more": False}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr("tools.feishu.calendar_event.feishu_api_request", _fake_request)
+    payload = json.loads(
+        _handle_calendar_event(
+            {
+                "action": "instance_view",
+                "start_time": "2024-03-01T10:00:00+08:00",
+                "end_time": "2024-03-01T11:00:00+08:00",
+            }
+        )
+    )
+    assert payload["events"][0]["event_id"] == "evt_3"
+
+
 def test_feishu_calendar_freebusy_list_handler(monkeypatch):
     from tools.feishu.calendar_freebusy import _handle_calendar_freebusy
 
