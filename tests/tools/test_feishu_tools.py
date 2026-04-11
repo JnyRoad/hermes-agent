@@ -26,6 +26,7 @@ def test_feishu_toolset_is_included_in_hermes_feishu():
     assert "feishu_task_task" in resolved
     assert "feishu_task_tasklist" in resolved
     assert "feishu_task_comment" in resolved
+    assert "feishu_task_subtask" in resolved
 
 
 def test_feishu_get_user_handler(monkeypatch):
@@ -309,6 +310,30 @@ def test_feishu_task_comment_list_handler(monkeypatch):
     )
     payload = json.loads(_handle_task_comment({"action": "list", "resource_id": "task_1"}))
     assert payload["comments"][0]["id"] == "c_1"
+
+
+def test_feishu_task_subtask_create_handler(monkeypatch):
+    from tools.feishu.task_subtask import _handle_task_subtask
+
+    monkeypatch.setattr(
+        "tools.feishu.task_subtask.feishu_api_request",
+        lambda *a, **kw: {"data": {"subtask": {"guid": "sub_1", "summary": "child"}}},
+    )
+    payload = json.loads(
+        _handle_task_subtask({"action": "create", "task_guid": "task_1", "summary": "child"})
+    )
+    assert payload["subtask"]["guid"] == "sub_1"
+
+
+def test_feishu_task_subtask_list_handler(monkeypatch):
+    from tools.feishu.task_subtask import _handle_task_subtask
+
+    monkeypatch.setattr(
+        "tools.feishu.task_subtask.feishu_api_request",
+        lambda *a, **kw: {"data": {"items": [{"guid": "sub_1"}], "has_more": False}},
+    )
+    payload = json.loads(_handle_task_subtask({"action": "list", "task_guid": "task_1"}))
+    assert payload["subtasks"][0]["guid"] == "sub_1"
 
 
 def test_feishu_im_get_messages_handler(monkeypatch):
