@@ -24,6 +24,7 @@ def test_feishu_toolset_is_included_in_hermes_feishu():
     assert "feishu_im_user_message" in resolved
     assert "feishu_calendar_calendar" in resolved
     assert "feishu_task_task" in resolved
+    assert "feishu_task_tasklist" in resolved
 
 
 def test_feishu_get_user_handler(monkeypatch):
@@ -244,6 +245,47 @@ def test_feishu_task_task_patch_handler(monkeypatch):
     )
     payload = json.loads(_handle_task({"action": "patch", "task_guid": "task_1", "summary": "Updated"}))
     assert payload["task"]["summary"] == "Updated"
+
+
+def test_feishu_task_tasklist_create_handler(monkeypatch):
+    from tools.feishu.tasklist import _handle_tasklist
+
+    monkeypatch.setattr(
+        "tools.feishu.tasklist.feishu_api_request",
+        lambda *a, **kw: {"data": {"tasklist": {"guid": "tl_1", "name": "Inbox"}}},
+    )
+    payload = json.loads(_handle_tasklist({"action": "create", "name": "Inbox"}))
+    assert payload["tasklist"]["guid"] == "tl_1"
+
+
+def test_feishu_task_tasklist_tasks_handler(monkeypatch):
+    from tools.feishu.tasklist import _handle_tasklist
+
+    monkeypatch.setattr(
+        "tools.feishu.tasklist.feishu_api_request",
+        lambda *a, **kw: {"data": {"items": [{"guid": "task_1"}], "has_more": False}},
+    )
+    payload = json.loads(_handle_tasklist({"action": "tasks", "tasklist_guid": "tl_1"}))
+    assert payload["tasks"][0]["guid"] == "task_1"
+
+
+def test_feishu_task_tasklist_add_members_handler(monkeypatch):
+    from tools.feishu.tasklist import _handle_tasklist
+
+    monkeypatch.setattr(
+        "tools.feishu.tasklist.feishu_api_request",
+        lambda *a, **kw: {"data": {"tasklist": {"guid": "tl_1"}}},
+    )
+    payload = json.loads(
+        _handle_tasklist(
+            {
+                "action": "add_members",
+                "tasklist_guid": "tl_1",
+                "members": [{"id": "ou_1", "role": "editor"}],
+            }
+        )
+    )
+    assert payload["tasklist"]["guid"] == "tl_1"
 
 
 def test_feishu_im_get_messages_handler(monkeypatch):

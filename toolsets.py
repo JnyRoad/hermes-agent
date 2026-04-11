@@ -220,6 +220,7 @@ TOOLSETS = {
             "feishu_im_user_fetch_resource",
             "feishu_im_user_message",
             "feishu_task_task",
+            "feishu_task_tasklist",
             "feishu_ask_user_question",
             "feishu_oauth",
             "feishu_oauth_batch_auth",
