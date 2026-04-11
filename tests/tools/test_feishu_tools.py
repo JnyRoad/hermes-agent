@@ -24,6 +24,7 @@ def test_feishu_toolset_is_included_in_hermes_feishu():
     assert "feishu_im_user_message" in resolved
     assert "feishu_calendar_calendar" in resolved
     assert "feishu_calendar_event" in resolved
+    assert "feishu_calendar_event_attendee" in resolved
     assert "feishu_calendar_freebusy" in resolved
     assert "feishu_task_task" in resolved
     assert "feishu_task_tasklist" in resolved
@@ -311,6 +312,39 @@ def test_feishu_calendar_freebusy_list_handler(monkeypatch):
         )
     )
     assert payload["freebusy_lists"][0]["user_id"] == "ou_1"
+
+
+def test_feishu_calendar_event_attendee_create_handler(monkeypatch):
+    from tools.feishu.calendar_event_attendee import _handle_calendar_event_attendee
+
+    monkeypatch.setattr(
+        "tools.feishu.calendar_event_attendee.feishu_api_request",
+        lambda *a, **kw: {"data": {"attendees": [{"type": "user", "user_id": "ou_1"}]}},
+    )
+    payload = json.loads(
+        _handle_calendar_event_attendee(
+            {
+                "action": "create",
+                "calendar_id": "cal_1",
+                "event_id": "evt_1",
+                "attendees": [{"type": "user", "attendee_id": "ou_1"}],
+            }
+        )
+    )
+    assert payload["attendees"][0]["user_id"] == "ou_1"
+
+
+def test_feishu_calendar_event_attendee_list_handler(monkeypatch):
+    from tools.feishu.calendar_event_attendee import _handle_calendar_event_attendee
+
+    monkeypatch.setattr(
+        "tools.feishu.calendar_event_attendee.feishu_api_request",
+        lambda *a, **kw: {"data": {"items": [{"type": "user", "user_id": "ou_1"}], "has_more": False}},
+    )
+    payload = json.loads(
+        _handle_calendar_event_attendee({"action": "list", "calendar_id": "cal_1", "event_id": "evt_1"})
+    )
+    assert payload["attendees"][0]["user_id"] == "ou_1"
 
 
 def test_feishu_task_task_create_handler(monkeypatch):
