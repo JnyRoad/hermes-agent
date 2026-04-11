@@ -22,6 +22,8 @@ def test_feishu_toolset_is_included_in_hermes_feishu():
     assert "feishu_ask_user_question" in resolved
     assert "feishu_im_user_search_messages" in resolved
     assert "feishu_im_user_message" in resolved
+    assert "feishu_calendar_calendar" in resolved
+    assert "feishu_task_task" in resolved
 
 
 def test_feishu_get_user_handler(monkeypatch):
@@ -187,6 +189,61 @@ def test_feishu_wiki_space_node_copy_handler(monkeypatch):
         )
     )
     assert payload["node"]["node_token"] == "wik_copy"
+
+
+def test_feishu_calendar_calendar_list_handler(monkeypatch):
+    from tools.feishu.calendar import _handle_calendar
+
+    monkeypatch.setattr(
+        "tools.feishu.calendar.feishu_api_request",
+        lambda *a, **kw: {"data": {"calendar_list": [{"calendar_id": "cal_1"}], "has_more": False}},
+    )
+    payload = json.loads(_handle_calendar({"action": "list"}))
+    assert payload["calendars"][0]["calendar_id"] == "cal_1"
+
+
+def test_feishu_calendar_calendar_primary_handler(monkeypatch):
+    from tools.feishu.calendar import _handle_calendar
+
+    monkeypatch.setattr(
+        "tools.feishu.calendar.feishu_api_request",
+        lambda *a, **kw: {"data": {"calendars": [{"calendar_id": "cal_primary"}]}},
+    )
+    payload = json.loads(_handle_calendar({"action": "primary"}))
+    assert payload["calendars"][0]["calendar_id"] == "cal_primary"
+
+
+def test_feishu_task_task_create_handler(monkeypatch):
+    from tools.feishu.task import _handle_task
+
+    monkeypatch.setattr(
+        "tools.feishu.task.feishu_api_request",
+        lambda *a, **kw: {"data": {"task": {"guid": "task_1", "summary": "Ship"}}},
+    )
+    payload = json.loads(_handle_task({"action": "create", "summary": "Ship"}))
+    assert payload["task"]["guid"] == "task_1"
+
+
+def test_feishu_task_task_list_handler(monkeypatch):
+    from tools.feishu.task import _handle_task
+
+    monkeypatch.setattr(
+        "tools.feishu.task.feishu_api_request",
+        lambda *a, **kw: {"data": {"items": [{"guid": "task_1"}], "has_more": False}},
+    )
+    payload = json.loads(_handle_task({"action": "list"}))
+    assert payload["tasks"][0]["guid"] == "task_1"
+
+
+def test_feishu_task_task_patch_handler(monkeypatch):
+    from tools.feishu.task import _handle_task
+
+    monkeypatch.setattr(
+        "tools.feishu.task.feishu_api_request",
+        lambda *a, **kw: {"data": {"task": {"guid": "task_1", "summary": "Updated"}}},
+    )
+    payload = json.loads(_handle_task({"action": "patch", "task_guid": "task_1", "summary": "Updated"}))
+    assert payload["task"]["summary"] == "Updated"
 
 
 def test_feishu_im_get_messages_handler(monkeypatch):
