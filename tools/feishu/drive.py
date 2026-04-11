@@ -1,0 +1,178 @@
+"""飞书 Drive 基础工具。"""
+
+from __future__ import annotations
+
+import json
+import logging
+
+from tools.feishu.client import feishu_api_request
+from tools.registry import registry, tool_error
+
+logger = logging.getLogger(__name__)
+
+
+def _check_feishu_available() -> bool:
+    try:
+        from tools.feishu.client import get_feishu_credentials
+
+        get_feishu_credentials()
+        return True
+    except Exception:
+        return False
+
+
+def _handle_drive_file(args: dict, **_kw) -> str:
+    action = str(args.get("action", "")).strip().lower()
+    try:
+        if action == "list":
+            params = {
+                "page_size": max(1, min(int(args.get("page_size", 200) or 200), 200)),
+            }
+            folder_token = str(args.get("folder_token", "")).strip()
+            if folder_token:
+                params["folder_token"] = folder_token
+            page_token = str(args.get("page_token", "")).strip()
+            if page_token:
+                params["page_token"] = page_token
+            order_by = str(args.get("order_by", "")).strip()
+            if order_by:
+                params["order_by"] = order_by
+            direction = str(args.get("direction", "")).strip()
+            if direction:
+                params["direction"] = direction
+            data = feishu_api_request("GET", "/open-apis/drive/v1/files", params=params)
+            payload = data.get("data") or {}
+            return json.dumps(
+                {
+                    "files": payload.get("files", []),
+                    "has_more": bool(payload.get("has_more", False)),
+                    "next_page_token": payload.get("next_page_token") or payload.get("page_token"),
+                },
+                ensure_ascii=False,
+            )
+
+        if action == "get_meta":
+            request_docs = args.get("request_docs")
+            if not isinstance(request_docs, list) or not request_docs:
+                return tool_error("Parameter 'request_docs' must be a non-empty array.")
+            data = feishu_api_request(
+                "POST",
+                "/open-apis/drive/v1/metas/batch_query",
+                json_body={"request_docs": request_docs},
+            )
+            payload = data.get("data") or {}
+            return json.dumps(
+                {
+                    "metas": payload.get("metas", []),
+                    "docs": payload.get("docs", payload.get("metas", [])),
+                },
+                ensure_ascii=False,
+            )
+
+        if action == "copy":
+            file_token = str(args.get("file_token", "")).strip()
+            name = str(args.get("name", "")).strip()
+            file_type = str(args.get("type", "")).strip()
+            folder_token = str(args.get("folder_token", "")).strip() or str(args.get("parent_node", "")).strip()
+            if not file_token or not name or not file_type:
+                return tool_error("Parameters 'file_token', 'name', and 'type' are required for copy.")
+            data = feishu_api_request(
+                "POST",
+                f"/open-apis/drive/v1/files/{file_token}/copy",
+                json_body={
+                    "name": name,
+                    "type": file_type,
+                    **({"folder_token": folder_token} if folder_token else {}),
+                },
+            )
+            payload = data.get("data") or {}
+            return json.dumps({"file": payload.get("file", payload)}, ensure_ascii=False)
+
+        if action == "move":
+            file_token = str(args.get("file_token", "")).strip()
+            file_type = str(args.get("type", "")).strip()
+            folder_token = str(args.get("folder_token", "")).strip()
+            if not file_token or not file_type or not folder_token:
+                return tool_error("Parameters 'file_token', 'type', and 'folder_token' are required for move.")
+            data = feishu_api_request(
+                "POST",
+                f"/open-apis/drive/v1/files/{file_token}/move",
+                json_body={
+                    "type": file_type,
+                    "folder_token": folder_token,
+                },
+            )
+            payload = data.get("data") or {}
+            return json.dumps(
+                {
+                    "success": True,
+                    "task_id": payload.get("task_id"),
+                    "file_token": file_token,
+                    "target_folder_token": folder_token,
+                },
+                ensure_ascii=False,
+            )
+
+        return tool_error("Unsupported action. Supported actions: list, get_meta, copy, move")
+    except Exception as exc:
+        logger.error("feishu_drive_file error: %s", exc)
+        return tool_error(f"Failed to execute feishu_drive_file: {exc}")
+
+
+FEISHU_DRIVE_FILE_SCHEMA = {
+    "name": "feishu_drive_file",
+    "description": "Manage Feishu Drive files. Supported actions in Hermes now: list and get_meta.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "get_meta", "copy", "move"],
+                "description": "Drive action to execute.",
+            },
+            "folder_token": {"type": "string", "description": "Folder token for list action."},
+            "parent_node": {"type": "string", "description": "Alias of folder_token for copy action."},
+            "page_size": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Page size for list."},
+            "page_token": {"type": "string", "description": "Pagination token for list."},
+            "order_by": {
+                "type": "string",
+                "enum": ["EditedTime", "CreatedTime"],
+                "description": "Sort key for list.",
+            },
+            "direction": {
+                "type": "string",
+                "enum": ["ASC", "DESC"],
+                "description": "Sort direction for list.",
+            },
+            "request_docs": {
+                "type": "array",
+                "description": "Batch metadata query input for get_meta.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "doc_token": {"type": "string"},
+                        "doc_type": {"type": "string"},
+                    },
+                        "required": ["doc_token", "doc_type"],
+                },
+            },
+            "file_token": {"type": "string", "description": "File token for copy or move action."},
+            "name": {"type": "string", "description": "Target file name for copy action."},
+            "type": {
+                "type": "string",
+                "enum": ["doc", "sheet", "file", "bitable", "docx", "folder", "mindnote", "slides"],
+                "description": "Drive file type for copy or move action.",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
+registry.register(
+    name="feishu_drive_file",
+    toolset="feishu",
+    schema=FEISHU_DRIVE_FILE_SCHEMA,
+    handler=_handle_drive_file,
+    check_fn=_check_feishu_available,
+    emoji="🪽",
+)

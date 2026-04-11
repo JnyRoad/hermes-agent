@@ -201,6 +201,30 @@ TOOLSETS = {
         "includes": []
     },
 
+    "feishu": {
+        "description": "Feishu workspace tools for people, search, user interaction, and authorization prompts",
+        "tools": [
+            "feishu_get_user",
+            "feishu_search_user",
+            "feishu_search_doc_wiki",
+            "feishu_fetch_doc",
+            "feishu_create_doc",
+            "feishu_update_doc",
+            "feishu_drive_file",
+            "feishu_wiki_space",
+            "feishu_wiki_space_node",
+            "feishu_im_user_get_messages",
+            "feishu_im_user_get_thread_messages",
+            "feishu_im_user_search_messages",
+            "feishu_im_user_fetch_resource",
+            "feishu_im_user_message",
+            "feishu_ask_user_question",
+            "feishu_oauth",
+            "feishu_oauth_batch_auth",
+        ],
+        "includes": []
+    },
+
 
     # Scenario-specific toolsets
     
@@ -350,7 +374,7 @@ TOOLSETS = {
     "hermes-feishu": {
         "description": "Feishu/Lark bot toolset - enterprise messaging via Feishu/Lark (full access)",
         "tools": _HERMES_CORE_TOOLS,
-        "includes": []
+        "includes": ["feishu"]
     },
 
     "hermes-weixin": {

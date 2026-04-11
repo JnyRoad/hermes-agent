@@ -1,0 +1,448 @@
+"""飞书文档工具。
+
+当前实现优先保证可用闭环：
+- 读取：使用 docx raw_content
+- 写入：使用 docx block API 按段落重建内容
+
+这意味着更新阶段会把输入内容降级为“文本段落”写回文档，
+优先保证内容正确落盘，再逐步演进到更高保真的块级 Markdown 转换。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import uuid
+from typing import Any, Dict, List, Optional
+
+from tools.feishu.client import feishu_api_request
+from tools.registry import registry, tool_error
+
+logger = logging.getLogger(__name__)
+
+_DOC_URL_RE = re.compile(r"/docx/([A-Za-z0-9]+)")
+_DOC_TOKEN_RE = re.compile(r"^[A-Za-z0-9]{10,}$")
+_MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*")
+_MD_LIST_RE = re.compile(r"^\s*([-*+]|\d+\.)\s+")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_MD_EMPHASIS_RE = re.compile(r"(\*\*|__|\*|_|~~|`)")
+
+
+def _check_feishu_available() -> bool:
+    try:
+        from tools.feishu.client import get_feishu_credentials
+
+        get_feishu_credentials()
+        return True
+    except Exception:
+        return False
+
+
+def _extract_doc_id(value: str) -> str:
+    trimmed = str(value or "").strip()
+    if not trimmed:
+        raise ValueError("Document ID or URL is required.")
+    match = _DOC_URL_RE.search(trimmed)
+    if match:
+        return match.group(1)
+    if _DOC_TOKEN_RE.match(trimmed):
+        return trimmed
+    raise ValueError(f"Could not extract Feishu document ID from: {trimmed}")
+
+
+def _normalize_markdown_to_paragraphs(markdown: str) -> List[str]:
+    """将 Markdown 近似转换为文档段落文本。
+
+    这里保留内容语义，去掉大多数 Markdown 标记，避免用户看到原始符号。
+    """
+    text = str(markdown or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = _MD_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2)})", text)
+    paragraphs: List[str] = []
+    for raw_line in text.split("\n"):
+        line = raw_line.rstrip()
+        line = _MD_HEADING_RE.sub("", line)
+        line = _MD_LIST_RE.sub("", line)
+        line = _MD_EMPHASIS_RE.sub("", line)
+        line = line.strip()
+        paragraphs.append(line)
+    while paragraphs and paragraphs[0] == "":
+        paragraphs.pop(0)
+    while paragraphs and paragraphs[-1] == "":
+        paragraphs.pop()
+    return paragraphs or [""]
+
+
+def _build_text_block(text: str) -> Dict[str, Any]:
+    content = text if text else " "
+    return {
+        "block_type": 2,
+        "text": {
+            "elements": [
+                {
+                    "text_run": {
+                        "content": content,
+                    }
+                }
+            ],
+            "style": {},
+        },
+    }
+
+
+def _get_doc_meta(document_id: str) -> Dict[str, Any]:
+    return feishu_api_request("GET", f"/open-apis/docx/v1/documents/{document_id}")
+
+
+def _get_doc_raw_content(document_id: str) -> Dict[str, Any]:
+    return feishu_api_request("GET", f"/open-apis/docx/v1/documents/{document_id}/raw_content")
+
+
+def _list_root_children(document_id: str) -> List[Dict[str, Any]]:
+    children: List[Dict[str, Any]] = []
+    page_token: Optional[str] = None
+    while True:
+        params: Dict[str, Any] = {
+            "page_size": 500,
+            "document_revision_id": -1,
+        }
+        if page_token:
+            params["page_token"] = page_token
+        data = feishu_api_request(
+            "GET",
+            f"/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}/children",
+            params=params,
+        )
+        payload = data.get("data") or {}
+        batch = payload.get("items") or payload.get("children") or []
+        if isinstance(batch, list):
+            children.extend(item for item in batch if isinstance(item, dict))
+        page_token = payload.get("page_token")
+        if not payload.get("has_more"):
+            break
+    return children
+
+
+def _delete_root_children(document_id: str, child_ids: List[str]) -> None:
+    if not child_ids:
+        return
+    for index in range(0, len(child_ids), 200):
+        batch = child_ids[index:index + 200]
+        feishu_api_request(
+            "DELETE",
+            f"/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}/children/batch_delete",
+            params={"document_revision_id": -1, "client_token": str(uuid.uuid4())},
+            json_body={"children": batch},
+        )
+
+
+def _append_blocks(document_id: str, paragraphs: List[str], *, start_index: int) -> None:
+    blocks = [_build_text_block(item) for item in paragraphs]
+    for index in range(0, len(blocks), 50):
+        chunk = blocks[index:index + 50]
+        feishu_api_request(
+            "POST",
+            f"/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}/children",
+            params={"document_revision_id": -1, "client_token": str(uuid.uuid4())},
+            json_body={
+                "index": start_index + index,
+                "children": chunk,
+            },
+        )
+
+
+def _rewrite_document_content(document_id: str, content: str) -> Dict[str, Any]:
+    """用新的全文内容重建文档。
+
+    规则：
+    - 先读根子块，再删除，再按顺序插入新段落
+    - 返回最终段落数，供上层工具结果使用
+    """
+    children = _list_root_children(document_id)
+    child_ids = [str(item.get("block_id", "")).strip() for item in children if str(item.get("block_id", "")).strip()]
+    _delete_root_children(document_id, child_ids)
+    paragraphs = _normalize_markdown_to_paragraphs(content)
+    _append_blocks(document_id, paragraphs, start_index=0)
+    return {"paragraph_count": len(paragraphs)}
+
+
+def _slice_content(content: str, offset: int = 0, limit: Optional[int] = None) -> str:
+    if offset < 0:
+        offset = 0
+    if limit is None:
+        return content[offset:]
+    return content[offset:offset + limit]
+
+
+def _resolve_selection(content: str, *, selection_with_ellipsis: str = "", selection_by_title: str = "") -> tuple[int, int]:
+    if selection_with_ellipsis:
+        if "..." not in selection_with_ellipsis:
+            raise ValueError("selection_with_ellipsis must contain '...'.")
+        start_text, end_text = selection_with_ellipsis.split("...", 1)
+        start_idx = content.find(start_text)
+        if start_idx < 0:
+            raise ValueError("selection_with_ellipsis start marker not found.")
+        end_idx = content.find(end_text, start_idx + len(start_text))
+        if end_idx < 0:
+            raise ValueError("selection_with_ellipsis end marker not found.")
+        return start_idx, end_idx + len(end_text)
+
+    if selection_by_title:
+        lines = content.splitlines(keepends=True)
+        stripped_title = selection_by_title.strip()
+        cursor = 0
+        for index, line in enumerate(lines):
+            line_stripped = line.strip()
+            if line_stripped == stripped_title:
+                start = cursor
+                end = len(content)
+                for later in lines[index + 1:]:
+                    if later.lstrip().startswith("#"):
+                        end = cursor + len(line)
+                        break
+                    cursor += len(later)
+                else:
+                    cursor += len(line)
+                if end == len(content):
+                    running = 0
+                    for item in lines[:index]:
+                        running += len(item)
+                    return running, len(content)
+        raise ValueError("selection_by_title not found.")
+
+    raise ValueError("A selection expression is required for this mode.")
+
+
+def _apply_update_mode(
+    *,
+    current_content: str,
+    mode: str,
+    markdown: str,
+    selection_with_ellipsis: str = "",
+    selection_by_title: str = "",
+) -> str:
+    if mode in {"overwrite", "replace_all"}:
+        return markdown
+    if mode == "append":
+        if not current_content.strip():
+            return markdown
+        return f"{current_content.rstrip()}\n\n{markdown.lstrip()}"
+
+    start, end = _resolve_selection(
+        current_content,
+        selection_with_ellipsis=selection_with_ellipsis,
+        selection_by_title=selection_by_title,
+    )
+    if mode == "replace_range":
+        return current_content[:start] + markdown + current_content[end:]
+    if mode == "insert_before":
+        return current_content[:start] + markdown + "\n" + current_content[start:]
+    if mode == "insert_after":
+        return current_content[:end] + "\n" + markdown + current_content[end:]
+    if mode == "delete_range":
+        return current_content[:start] + current_content[end:]
+    raise ValueError(f"Unsupported update mode: {mode}")
+
+
+def _handle_fetch_doc(args: dict, **_kw) -> str:
+    try:
+        document_id = _extract_doc_id(args.get("doc_id", ""))
+        offset = int(args.get("offset", 0) or 0)
+        limit = args.get("limit")
+        limit_value = int(limit) if limit is not None else None
+        meta = _get_doc_meta(document_id)
+        raw = _get_doc_raw_content(document_id)
+        title = ((meta.get("data") or {}).get("document") or {}).get("title")
+        content = ((raw.get("data") or {}).get("content") or "")
+        sliced = _slice_content(str(content), offset=offset, limit=limit_value)
+        return json.dumps(
+            {
+                "document_id": document_id,
+                "title": title,
+                "content": sliced,
+                "total_chars": len(str(content)),
+                "offset": offset,
+                "limit": limit_value,
+                "has_more": offset + len(sliced) < len(str(content)),
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        logger.error("feishu_fetch_doc error: %s", exc)
+        return tool_error(f"Failed to fetch Feishu doc: {exc}")
+
+
+def _handle_create_doc(args: dict, **_kw) -> str:
+    try:
+        title = str(args.get("title", "")).strip()
+        markdown = str(args.get("markdown", "") or "")
+        if not title:
+            return tool_error("Missing required parameter: title")
+        if args.get("task_id"):
+            return tool_error("task_id polling is not implemented in Hermes yet.")
+        target_flags = [args.get("folder_token"), args.get("wiki_node"), args.get("wiki_space")]
+        if len([item for item in target_flags if item]) > 1:
+            return tool_error("folder_token, wiki_node, and wiki_space are mutually exclusive.")
+
+        data = feishu_api_request(
+            "POST",
+            "/open-apis/docx/v1/documents",
+            json_body={"title": title},
+        )
+        document = (data.get("data") or {}).get("document") or {}
+        document_id = str(document.get("document_id") or document.get("document_id", "")).strip()
+        if not document_id:
+            document_id = str(document.get("document_id", "")).strip() or str(document.get("document_token", "")).strip()
+        if not document_id:
+            document_id = str((data.get("data") or {}).get("document_id", "")).strip()
+        if not document_id:
+            return tool_error("Document was created but no document_id was returned.")
+
+        write_result = None
+        if markdown.strip():
+            write_result = _rewrite_document_content(document_id, markdown)
+
+        return json.dumps(
+            {
+                "document_id": document_id,
+                "title": title,
+                "initialized": bool(markdown.strip()),
+                "write_result": write_result,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        logger.error("feishu_create_doc error: %s", exc)
+        return tool_error(f"Failed to create Feishu doc: {exc}")
+
+
+def _handle_update_doc(args: dict, **_kw) -> str:
+    mode = str(args.get("mode", "")).strip().lower()
+    if not mode:
+        return tool_error("Missing required parameter: mode")
+    if args.get("task_id"):
+        return tool_error("task_id polling is not implemented in Hermes yet.")
+
+    try:
+        document_id = _extract_doc_id(args.get("doc_id", ""))
+        markdown = str(args.get("markdown", "") or "")
+        selection_with_ellipsis = str(args.get("selection_with_ellipsis", "") or "")
+        selection_by_title = str(args.get("selection_by_title", "") or "")
+        current = _get_doc_raw_content(document_id)
+        current_content = str(((current.get("data") or {}).get("content") or ""))
+        next_content = _apply_update_mode(
+            current_content=current_content,
+            mode=mode,
+            markdown=markdown,
+            selection_with_ellipsis=selection_with_ellipsis,
+            selection_by_title=selection_by_title,
+        )
+        write_result = _rewrite_document_content(document_id, next_content)
+        result = {
+            "document_id": document_id,
+            "mode": mode,
+            "updated": True,
+            "paragraph_count": write_result["paragraph_count"],
+        }
+        new_title = str(args.get("new_title", "") or "").strip()
+        if new_title:
+            result["title_update_note"] = "Document title update is not implemented yet."
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        logger.error("feishu_update_doc error: %s", exc)
+        return tool_error(f"Failed to update Feishu doc: {exc}")
+
+
+FEISHU_FETCH_DOC_SCHEMA = {
+    "name": "feishu_fetch_doc",
+    "description": "Fetch a Feishu doc by document ID or URL. Returns title and raw text content, with optional pagination by character offset.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "doc_id": {"type": "string", "description": "Feishu document ID or full document URL."},
+            "offset": {"type": "integer", "minimum": 0, "description": "Character offset for paginated reads."},
+            "limit": {"type": "integer", "minimum": 1, "description": "Maximum characters to return."},
+        },
+        "required": ["doc_id"],
+    },
+}
+
+FEISHU_CREATE_DOC_SCHEMA = {
+    "name": "feishu_create_doc",
+    "description": "Create a Feishu doc. When markdown is provided, Hermes writes a simplified paragraph-based rendering into the new document.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Document title."},
+            "markdown": {"type": "string", "description": "Initial Markdown content to render into the document."},
+            "folder_token": {"type": "string", "description": "Reserved for future folder placement support."},
+            "wiki_node": {"type": "string", "description": "Reserved for future wiki placement support."},
+            "wiki_space": {"type": "string", "description": "Reserved for future wiki space placement support."},
+            "task_id": {"type": "string", "description": "Reserved for future async task polling support."},
+        },
+        "required": ["title"],
+    },
+}
+
+FEISHU_UPDATE_DOC_SCHEMA = {
+    "name": "feishu_update_doc",
+    "description": "Update a Feishu doc by rewriting its text content. Supports overwrite, append, replace_all, replace_range, insert_before, insert_after, and delete_range.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "doc_id": {"type": "string", "description": "Feishu document ID or URL."},
+            "markdown": {"type": "string", "description": "New content to apply for the selected mode."},
+            "mode": {
+                "type": "string",
+                "enum": [
+                    "overwrite",
+                    "append",
+                    "replace_range",
+                    "replace_all",
+                    "insert_before",
+                    "insert_after",
+                    "delete_range",
+                ],
+                "description": "Update mode.",
+            },
+            "selection_with_ellipsis": {
+                "type": "string",
+                "description": "Range locator in the form 'start...end'. Required for replace_range, insert_before, insert_after, delete_range unless selection_by_title is used.",
+            },
+            "selection_by_title": {
+                "type": "string",
+                "description": "Heading text used to select a section. Alternative to selection_with_ellipsis for range-based modes.",
+            },
+            "new_title": {"type": "string", "description": "Reserved for future document title update support."},
+            "task_id": {"type": "string", "description": "Reserved for future async task polling support."},
+        },
+        "required": ["doc_id", "mode"],
+    },
+}
+
+registry.register(
+    name="feishu_fetch_doc",
+    toolset="feishu",
+    schema=FEISHU_FETCH_DOC_SCHEMA,
+    handler=_handle_fetch_doc,
+    check_fn=_check_feishu_available,
+    emoji="🪽",
+)
+
+registry.register(
+    name="feishu_create_doc",
+    toolset="feishu",
+    schema=FEISHU_CREATE_DOC_SCHEMA,
+    handler=_handle_create_doc,
+    check_fn=_check_feishu_available,
+    emoji="🪽",
+)
+
+registry.register(
+    name="feishu_update_doc",
+    toolset="feishu",
+    schema=FEISHU_UPDATE_DOC_SCHEMA,
+    handler=_handle_update_doc,
+    check_fn=_check_feishu_available,
+    emoji="🪽",
+)

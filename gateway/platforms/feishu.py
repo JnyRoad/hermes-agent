@@ -278,6 +278,13 @@ class FeishuAdapterSettings:
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
+    reply_mode: str = "auto"
+    dm_policy: str = "open"
+    thread_session: bool = False
+    workspace_tools_enabled: bool = True
+    streaming_cards_enabled: bool = True
+    block_streaming_enabled: bool = True
+    block_streaming_coalesce_ms: int = 600
 
 
 @dataclass
@@ -294,6 +301,31 @@ class FeishuBatchState:
     events: Dict[str, MessageEvent] = field(default_factory=dict)
     tasks: Dict[str, asyncio.Task] = field(default_factory=dict)
     counts: Dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class FeishuPendingQuestion:
+    """等待用户点击回答的问题卡状态。"""
+
+    question_id: str
+    chat_id: str
+    message_id: str
+    question: str
+    options: List[str]
+    header: str
+    note: str = ""
+
+
+@dataclass
+class FeishuPendingOAuthRequest:
+    """等待用户确认已完成后台授权的授权提示状态。"""
+
+    request_id: str
+    chat_id: str
+    message_id: str
+    scopes: List[str]
+    reason: str
+    title: str
 
 
 # ---------------------------------------------------------------------------
@@ -1062,6 +1094,8 @@ class FeishuAdapter(BasePlatformAdapter):
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
+        self._pending_questions: Dict[str, FeishuPendingQuestion] = {}
+        self._pending_oauth_requests: Dict[str, FeishuPendingOAuthRequest] = {}
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1142,6 +1176,17 @@ class FeishuAdapter(BasePlatformAdapter):
             admins=admins,
             default_group_policy=default_group_policy,
             group_rules=group_rules,
+            reply_mode=str(extra.get("reply_mode", "auto")).strip().lower() or "auto",
+            dm_policy=str(extra.get("dm_policy", "open")).strip().lower() or "open",
+            thread_session=_to_boolean(extra.get("thread_session")),
+            workspace_tools_enabled=_to_boolean(extra.get("tools_enabled", True)),
+            streaming_cards_enabled=_to_boolean(extra.get("streaming", True)),
+            block_streaming_enabled=_to_boolean(extra.get("block_streaming", True)),
+            block_streaming_coalesce_ms=_coerce_required_int(
+                extra.get("block_streaming_coalesce_ms"),
+                default=600,
+                min_value=50,
+            ),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1172,28 +1217,35 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_reconnect_interval = settings.ws_reconnect_interval
         self._ws_ping_interval = settings.ws_ping_interval
         self._ws_ping_timeout = settings.ws_ping_timeout
+        self._reply_mode = settings.reply_mode
+        self._dm_policy = settings.dm_policy
+        self._thread_session = settings.thread_session
+        self._workspace_tools_enabled = settings.workspace_tools_enabled
+        self._streaming_cards_enabled = settings.streaming_cards_enabled
+        self._block_streaming_enabled = settings.block_streaming_enabled
+        self._block_streaming_coalesce_ms = settings.block_streaming_coalesce_ms
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
             return None
-        return (
-            EventDispatcherHandler.builder(
-                self._encrypt_key,
-                self._verification_token,
-            )
-            .register_p2_im_message_message_read_v1(self._on_message_read_event)
-            .register_p2_im_message_receive_v1(self._on_message_event)
-            .register_p2_im_message_reaction_created_v1(
-                lambda data: self._on_reaction_event("im.message.reaction.created_v1", data)
-            )
-            .register_p2_im_message_reaction_deleted_v1(
-                lambda data: self._on_reaction_event("im.message.reaction.deleted_v1", data)
-            )
-            .register_p2_card_action_trigger(self._on_card_action_trigger)
-            .register_p2_im_chat_member_bot_added_v1(self._on_bot_added_to_chat)
-            .register_p2_im_chat_member_bot_deleted_v1(self._on_bot_removed_from_chat)
-            .build()
+        builder = EventDispatcherHandler.builder(
+            self._encrypt_key,
+            self._verification_token,
         )
+        builder = builder.register_p2_im_message_message_read_v1(self._on_message_read_event)
+        builder = builder.register_p2_im_message_receive_v1(self._on_message_event)
+        builder = builder.register_p2_im_message_reaction_created_v1(
+            lambda data: self._on_reaction_event("im.message.reaction.created_v1", data)
+        )
+        builder = builder.register_p2_im_message_reaction_deleted_v1(
+            lambda data: self._on_reaction_event("im.message.reaction.deleted_v1", data)
+        )
+        builder = builder.register_p2_card_action_trigger(self._on_card_action_trigger)
+        if hasattr(builder, "register_p2_im_chat_member_bot_added_v1"):
+            builder = builder.register_p2_im_chat_member_bot_added_v1(self._on_bot_added_to_chat)
+        if hasattr(builder, "register_p2_im_chat_member_bot_deleted_v1"):
+            builder = builder.register_p2_im_chat_member_bot_deleted_v1(self._on_bot_removed_from_chat)
+        return builder.build()
 
     async def connect(self) -> bool:
         """Connect to Feishu/Lark."""
@@ -1479,6 +1531,187 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[Feishu] send_exec_approval failed: %s", exc)
             return SendResult(success=False, error=str(exc))
+
+    async def send_question_card(
+        self,
+        *,
+        chat_id: str,
+        question: str,
+        options: List[str],
+        header: str = "Question from Hermes",
+        note: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """发送多选问题卡片并记录等待态。
+
+        该卡片通过按钮回调把用户选择重新注入当前会话，避免工具层自行维护消息总线。
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        question_id = f"fq_{uuid.uuid4().hex[:12]}"
+        actions = []
+        for index, option in enumerate(options[:5]):
+            actions.append(
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": option},
+                    "type": "primary" if index == 0 else "default",
+                    "value": {
+                        "hermes_action": "answer_question",
+                        "question_id": question_id,
+                        "answer": option,
+                    },
+                }
+            )
+
+        elements: List[Dict[str, Any]] = [
+            {"tag": "markdown", "content": question},
+        ]
+        if note:
+            elements.append({"tag": "markdown", "content": note})
+        elements.append({"tag": "action", "actions": actions})
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": header, "tag": "plain_text"},
+                "template": "blue",
+            },
+            "elements": elements,
+        }
+
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=json.dumps(card, ensure_ascii=False),
+                reply_to=None,
+                metadata=metadata,
+            )
+            result = self._finalize_send_result(response, "send_question_card failed")
+            if result.success:
+                self._pending_questions[question_id] = FeishuPendingQuestion(
+                    question_id=question_id,
+                    chat_id=chat_id,
+                    message_id=result.message_id or "",
+                    question=question,
+                    options=list(options[:5]),
+                    header=header,
+                    note=note,
+                )
+                result.raw_response = {
+                    **(result.raw_response if isinstance(result.raw_response, dict) else {}),
+                    "question_id": question_id,
+                }
+            return result
+        except Exception as exc:
+            logger.warning("[Feishu] send_question_card failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def send_oauth_request_card(
+        self,
+        *,
+        chat_id: str,
+        scopes: List[str],
+        reason: str,
+        title: str = "Feishu Authorization Required",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """发送人工确认式授权提示卡片。
+
+        当前实现不直接驱动 OAuth 回跳，而是把所需 scopes 明确展示给用户，
+        用户在后台完成授权后点击按钮，系统再把确认消息注入会话继续执行。
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        request_id = f"fo_{uuid.uuid4().hex[:12]}"
+        scope_lines = "\n".join(f"- `{scope}`" for scope in scopes)
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": title, "tag": "plain_text"},
+                "template": "orange",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"{reason}\n\n"
+                        "Please complete the required Feishu app authorization in the developer console, "
+                        "then click the confirmation button below.\n\n"
+                        f"Required scopes:\n{scope_lines}"
+                    ),
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "I Finished Authorization"},
+                            "type": "primary",
+                            "value": {
+                                "hermes_action": "complete_oauth",
+                                "request_id": request_id,
+                            },
+                        }
+                    ],
+                },
+            ],
+        }
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=json.dumps(card, ensure_ascii=False),
+                reply_to=None,
+                metadata=metadata,
+            )
+            result = self._finalize_send_result(response, "send_oauth_request_card failed")
+            if result.success:
+                self._pending_oauth_requests[request_id] = FeishuPendingOAuthRequest(
+                    request_id=request_id,
+                    chat_id=chat_id,
+                    message_id=result.message_id or "",
+                    scopes=list(scopes),
+                    reason=reason,
+                    title=title,
+                )
+                result.raw_response = {
+                    **(result.raw_response if isinstance(result.raw_response, dict) else {}),
+                    "request_id": request_id,
+                }
+            return result
+        except Exception as exc:
+            logger.warning("[Feishu] send_oauth_request_card failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _update_interactive_card(
+        self,
+        *,
+        message_id: str,
+        title: str,
+        body_markdown: str,
+        template: str = "green",
+    ) -> None:
+        """把交互卡片更新为只读状态。"""
+        if not message_id:
+            return
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": title, "tag": "plain_text"},
+                "template": template,
+            },
+            "elements": [
+                {"tag": "markdown", "content": body_markdown},
+            ],
+        }
+        payload = json.dumps(card, ensure_ascii=False)
+        body = self._build_update_message_body(msg_type="interactive", content=payload)
+        request = self._build_update_message_request(message_id=message_id, request_body=body)
+        await asyncio.to_thread(self._client.im.v1.message.update, request)
 
     async def _update_approval_card(
         self, message_id: str, label: str, user_name: str, choice: str,
@@ -1943,6 +2176,96 @@ class FeishuAdapter(BasePlatformAdapter):
         # --- Exec approval button intercept ---
         hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
         if hermes_action:
+            if hermes_action == "answer_question":
+                question_id = str(action_value.get("question_id", "") or "")
+                answer = str(action_value.get("answer", "") or "").strip()
+                state = self._pending_questions.pop(question_id, None)
+                if not state:
+                    logger.debug("[Feishu] Question %s already resolved or unknown", question_id)
+                    return
+
+                sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+                sender_profile = await self._resolve_sender_profile(sender_id)
+                user_name = sender_profile.get("user_name") or open_id
+                await self._update_interactive_card(
+                    message_id=state.message_id,
+                    title=state.header,
+                    body_markdown=(
+                        f"{state.question}\n\n"
+                        f"**Answered by:** {user_name}\n"
+                        f"**Answer:** {answer}"
+                    ),
+                    template="green",
+                )
+
+                chat_info = await self.get_chat_info(chat_id)
+                source = self.build_source(
+                    chat_id=chat_id,
+                    chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
+                    chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type="group"),
+                    user_id=sender_profile["user_id"],
+                    user_name=sender_profile["user_name"],
+                    thread_id=None,
+                    user_id_alt=sender_profile["user_id_alt"],
+                )
+                synthetic_event = MessageEvent(
+                    text=f"{state.question}\nAnswer: {answer}",
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    raw_message=data,
+                    message_id=token or str(uuid.uuid4()),
+                    timestamp=datetime.now(),
+                )
+                logger.info("[Feishu] Routed question answer for %s from %s", question_id, user_name)
+                await self._handle_message_with_guards(synthetic_event)
+                return
+
+            if hermes_action == "complete_oauth":
+                request_id = str(action_value.get("request_id", "") or "")
+                state = self._pending_oauth_requests.pop(request_id, None)
+                if not state:
+                    logger.debug("[Feishu] OAuth request %s already resolved or unknown", request_id)
+                    return
+
+                sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+                sender_profile = await self._resolve_sender_profile(sender_id)
+                user_name = sender_profile.get("user_name") or open_id
+                await self._update_interactive_card(
+                    message_id=state.message_id,
+                    title=state.title,
+                    body_markdown=(
+                        f"{state.reason}\n\n"
+                        f"**Confirmed by:** {user_name}\n"
+                        f"**Scopes:** {', '.join(state.scopes)}"
+                    ),
+                    template="green",
+                )
+
+                chat_info = await self.get_chat_info(chat_id)
+                source = self.build_source(
+                    chat_id=chat_id,
+                    chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
+                    chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type="group"),
+                    user_id=sender_profile["user_id"],
+                    user_name=sender_profile["user_name"],
+                    thread_id=None,
+                    user_id_alt=sender_profile["user_id_alt"],
+                )
+                synthetic_event = MessageEvent(
+                    text=(
+                        "Feishu authorization completed by the user. "
+                        f"Confirmed scopes: {', '.join(state.scopes)}"
+                    ),
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    raw_message=data,
+                    message_id=token or str(uuid.uuid4()),
+                    timestamp=datetime.now(),
+                )
+                logger.info("[Feishu] Routed OAuth completion for %s from %s", request_id, user_name)
+                await self._handle_message_with_guards(synthetic_event)
+                return
+
             approval_id = action_value.get("approval_id")
             state = self._approval_state.pop(approval_id, None)
             if not state:
@@ -2320,6 +2643,28 @@ class FeishuAdapter(BasePlatformAdapter):
             return [FeishuAdapter._namespace_from_mapping(item) for item in value]
         return value
 
+    @staticmethod
+    def _web_response(*, status: int, text: str) -> Any:
+        """构造 webhook 文本响应，并兼容测试中的轻量 mock。"""
+        response = web.Response(status=status, text=text)
+        if not isinstance(getattr(response, "status", None), int):
+            try:
+                response.status = status
+            except Exception:
+                pass
+        return response
+
+    @staticmethod
+    def _web_json_response(payload: Dict[str, Any], *, status: int = 200) -> Any:
+        """构造 webhook JSON 响应，并兼容测试中的轻量 mock。"""
+        response = web.json_response(payload, status=status)
+        if not isinstance(getattr(response, "status", None), int):
+            try:
+                response.status = status
+            except Exception:
+                pass
+        return response
+
     async def _handle_webhook_request(self, request: Any) -> Any:
         remote_ip = (getattr(request, "remote", None) or "unknown")
 
@@ -2328,7 +2673,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._check_webhook_rate_limit(rate_key):
             logger.warning("[Feishu] Webhook rate limit exceeded for %s", remote_ip)
             self._record_webhook_anomaly(remote_ip, "429")
-            return web.Response(status=429, text="Too Many Requests")
+            return self._web_response(status=429, text="Too Many Requests")
 
         # Content-Type guard — Feishu always sends application/json.
         headers = getattr(request, "headers", {}) or {}
@@ -2336,14 +2681,14 @@ class FeishuAdapter(BasePlatformAdapter):
         if content_type and content_type != "application/json":
             logger.warning("[Feishu] Webhook rejected: unexpected Content-Type %r from %s", content_type, remote_ip)
             self._record_webhook_anomaly(remote_ip, "415")
-            return web.Response(status=415, text="Unsupported Media Type")
+            return self._web_response(status=415, text="Unsupported Media Type")
 
         # Body size guard — reject early via Content-Length when present.
         content_length = getattr(request, "content_length", None)
         if content_length is not None and content_length > _FEISHU_WEBHOOK_MAX_BODY_BYTES:
             logger.warning("[Feishu] Webhook body too large (%d bytes) from %s", content_length, remote_ip)
             self._record_webhook_anomaly(remote_ip, "413")
-            return web.Response(status=413, text="Request body too large")
+            return self._web_response(status=413, text="Request body too large")
 
         try:
             body_bytes: bytes = await asyncio.wait_for(
@@ -2353,26 +2698,26 @@ class FeishuAdapter(BasePlatformAdapter):
         except asyncio.TimeoutError:
             logger.warning("[Feishu] Webhook body read timed out after %ds from %s", _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS, remote_ip)
             self._record_webhook_anomaly(remote_ip, "408")
-            return web.Response(status=408, text="Request Timeout")
+            return self._web_response(status=408, text="Request Timeout")
         except Exception:
             self._record_webhook_anomaly(remote_ip, "400")
-            return web.json_response({"code": 400, "msg": "failed to read body"}, status=400)
+            return self._web_json_response({"code": 400, "msg": "failed to read body"}, status=400)
 
         if len(body_bytes) > _FEISHU_WEBHOOK_MAX_BODY_BYTES:
             logger.warning("[Feishu] Webhook body exceeds limit (%d bytes) from %s", len(body_bytes), remote_ip)
             self._record_webhook_anomaly(remote_ip, "413")
-            return web.Response(status=413, text="Request body too large")
+            return self._web_response(status=413, text="Request body too large")
 
         try:
             payload = json.loads(body_bytes.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._record_webhook_anomaly(remote_ip, "400")
-            return web.json_response({"code": 400, "msg": "invalid json"}, status=400)
+            return self._web_json_response({"code": 400, "msg": "invalid json"}, status=400)
 
         # URL verification challenge — respond before other checks so that Feishu's
         # subscription setup works even before encrypt_key is wired.
         if payload.get("type") == "url_verification":
-            return web.json_response({"challenge": payload.get("challenge", "")})
+            return self._web_json_response({"challenge": payload.get("challenge", "")})
 
         # Verification token check — second layer of defence beyond signature (matches openclaw).
         if self._verification_token:
@@ -2381,18 +2726,18 @@ class FeishuAdapter(BasePlatformAdapter):
             if not incoming_token or not hmac.compare_digest(incoming_token, self._verification_token):
                 logger.warning("[Feishu] Webhook rejected: invalid verification token from %s", remote_ip)
                 self._record_webhook_anomaly(remote_ip, "401-token")
-                return web.Response(status=401, text="Invalid verification token")
+                return self._web_response(status=401, text="Invalid verification token")
 
         # Timing-safe signature verification (only enforced when encrypt_key is set).
         if self._encrypt_key and not self._is_webhook_signature_valid(request.headers, body_bytes):
             logger.warning("[Feishu] Webhook rejected: invalid signature from %s", remote_ip)
             self._record_webhook_anomaly(remote_ip, "401-sig")
-            return web.Response(status=401, text="Invalid signature")
+            return self._web_response(status=401, text="Invalid signature")
 
         if payload.get("encrypt"):
             logger.error("[Feishu] Encrypted webhook payloads are not supported by Hermes webhook mode")
             self._record_webhook_anomaly(remote_ip, "400-encrypted")
-            return web.json_response({"code": 400, "msg": "encrypted webhook payloads are not supported"}, status=400)
+            return self._web_json_response({"code": 400, "msg": "encrypted webhook payloads are not supported"}, status=400)
 
         self._clear_webhook_anomaly(remote_ip)
 
@@ -2412,7 +2757,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._on_card_action_trigger(data)
         else:
             logger.debug("[Feishu] Ignoring webhook event type: %s", event_type or "unknown")
-        return web.json_response({"code": 0, "msg": "ok"})
+        return self._web_json_response({"code": 0, "msg": "ok"})
 
     def _is_webhook_signature_valid(self, headers: Any, body_bytes: bytes) -> bool:
         """Verify Feishu webhook signature using timing-safe comparison.

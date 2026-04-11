@@ -1,0 +1,10 @@
+"""飞书工作区工具注册入口。"""
+
+from . import ask_user_question  # noqa: F401
+from . import docs  # noqa: F401
+from . import drive  # noqa: F401
+from . import im  # noqa: F401
+from . import oauth  # noqa: F401
+from . import people  # noqa: F401
+from . import search  # noqa: F401
+from . import wiki  # noqa: F401

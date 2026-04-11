@@ -927,6 +927,12 @@ class GatewayRunner:
             try:
                 await adapter.disconnect()
             finally:
+                try:
+                    from gateway.adapter_registry import unregister_adapter
+
+                    unregister_adapter(adapter.platform, adapter)
+                except Exception:
+                    pass
                 self.adapters.pop(adapter.platform, None)
                 self.delivery_router.adapters = self.adapters
 
@@ -1494,6 +1500,12 @@ class GatewayRunner:
                 success = await adapter.connect()
                 if success:
                     self.adapters[platform] = adapter
+                    try:
+                        from gateway.adapter_registry import register_adapter
+
+                        register_adapter(platform, adapter)
+                    except Exception:
+                        pass
                     self._sync_voice_mode_state_to_adapter(adapter)
                     connected_count += 1
                     logger.info("✓ %s connected", platform.value)
@@ -1802,6 +1814,12 @@ class GatewayRunner:
                     success = await adapter.connect()
                     if success:
                         self.adapters[platform] = adapter
+                        try:
+                            from gateway.adapter_registry import register_adapter
+
+                            register_adapter(platform, adapter)
+                        except Exception:
+                            pass
                         self._sync_voice_mode_state_to_adapter(adapter)
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
@@ -1899,6 +1917,12 @@ class GatewayRunner:
                     logger.debug("✗ %s background-task cancel error: %s", platform.value, e)
                 try:
                     await adapter.disconnect()
+                    try:
+                        from gateway.adapter_registry import unregister_adapter
+
+                        unregister_adapter(platform, adapter)
+                    except Exception:
+                        pass
                     logger.info("✓ %s disconnected", platform.value)
                 except Exception as e:
                     logger.error("✗ %s disconnect error: %s", platform.value, e)
@@ -1910,6 +1934,12 @@ class GatewayRunner:
             self._background_tasks.clear()
 
             self.adapters.clear()
+            try:
+                from gateway.adapter_registry import clear_adapters
+
+                clear_adapters()
+            except Exception:
+                pass
             self._running_agents.clear()
             self._pending_messages.clear()
             self._pending_approvals.clear()
