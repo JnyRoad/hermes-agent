@@ -13,6 +13,7 @@ from . import im  # noqa: F401
 from . import oauth  # noqa: F401
 from . import people  # noqa: F401
 from . import search  # noqa: F401
+from . import sheet  # noqa: F401
 from . import task_comment  # noqa: F401
 from . import task_section  # noqa: F401
 from . import task_subtask  # noqa: F401

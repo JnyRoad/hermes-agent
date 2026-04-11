@@ -18,6 +18,7 @@ def test_feishu_toolset_is_included_in_hermes_feishu():
     resolved = set(resolve_toolset("hermes-feishu"))
     assert "feishu_get_user" in resolved
     assert "feishu_search_doc_wiki" in resolved
+    assert "feishu_sheet" in resolved
     assert "feishu_fetch_doc" in resolved
     assert "feishu_ask_user_question" in resolved
     assert "feishu_chat" in resolved
@@ -63,6 +64,82 @@ def test_feishu_search_doc_wiki_handler(monkeypatch):
     payload = json.loads(_handle_search_doc_wiki({"query": "spec"}))
     assert payload["total"] == 1
     assert payload["results"][0]["title"] == "Spec"
+
+
+def test_feishu_sheet_info_handler(monkeypatch):
+    from tools.feishu.sheet import _handle_sheet
+
+    def _fake_request(method, path, **kwargs):
+        if path == "/open-apis/sheets/v3/spreadsheets/sht_1":
+            return {"data": {"spreadsheet": {"title": "Budget"}}}
+        if path == "/open-apis/sheets/v3/spreadsheets/sht_1/sheets/query":
+            return {"data": {"sheets": [{"sheet_id": "sheet_1", "title": "Sheet1"}]}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr("tools.feishu.sheet.feishu_api_request", _fake_request)
+    payload = json.loads(_handle_sheet({"action": "info", "spreadsheet_token": "sht_1"}))
+    assert payload["title"] == "Budget"
+    assert payload["sheets"][0]["sheet_id"] == "sheet_1"
+
+
+def test_feishu_sheet_read_handler(monkeypatch):
+    from tools.feishu.sheet import _handle_sheet
+
+    monkeypatch.setattr(
+        "tools.feishu.sheet.feishu_api_request",
+        lambda *a, **kw: {
+            "data": {"valueRange": {"range": "sheet_1!A1:B2", "values": [["A", "B"], ["1", "2"]], "revision": 3}}
+        },
+    )
+    payload = json.loads(_handle_sheet({"action": "read", "spreadsheet_token": "sht_1", "range": "sheet_1!A1:B2"}))
+    assert payload["range"] == "sheet_1!A1:B2"
+    assert payload["values"][1][1] == "2"
+
+
+def test_feishu_sheet_write_handler(monkeypatch):
+    from tools.feishu.sheet import _handle_sheet
+
+    monkeypatch.setattr(
+        "tools.feishu.sheet.feishu_api_request",
+        lambda *a, **kw: {
+            "data": {
+                "spreadsheetToken": "sht_1",
+                "revision": 5,
+                "updatedRange": "sheet_1!A1:B2",
+                "updatedRows": 2,
+                "updatedColumns": 2,
+                "updatedCells": 4,
+            }
+        },
+    )
+    payload = json.loads(
+        _handle_sheet(
+            {
+                "action": "write",
+                "spreadsheet_token": "sht_1",
+                "range": "sheet_1!A1:B2",
+                "values": [["A", "B"], ["1", "2"]],
+            }
+        )
+    )
+    assert payload["updated_cells"] == 4
+
+
+def test_feishu_sheet_create_handler(monkeypatch):
+    from tools.feishu.sheet import _handle_sheet
+
+    responses = [
+        {"data": {"spreadsheet": {"spreadsheet_token": "sht_new", "title": "Budget"}}},
+        {"data": {"updatedRange": "sheet_1!A1:B2"}},
+    ]
+
+    monkeypatch.setattr("tools.feishu.sheet.feishu_api_request", lambda *a, **kw: responses.pop(0))
+    monkeypatch.setattr("tools.feishu.sheet._get_default_sheet_id", lambda token: "sheet_1")
+    payload = json.loads(
+        _handle_sheet({"action": "create", "title": "Budget", "headers": ["A", "B"], "data": [["1", "2"]]})
+    )
+    assert payload["spreadsheet_token"] == "sht_new"
+    assert payload["initial_write"] == "sheet_1!A1:B2"
 
 
 def test_feishu_drive_file_list_handler(monkeypatch):
