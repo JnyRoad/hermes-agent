@@ -8,6 +8,7 @@ from . import im  # noqa: F401
 from . import oauth  # noqa: F401
 from . import people  # noqa: F401
 from . import search  # noqa: F401
+from . import task_comment  # noqa: F401
 from . import task  # noqa: F401
 from . import tasklist  # noqa: F401
 from . import wiki  # noqa: F401

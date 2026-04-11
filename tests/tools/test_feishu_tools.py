@@ -25,6 +25,7 @@ def test_feishu_toolset_is_included_in_hermes_feishu():
     assert "feishu_calendar_calendar" in resolved
     assert "feishu_task_task" in resolved
     assert "feishu_task_tasklist" in resolved
+    assert "feishu_task_comment" in resolved
 
 
 def test_feishu_get_user_handler(monkeypatch):
@@ -286,6 +287,28 @@ def test_feishu_task_tasklist_add_members_handler(monkeypatch):
         )
     )
     assert payload["tasklist"]["guid"] == "tl_1"
+
+
+def test_feishu_task_comment_create_handler(monkeypatch):
+    from tools.feishu.task_comment import _handle_task_comment
+
+    monkeypatch.setattr(
+        "tools.feishu.task_comment.feishu_api_request",
+        lambda *a, **kw: {"data": {"comment": {"id": "c_1", "content": "ok"}}},
+    )
+    payload = json.loads(_handle_task_comment({"action": "create", "task_guid": "task_1", "content": "ok"}))
+    assert payload["comment"]["id"] == "c_1"
+
+
+def test_feishu_task_comment_list_handler(monkeypatch):
+    from tools.feishu.task_comment import _handle_task_comment
+
+    monkeypatch.setattr(
+        "tools.feishu.task_comment.feishu_api_request",
+        lambda *a, **kw: {"data": {"items": [{"id": "c_1"}], "has_more": False}},
+    )
+    payload = json.loads(_handle_task_comment({"action": "list", "resource_id": "task_1"}))
+    assert payload["comments"][0]["id"] == "c_1"
 
 
 def test_feishu_im_get_messages_handler(monkeypatch):
