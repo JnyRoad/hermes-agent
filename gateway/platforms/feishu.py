@@ -314,6 +314,7 @@ class FeishuPendingQuestion:
     options: List[str]
     header: str
     note: str = ""
+    thread_id: str = ""
 
 
 @dataclass
@@ -326,6 +327,7 @@ class FeishuPendingOAuthRequest:
     scopes: List[str]
     reason: str
     title: str
+    thread_id: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -1626,8 +1628,60 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        def _normalize_scope_list(items: List[str]) -> List[str]:
+            result: List[str] = []
+            seen = set()
+            for item in items:
+                scope = str(item or "").strip()
+                if not scope or scope in seen:
+                    continue
+                seen.add(scope)
+                result.append(scope)
+            return result
+
+        def _build_oauth_body(scope_items: List[str], reason_text: str) -> str:
+            scope_lines = "\n".join(f"- `{scope}`" for scope in scope_items)
+            return (
+                f"{reason_text}\n\n"
+                "Please complete the required Feishu app authorization in the developer console, "
+                "then click the confirmation button below.\n\n"
+                f"Required scopes:\n{scope_lines}"
+            )
+
         request_id = f"fo_{uuid.uuid4().hex[:12]}"
-        scope_lines = "\n".join(f"- `{scope}`" for scope in scopes)
+        scopes = _normalize_scope_list(scopes)
+        metadata = dict(metadata or {})
+        thread_id = str(metadata.get("thread_id", "") or "").strip()
+
+        for state in self._pending_oauth_requests.values():
+            if state.chat_id != chat_id:
+                continue
+            if (state.thread_id or "") != thread_id:
+                continue
+            merged_scopes = _normalize_scope_list([*state.scopes, *scopes])
+            merged_reason = state.reason
+            if reason and reason != state.reason:
+                merged_reason = f"{state.reason}\n\nAdditional requested scopes were needed by a later action."
+            await self._update_interactive_card(
+                message_id=state.message_id,
+                title=state.title or title,
+                body_markdown=_build_oauth_body(merged_scopes, merged_reason),
+                template="orange",
+                button_label="I Finished Authorization",
+                button_value={
+                    "hermes_action": "complete_oauth",
+                    "request_id": state.request_id,
+                },
+            )
+            state.scopes = merged_scopes
+            state.reason = merged_reason
+            state.title = state.title or title
+            return SendResult(
+                success=True,
+                message_id=state.message_id,
+                raw_response={"request_id": state.request_id, "merged": True},
+            )
+
         card = {
             "config": {"wide_screen_mode": True},
             "header": {
@@ -1637,12 +1691,7 @@ class FeishuAdapter(BasePlatformAdapter):
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": (
-                        f"{reason}\n\n"
-                        "Please complete the required Feishu app authorization in the developer console, "
-                        "then click the confirmation button below.\n\n"
-                        f"Required scopes:\n{scope_lines}"
-                    ),
+                    "content": _build_oauth_body(scopes, reason),
                 },
                 {
                     "tag": "action",
@@ -1677,6 +1726,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     scopes=list(scopes),
                     reason=reason,
                     title=title,
+                    thread_id=thread_id,
                 )
                 result.raw_response = {
                     **(result.raw_response if isinstance(result.raw_response, dict) else {}),
@@ -2205,7 +2255,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type="group"),
                     user_id=sender_profile["user_id"],
                     user_name=sender_profile["user_name"],
-                    thread_id=None,
+                    thread_id=state.thread_id or None,
                     user_id_alt=sender_profile["user_id_alt"],
                 )
                 synthetic_event = MessageEvent(

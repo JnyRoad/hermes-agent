@@ -979,6 +979,46 @@ def test_feishu_oauth_uses_active_adapter(monkeypatch):
         unregister_adapter(Platform.FEISHU, adapter)
 
 
+def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingOAuthRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._client = object()
+    adapter._pending_oauth_requests["fo_existing"] = FeishuPendingOAuthRequest(
+        request_id="fo_existing",
+        chat_id="oc_chat_1",
+        message_id="msg_auth_1",
+        scopes=["contact:user.base:readonly"],
+        reason="Need basic profile.",
+        title="Auth",
+        thread_id="omt_1",
+    )
+    adapter._update_interactive_card = AsyncMock()
+
+    import asyncio
+
+    result = asyncio.run(
+        adapter.send_oauth_request_card(
+            chat_id="oc_chat_1",
+            scopes=["contact:user.base:readonly", "calendar:calendar.readonly"],
+            reason="Need calendar too.",
+            title="Auth",
+            metadata={"thread_id": "omt_1"},
+        )
+    )
+
+    assert result.success is True
+    assert result.raw_response["request_id"] == "fo_existing"
+    assert result.raw_response["merged"] is True
+    state = adapter._pending_oauth_requests["fo_existing"]
+    assert state.scopes == ["contact:user.base:readonly", "calendar:calendar.readonly"]
+    adapter._update_interactive_card.assert_awaited_once()
+
+
 def test_feishu_adapter_routes_question_answer(monkeypatch):
     from gateway.platforms.feishu import FeishuAdapter, FeishuPendingQuestion
 

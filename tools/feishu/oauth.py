@@ -49,7 +49,15 @@ def _check_feishu_runtime() -> bool:
 def _normalize_scopes(raw_scopes) -> list[str]:
     if not isinstance(raw_scopes, list):
         return []
-    return [str(item).strip() for item in raw_scopes if str(item).strip()]
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw_scopes:
+        scope = str(item).strip()
+        if not scope or scope in seen:
+            continue
+        seen.add(scope)
+        result.append(scope)
+    return result
 
 
 def _handle_feishu_oauth(args: dict, **_kw) -> str:
