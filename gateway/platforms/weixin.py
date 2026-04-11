@@ -756,13 +756,15 @@ def _pack_markdown_blocks_for_weixin(content: str, max_length: int) -> List[str]
 
 
 def _split_text_for_weixin_delivery(content: str, max_length: int) -> List[str]:
-    """Split content into sequential Weixin messages.
+    """Split content into Weixin messages only when necessary.
 
-    Prefer one message per top-level line/markdown unit when the author used
-    explicit line breaks. Oversized units fall back to block-aware packing so
-    long code fences still split safely.
+    Preference order:
+    1. If the whole message fits, keep it as a single bubble even if it
+       contains multiple lines. This gives the most card-like experience.
+    2. If it exceeds the platform limit, split it into readable blocks while
+       preserving markdown/code fence boundaries as much as possible.
     """
-    if len(content) <= max_length and "\n" not in content:
+    if len(content) <= max_length:
         return [content]
 
     chunks: List[str] = []
@@ -1425,12 +1427,12 @@ class WeixinAdapter(BasePlatformAdapter):
     async def send_image_file(
         self,
         chat_id: str,
-        path: str,
+        image_path: str,
         caption: str = "",
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        return await self.send_document(chat_id, path, caption=caption, metadata=metadata)
+        return await self.send_document(chat_id, image_path, caption=caption, metadata=metadata)
 
     async def send_document(
         self,
