@@ -214,6 +214,7 @@ TOOLSETS = {
             "feishu_wiki_space",
             "feishu_wiki_space_node",
             "feishu_calendar_calendar",
+            "feishu_calendar_event",
             "feishu_im_user_get_messages",
             "feishu_im_user_get_thread_messages",
             "feishu_im_user_search_messages",
