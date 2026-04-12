@@ -4157,6 +4157,7 @@ class GatewayRunner:
                 "- `/feishu start` — validate Feishu gateway readiness\n"
                 "- `/feishu doctor` — show Feishu diagnostics in chat\n"
                 "- `/feishu auth ...` — inspect or request Feishu user authorization\n"
+                "- `/feishu auth batch` — owner-only batch authorization for all granted user scopes\n"
                 "- `/feishu help` — show this help"
             )
 
@@ -4213,6 +4214,7 @@ class GatewayRunner:
     async def _handle_feishu_auth_command(self, event: MessageEvent) -> str:
         """Handle /feishu-auth - inspect or request Feishu user authorization."""
         from gateway.config import Platform
+        from tools.feishu.client import get_app_granted_scopes_by_token_type, get_app_info
         from tools.feishu.scopes import get_required_scopes, split_sensitive_scopes
 
         if event.source.platform != Platform.FEISHU:
@@ -4291,6 +4293,68 @@ class GatewayRunner:
                 f"- Remaining scopes: {len(status.get('granted_scopes') or [])}"
             )
 
+        if subcommand == "batch":
+            account_id = getattr(event.source, "account_id", None)
+            app_info = get_app_info(account_id=account_id)
+            owner_open_id = str(app_info.get("effective_owner_open_id", "") or "").strip()
+            if not owner_open_id:
+                return (
+                    "❌ **Feishu batch authorization unavailable**\n"
+                    "- Hermes could not determine the Feishu app owner for this account."
+                )
+            if owner_open_id != user_open_id:
+                return (
+                    "❌ **Feishu batch authorization is owner-only**\n"
+                    "- Ask the Feishu app owner to run `/feishu auth batch` in chat."
+                )
+
+            app_scopes = get_app_granted_scopes_by_token_type("user", account_id=account_id)
+            app_scopes = adapter._normalize_scope_list(app_scopes)
+            if not app_scopes:
+                return (
+                    "ℹ️ **Feishu batch authorization skipped**\n"
+                    "- This app has no granted user scopes yet."
+                )
+
+            if account_id:
+                status = adapter.get_authorization_status(
+                    user_open_id,
+                    app_scopes,
+                    account_id=account_id,
+                )
+            else:
+                status = adapter.get_authorization_status(user_open_id, app_scopes)
+
+            missing_scopes = adapter._normalize_scope_list(list(status.get("missing_scopes") or []))
+            if not missing_scopes:
+                return (
+                    "✅ **Feishu batch authorization already complete**\n"
+                    f"- Authorized scopes: {len(status.get('granted_scopes') or [])}"
+                )
+
+            safe_scopes, sensitive_scopes = split_sensitive_scopes(missing_scopes)
+            result = await adapter.send_oauth_request_card(
+                chat_id=event.source.chat_id,
+                scopes=missing_scopes,
+                reason="Batch authorization requested for all app-granted Feishu user scopes.",
+                title="Feishu Batch Authorization Required",
+                metadata={
+                    "thread_id": thread_id,
+                    "account_id": account_id,
+                    "requester_open_id": user_open_id,
+                    "tool_name": "feishu_oauth_batch_auth",
+                    "action": "batch",
+                },
+            )
+            if not result.success:
+                return f"Failed to create Feishu batch authorization request: {result.error}"
+            return (
+                "🔐 **Feishu batch authorization requested**\n"
+                f"- Missing scopes: {len(missing_scopes)}\n"
+                f"- Safe scopes: {', '.join(safe_scopes) if safe_scopes else 'none'}\n"
+                f"- Sensitive scopes: {', '.join(sensitive_scopes) if sensitive_scopes else 'none'}"
+            )
+
         if subcommand == "scope":
             scopes = _parse_scope_tokens(payload_args)
             if not scopes:
@@ -4322,7 +4386,7 @@ class GatewayRunner:
         scopes = get_required_scopes(tool_name, action_name)
         if not scopes:
             return (
-                "Usage: `/feishu-auth [status|revoke|scope|<tool_name> [action]]`\n"
+                "Usage: `/feishu-auth [status|revoke|batch|scope|<tool_name> [action]]`\n"
                 "Example: `/feishu-auth feishu_calendar_event delete`"
             )
 

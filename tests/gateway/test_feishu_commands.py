@@ -57,6 +57,7 @@ async def test_feishu_unified_help_lists_subcommands():
     assert "Feishu Commands" in result
     assert "/feishu start" in result
     assert "/feishu auth" in result
+    assert "/feishu auth batch" in result
 
 
 @pytest.mark.asyncio
@@ -234,6 +235,64 @@ async def test_feishu_auth_scope_request_accepts_explicit_scopes():
     adapter.send_oauth_request_card.assert_awaited_once()
     kwargs = adapter.send_oauth_request_card.await_args.kwargs
     assert kwargs["scopes"] == ["im:chat:read", "im:message:readonly"]
+
+
+@pytest.mark.asyncio
+async def test_feishu_auth_batch_requires_owner(monkeypatch):
+    adapter = SimpleNamespace(
+        _normalize_scope_list=lambda scopes: list(dict.fromkeys(scopes)),
+    )
+    runner = _make_runner()
+    runner.adapters[Platform.FEISHU] = adapter
+    monkeypatch.setattr(
+        "tools.feishu.client.get_app_info",
+        lambda **kwargs: {"effective_owner_open_id": "ou_owner"},
+    )
+
+    result = await runner._handle_feishu_auth_command(_make_event("/feishu-auth batch", user_id="ou_user_1"))
+
+    assert "owner-only" in result
+
+
+@pytest.mark.asyncio
+async def test_feishu_auth_batch_requests_missing_scopes(monkeypatch):
+    adapter = SimpleNamespace(
+        get_authorization_status=lambda user_open_id, scopes=None, account_id=None: {
+            "authorized": False,
+            "granted_scopes": ["task:task:read"],
+            "requested_scopes": list(scopes or []),
+            "missing_scopes": ["calendar:calendar.event:read", "im:message.send_as_user"],
+        },
+        send_oauth_request_card=AsyncMock(
+            return_value=SendResult(success=True, message_id="msg_batch", raw_response={"request_id": "fo_batch"})
+        ),
+        _normalize_scope_list=lambda scopes: list(dict.fromkeys(scopes)),
+    )
+    runner = _make_runner()
+    runner.adapters[Platform.FEISHU] = adapter
+    monkeypatch.setattr(
+        "tools.feishu.client.get_app_info",
+        lambda **kwargs: {"effective_owner_open_id": "ou_user_1"},
+    )
+    monkeypatch.setattr(
+        "tools.feishu.client.get_app_granted_scopes_by_token_type",
+        lambda token_type, account_id=None: [
+            "task:task:read",
+            "calendar:calendar.event:read",
+            "im:message.send_as_user",
+        ],
+    )
+
+    result = await runner._handle_feishu_auth_command(
+        _make_event("/feishu-auth batch", account_id="feishu-cn")
+    )
+
+    assert "batch authorization requested" in result
+    kwargs = adapter.send_oauth_request_card.await_args.kwargs
+    assert kwargs["scopes"] == ["calendar:calendar.event:read", "im:message.send_as_user"]
+    assert kwargs["metadata"]["tool_name"] == "feishu_oauth_batch_auth"
+    assert kwargs["metadata"]["action"] == "batch"
+    assert kwargs["metadata"]["account_id"] == "feishu-cn"
 
 
 @pytest.mark.asyncio

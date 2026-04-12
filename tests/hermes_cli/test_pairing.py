@@ -112,4 +112,6 @@ def test_maybe_notify_feishu_onboarding_sends_owner_message():
     _, kwargs = api_request.call_args
     assert kwargs["account_id"] == "feishu-cn"
     assert kwargs["json_body"]["receive_id"] == "ou_notice"
-    assert "/feishu-auth scope calendar:calendar.event:read,task:task:read" in kwargs["json_body"]["content"]
+    assert "/feishu auth batch" in kwargs["json_body"]["content"]
+    assert "3 granted user scopes" in kwargs["json_body"]["content"]
+    assert "(2 safe, 1 sensitive)" in kwargs["json_body"]["content"]

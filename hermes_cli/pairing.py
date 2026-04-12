@@ -52,16 +52,18 @@ def _maybe_notify_feishu_onboarding(user_open_id: str, account_id: str | None = 
         return False
 
     granted_user_scopes = get_app_granted_scopes_by_token_type("user", account_id=account_id)
-    safe_scopes, _sensitive_scopes = split_sensitive_scopes(granted_user_scopes)
-    if not safe_scopes:
+    safe_scopes, sensitive_scopes = split_sensitive_scopes(granted_user_scopes)
+    all_scopes = [*safe_scopes, *sensitive_scopes]
+    if not all_scopes:
         return False
 
-    command = "/feishu-auth scope " + ",".join(safe_scopes)
     content = (
         "You are the Feishu app owner.\n\n"
         "To finish Hermes onboarding, run this command in the current Feishu chat:\n"
-        f"{command}\n\n"
-        "This requests the app's currently granted user scopes and skips sensitive scopes."
+        "/feishu auth batch\n\n"
+        f"Hermes detected {len(all_scopes)} granted user scopes for this app "
+        f"({len(safe_scopes)} safe, {len(sensitive_scopes)} sensitive). "
+        "The batch command will request the missing scopes in one owner-only flow."
     )
     feishu_api_request(
         "POST",
