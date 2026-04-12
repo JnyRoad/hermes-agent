@@ -448,6 +448,13 @@ def test_feishu_doc_media_download_requires_output_path(monkeypatch):
     assert "output_path" in payload["error"]
 
 
+def test_feishu_doc_media_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.doc_media import _handle_doc_media
+
+    payload = json.loads(_handle_doc_media({"action": "noop"}))
+    assert "Unsupported action" in payload["error"]
+
+
 def test_feishu_bitable_app_list_handler(monkeypatch):
     from tools.feishu.bitable_app import _handle_bitable_app
 
@@ -1050,6 +1057,13 @@ def test_feishu_chat_search_handler(monkeypatch):
     assert payload["items"][0]["chat_id"] == "oc_1"
 
 
+def test_feishu_chat_search_requires_query(monkeypatch):
+    from tools.feishu.chat import _handle_chat
+
+    payload = json.loads(_handle_chat({"action": "search"}))
+    assert "query" in payload["error"]
+
+
 def test_feishu_chat_get_handler(monkeypatch):
     from tools.feishu.chat import _handle_chat
 
@@ -1059,6 +1073,20 @@ def test_feishu_chat_get_handler(monkeypatch):
     )
     payload = json.loads(_handle_chat({"action": "get", "chat_id": "oc_1"}))
     assert payload["chat"]["name"] == "研发群"
+
+
+def test_feishu_chat_get_requires_chat_id(monkeypatch):
+    from tools.feishu.chat import _handle_chat
+
+    payload = json.loads(_handle_chat({"action": "get"}))
+    assert "chat_id" in payload["error"]
+
+
+def test_feishu_chat_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.chat import _handle_chat
+
+    payload = json.loads(_handle_chat({"action": "noop"}))
+    assert "Unsupported action" in payload["error"]
 
 
 def test_feishu_chat_members_handler(monkeypatch):
@@ -1071,6 +1099,13 @@ def test_feishu_chat_members_handler(monkeypatch):
     payload = json.loads(_handle_chat_members({"chat_id": "oc_1"}))
     assert payload["member_total"] == 1
     assert payload["items"][0]["member_id"] == "ou_1"
+
+
+def test_feishu_chat_members_requires_chat_id(monkeypatch):
+    from tools.feishu.chat_members import _handle_chat_members
+
+    payload = json.loads(_handle_chat_members({}))
+    assert "chat_id" in payload["error"]
 
 
 def test_feishu_drive_file_get_meta_handler(monkeypatch):
@@ -1249,6 +1284,20 @@ def test_feishu_drive_file_download_handler(monkeypatch, tmp_path):
     )
     assert payload["saved_path"] == str(target)
     assert target.read_bytes() == b"hello"
+
+
+def test_feishu_drive_file_download_requires_file_token(monkeypatch):
+    from tools.feishu.drive import _handle_drive_file
+
+    payload = json.loads(_handle_drive_file({"action": "download"}))
+    assert "file_token" in payload["error"]
+
+
+def test_feishu_drive_file_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.drive import _handle_drive_file
+
+    payload = json.loads(_handle_drive_file({"action": "noop"}))
+    assert "Unsupported action" in payload["error"]
 
 
 def test_feishu_wiki_space_handler(monkeypatch):
@@ -1441,6 +1490,13 @@ def test_feishu_calendar_calendar_get_requires_calendar_id(monkeypatch):
 
     payload = json.loads(_handle_calendar({"action": "get"}))
     assert "calendar_id" in payload["error"]
+
+
+def test_feishu_calendar_calendar_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.calendar import _handle_calendar
+
+    payload = json.loads(_handle_calendar({"action": "noop"}))
+    assert "Unsupported action" in payload["error"]
 
 
 def test_feishu_calendar_event_list_handler(monkeypatch):
@@ -1704,6 +1760,13 @@ def test_feishu_calendar_event_instance_view_requires_time_range(monkeypatch):
     assert "end_time" in payload["error"]
 
 
+def test_feishu_calendar_event_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    payload = json.loads(_handle_calendar_event({"action": "noop"}))
+    assert "Unsupported action" in payload["error"]
+
+
 def test_feishu_calendar_freebusy_list_handler(monkeypatch):
     from tools.feishu.calendar_freebusy import _handle_calendar_freebusy
 
@@ -1745,6 +1808,13 @@ def test_feishu_calendar_freebusy_rejects_more_than_ten_users(monkeypatch):
         )
     )
     assert "maximum 10 users" in payload["error"]
+
+
+def test_feishu_calendar_freebusy_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.calendar_freebusy import _handle_calendar_freebusy
+
+    payload = json.loads(_handle_calendar_freebusy({"action": "noop"}))
+    assert "Unsupported action" in payload["error"]
 
 
 def test_feishu_calendar_event_attendee_create_handler(monkeypatch):
@@ -1794,6 +1864,21 @@ def test_feishu_calendar_event_attendee_rejects_unsupported_attendee_type(monkey
         )
     )
     assert "unsupported attendee type" in payload["error"]
+
+
+def test_feishu_calendar_event_attendee_requires_calendar_and_event_id(monkeypatch):
+    from tools.feishu.calendar_event_attendee import _handle_calendar_event_attendee
+
+    payload = json.loads(_handle_calendar_event_attendee({"action": "list"}))
+    assert "calendar_id" in payload["error"]
+    assert "event_id" in payload["error"]
+
+
+def test_feishu_calendar_event_attendee_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.calendar_event_attendee import _handle_calendar_event_attendee
+
+    payload = json.loads(_handle_calendar_event_attendee({"action": "noop", "calendar_id": "cal_1", "event_id": "evt_1"}))
+    assert "Unsupported action" in payload["error"]
 
 
 def test_feishu_task_task_create_handler(monkeypatch):
@@ -1859,6 +1944,13 @@ def test_feishu_task_task_patch_requires_updatable_field(monkeypatch):
 
     payload = json.loads(_handle_task({"action": "patch", "task_guid": "task_1"}))
     assert "At least one updatable field is required for patch" in payload["error"]
+
+
+def test_feishu_task_task_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.task import _handle_task
+
+    payload = json.loads(_handle_task({"action": "noop"}))
+    assert "Unsupported action" in payload["error"]
 
 
 def test_feishu_task_tasklist_create_handler(monkeypatch):
@@ -2000,6 +2092,13 @@ def test_feishu_task_tasklist_add_members_requires_member_id(monkeypatch):
     assert "member.id is required" in payload["error"]
 
 
+def test_feishu_task_tasklist_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.tasklist import _handle_tasklist
+
+    payload = json.loads(_handle_tasklist({"action": "noop"}))
+    assert "Unsupported action" in payload["error"]
+
+
 def test_feishu_task_comment_create_handler(monkeypatch):
     from tools.feishu.task_comment import _handle_task_comment
 
@@ -2055,6 +2154,13 @@ def test_feishu_task_comment_get_requires_comment_id(monkeypatch):
     assert "comment_id" in payload["error"]
 
 
+def test_feishu_task_comment_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.task_comment import _handle_task_comment
+
+    payload = json.loads(_handle_task_comment({"action": "noop"}))
+    assert "Unsupported action" in payload["error"]
+
+
 def test_feishu_task_subtask_create_handler(monkeypatch):
     from tools.feishu.task_subtask import _handle_task_subtask
 
@@ -2085,6 +2191,20 @@ def test_feishu_task_subtask_list_handler(monkeypatch):
     )
     payload = json.loads(_handle_task_subtask({"action": "list", "task_guid": "task_1"}))
     assert payload["subtasks"][0]["guid"] == "sub_1"
+
+
+def test_feishu_task_subtask_list_requires_task_guid(monkeypatch):
+    from tools.feishu.task_subtask import _handle_task_subtask
+
+    payload = json.loads(_handle_task_subtask({"action": "list"}))
+    assert "task_guid" in payload["error"]
+
+
+def test_feishu_task_subtask_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.task_subtask import _handle_task_subtask
+
+    payload = json.loads(_handle_task_subtask({"action": "noop"}))
+    assert "Unsupported action" in payload["error"]
 
 
 def test_feishu_task_section_create_handler(monkeypatch):
@@ -2185,6 +2305,13 @@ def test_feishu_task_section_tasks_requires_section_guid(monkeypatch):
 
     payload = json.loads(_handle_task_section({"action": "tasks"}))
     assert "section_guid" in payload["error"]
+
+
+def test_feishu_task_section_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.task_section import _handle_task_section
+
+    payload = json.loads(_handle_task_section({"action": "noop"}))
+    assert "Unsupported action" in payload["error"]
 
 
 def test_feishu_im_get_messages_handler(monkeypatch):
