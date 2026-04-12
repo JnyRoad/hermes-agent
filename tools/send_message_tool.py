@@ -17,7 +17,9 @@ from agent.redact import redact_sensitive_text
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
-_FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
+_FEISHU_TARGET_RE = re.compile(
+    r"^\s*(?:(?P<account>[A-Za-z0-9._-]+)::)?(?P<target>(?:oc|ou|on|chat|open)_[\-A-Za-z0-9_]+)(?::(?P<thread>[-A-Za-z0-9_]+))?\s*$"
+)
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
 _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
@@ -68,7 +70,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567'"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Feishu also supports account-qualified IDs like 'feishu:feishu-cn::oc_xxx'. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'feishu:feishu-cn::oc_xxx'"
             },
             "message": {
                 "type": "string",
@@ -111,6 +113,7 @@ def _handle_send(args):
     target_ref = parts[1].strip() if len(parts) > 1 else None
     chat_id = None
     thread_id = None
+    account_id = None
 
     if target_ref:
         chat_id, thread_id, is_explicit = _parse_target_ref(platform_name, target_ref)
@@ -134,6 +137,9 @@ def _handle_send(args):
                 "error": f"Could not resolve '{target_ref}' on {platform_name}. "
                 f"Try using a numeric channel ID instead."
             })
+
+    if platform_name == "feishu" and chat_id:
+        chat_id, account_id = _split_feishu_account_target(chat_id)
 
     from tools.interrupt import is_interrupted
     if is_interrupted():
@@ -195,14 +201,19 @@ def _handle_send(args):
 
     try:
         from model_tools import _run_async
+        send_kwargs = {
+            "thread_id": thread_id,
+            "media_files": media_files,
+        }
+        if account_id:
+            send_kwargs["account_id"] = account_id
         result = _run_async(
             _send_to_platform(
                 platform,
                 pconfig,
                 chat_id,
                 cleaned_message,
-                thread_id=thread_id,
-                media_files=media_files,
+                **send_kwargs,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -235,7 +246,11 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     if platform_name == "feishu":
         match = _FEISHU_TARGET_RE.fullmatch(target_ref)
         if match:
-            return match.group(1), match.group(2), True
+            account_id = str(match.group("account") or "").strip()
+            chat_id = str(match.group("target") or "").strip()
+            thread_id = str(match.group("thread") or "").strip() or None
+            encoded_chat_id = f"{account_id}::{chat_id}" if account_id else chat_id
+            return encoded_chat_id, thread_id, True
     if platform_name == "discord":
         match = _NUMERIC_TOPIC_RE.fullmatch(target_ref)
         if match:
@@ -247,6 +262,19 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     if target_ref.lstrip("-").isdigit():
         return target_ref, None, True
     return None, None, False
+
+
+def _split_feishu_account_target(chat_id: str):
+    """Split an account-qualified Feishu target into raw chat_id and account_id."""
+    value = str(chat_id or "").strip()
+    if "::" not in value:
+        return value, None
+    account_id, raw_chat_id = value.split("::", 1)
+    account_id = account_id.strip()
+    raw_chat_id = raw_chat_id.strip()
+    if not account_id or not raw_chat_id:
+        return value, None
+    return raw_chat_id, account_id
 
 
 def _describe_media_for_mirror(media_files):
@@ -313,7 +341,7 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, account_id=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -418,7 +446,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         elif platform == Platform.DINGTALK:
             result = await _send_dingtalk(pconfig.extra, chat_id, chunk)
         elif platform == Platform.FEISHU:
-            result = await _send_feishu(pconfig, chat_id, chunk, thread_id=thread_id)
+            result = await _send_feishu(pconfig, chat_id, chunk, thread_id=thread_id, account_id=account_id)
         elif platform == Platform.WECOM:
             result = await _send_wecom(pconfig.extra, chat_id, chunk)
         elif platform == Platform.BLUEBUBBLES:
@@ -965,7 +993,7 @@ async def _send_bluebubbles(extra, chat_id, message):
         return _error(f"BlueBubbles send failed: {e}")
 
 
-async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=None):
+async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=None, account_id=None):
     """Send via Feishu/Lark using the adapter's send pipeline."""
     try:
         from gateway.platforms.feishu import FeishuAdapter, FEISHU_AVAILABLE
@@ -979,10 +1007,28 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
 
     try:
         adapter = FeishuAdapter(pconfig)
-        domain_name = getattr(adapter, "_domain_name", "feishu")
-        domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
-        adapter._client = adapter._build_lark_client(domain)
-        metadata = {"thread_id": thread_id} if thread_id else None
+        adapter._clients_by_account = {}
+        for feishu_account in adapter._accounts.values():
+            if not feishu_account.enabled:
+                continue
+            domain = FEISHU_DOMAIN if feishu_account.domain_name != "lark" else LARK_DOMAIN
+            if feishu_account.account_id == "default":
+                client = adapter._build_lark_client(domain)
+                adapter._client = client
+            else:
+                client = adapter._build_lark_client_for_account(feishu_account, domain)
+            adapter._clients_by_account[feishu_account.account_id] = client
+        if adapter._client is None:
+            domain_name = getattr(adapter, "_domain_name", "feishu")
+            domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
+            adapter._client = adapter._build_lark_client(domain)
+            adapter._clients_by_account.setdefault("default", adapter._client)
+        metadata = {}
+        if thread_id:
+            metadata["thread_id"] = thread_id
+        if account_id:
+            metadata["account_id"] = account_id
+        metadata = metadata or None
 
         last_result = None
         if message.strip():

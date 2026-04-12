@@ -73,7 +73,7 @@ class TestBuildChannelDirectoryWrites:
                 assert include_live is True
                 return [
                     {"id": "ou_live_1", "name": "Alice", "type": "dm", "source": "live"},
-                    {"id": "oc_chat_1", "name": "Hermes Group", "type": "group", "source": "live"},
+                    {"id": "feishu-cn::oc_chat_1", "name": "Hermes Group", "type": "group", "source": "live", "account_id": "feishu-cn"},
                 ]
 
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}), patch(
@@ -84,7 +84,7 @@ class TestBuildChannelDirectoryWrites:
 
         assert result["platforms"]["feishu"] == [
             {"id": "ou_live_1", "name": "Alice", "type": "dm", "source": "live"},
-            {"id": "oc_chat_1", "name": "Hermes Group", "type": "group", "source": "live"},
+            {"id": "feishu-cn::oc_chat_1", "name": "Hermes Group", "type": "group", "source": "live", "account_id": "feishu-cn"},
         ]
 
 
@@ -174,6 +174,17 @@ class TestResolveChannelName:
             assert resolve_channel_name("telegram", "Alice (dm)") == "123"
             assert resolve_channel_name("telegram", "Dev Group (group)") == "456"
             assert resolve_channel_name("telegram", "Coaching Chat / topic 17585 (group)") == "-1001:17585"
+
+    def test_feishu_account_qualified_label_resolves(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "ou_alice", "name": "Alice", "type": "dm", "account_id": "default"},
+                {"id": "feishu-cn::ou_bob", "name": "Bob", "type": "dm", "account_id": "feishu-cn"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            assert resolve_channel_name("feishu", "Alice (dm)") == "ou_alice"
+            assert resolve_channel_name("feishu", "feishu-cn/Bob (dm)") == "feishu-cn::ou_bob"
 
 
 class TestBuildFromSessions:

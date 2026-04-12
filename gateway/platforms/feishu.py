@@ -2366,13 +2366,14 @@ class FeishuAdapter(BasePlatformAdapter):
             entry_type = str(entry.type or "").strip() or "dm"
             entry_source = str(entry.source or "").strip() or "config"
             account_id = str(entry.account_id or "default").strip() or "default"
+            stored_entry_id = f"{account_id}::{entry_id}" if account_id != "default" else entry_id
             dedup_key = (account_id, entry_id)
             if not entry_id or dedup_key in seen:
                 continue
             seen.add(dedup_key)
             normalized.append(
                 {
-                    "id": entry_id,
+                    "id": stored_entry_id,
                     "name": entry_name,
                     "type": entry_type,
                     "source": entry_source,
@@ -2505,13 +2506,19 @@ class FeishuAdapter(BasePlatformAdapter):
     def build_channel_directory_entries(self, *, include_live: bool = True, limit_per_account: int = 50) -> List[Dict[str, str]]:
         """Build Feishu directory entries for the shared gateway channel directory cache.
 
-        The cache currently stores plain chat IDs, so only the default account is exposed
-        for outbound name resolution. Multi-account routing still relies on session context,
-        and can be extended later without breaking the cached schema introduced here.
+        Directory entries include account IDs so outbound name resolution can route
+        across multiple configured Feishu accounts without guessing.
         """
-        entries = self._list_config_directory_entries_for_account("default")
-        if include_live:
-            entries.extend(self._list_live_directory_entries_for_account("default", limit=limit_per_account))
+        entries: List[FeishuDirectoryEntry] = []
+        account_ids = [
+            account.account_id
+            for account in sorted(self._accounts.values(), key=lambda account: (account.account_id != "default", account.account_id))
+            if account.enabled
+        ] or ["default"]
+        for account_id in account_ids:
+            entries.extend(self._list_config_directory_entries_for_account(account_id))
+            if include_live:
+                entries.extend(self._list_live_directory_entries_for_account(account_id, limit=limit_per_account))
         return self._normalize_directory_entries(entries)
 
     def format_message(self, content: str) -> str:

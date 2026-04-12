@@ -40,6 +40,12 @@ def _normalize_channel_query(value: str) -> str:
 def _channel_target_name(platform_name: str, channel: Dict[str, Any]) -> str:
     """Return the human-facing target label shown to users for a channel entry."""
     name = channel["name"]
+    if platform_name == "feishu":
+        account_id = str(channel.get("account_id", "") or "").strip()
+        base = f"{name} ({channel['type']})" if channel.get("type") else name
+        if account_id and account_id != "default":
+            return f"{account_id}/{base}"
+        return base
     if platform_name == "discord" and channel.get("guild"):
         return f"#{name}"
     if platform_name != "discord" and channel.get("type"):
@@ -51,10 +57,15 @@ def _session_entry_id(origin: Dict[str, Any]) -> Optional[str]:
     chat_id = origin.get("chat_id")
     if not chat_id:
         return None
+    platform = str(origin.get("platform", "") or "").strip().lower()
+    account_id = str(origin.get("account_id", "") or "").strip()
     thread_id = origin.get("thread_id")
+    base_chat_id = str(chat_id)
+    if platform == "feishu" and account_id and account_id != "default":
+        base_chat_id = f"{account_id}::{base_chat_id}"
     if thread_id:
-        return f"{chat_id}:{thread_id}"
-    return str(chat_id)
+        return f"{base_chat_id}:{thread_id}"
+    return base_chat_id
 
 
 def _session_entry_name(origin: Dict[str, Any]) -> str:
@@ -205,6 +216,7 @@ def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
                 "name": _session_entry_name(origin),
                 "type": session.get("chat_type", "dm"),
                 "thread_id": origin.get("thread_id"),
+                "account_id": origin.get("account_id"),
             })
     except Exception as e:
         logger.debug("Channel directory: failed to read sessions for %s: %s", platform_name, e)
