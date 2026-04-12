@@ -2687,6 +2687,8 @@ def test_feishu_create_doc_handler(monkeypatch):
     payload = json.loads(_handle_create_doc({"title": "Hello", "markdown": "# Title\nBody"}))
     assert payload["document_id"] == "doxcn_new"
     assert payload["initialized"] is True
+    assert payload["write_result"]["block_count"] == 2
+    assert payload["write_result"]["block_kinds"] == ["heading", "paragraph"]
     assert any(item[0] == "POST" and item[1].endswith("/children") for item in calls)
 
 
@@ -2752,6 +2754,68 @@ def test_feishu_update_doc_handler_replace_range(monkeypatch):
     assert payload["updated"] is True
     assert any(item[0] == "DELETE" for item in calls)
     assert any(item[0] == "POST" and item[1].endswith("/children") for item in calls)
+
+
+def test_feishu_doc_markdown_blocks_preserve_structural_cues():
+    from tools.feishu.docs import _normalize_markdown_to_blocks, _render_doc_block_text
+
+    blocks = _normalize_markdown_to_blocks(
+        "# Title\n"
+        "Intro line\n\n"
+        "- Alpha\n"
+        "1. Beta\n"
+        "> Quote\n\n"
+        "```python\n"
+        "print('hi')\n"
+        "```"
+    )
+
+    assert [block["kind"] for block in blocks] == ["heading", "paragraph", "list", "list", "quote", "code"]
+    assert [_render_doc_block_text(block) for block in blocks] == [
+        "# Title",
+        "Intro line",
+        "• Alpha",
+        "1. Beta",
+        "> Quote",
+        "```\n[python]\nprint('hi')\n```",
+    ]
+
+
+def test_feishu_create_doc_renders_list_quote_and_code_blocks(monkeypatch):
+    from tools.feishu.docs import _handle_create_doc
+
+    create_children_payloads = []
+
+    def _fake_request(method, path, **kwargs):
+        if method == "POST" and path == "/open-apis/docx/v1/documents":
+            return {"data": {"document": {"document_id": "doxcn_new"}}}
+        if method == "GET" and path.endswith("/children"):
+            return {"data": {"items": [], "has_more": False}}
+        if method == "POST" and path.endswith("/children"):
+            create_children_payloads.append(kwargs.get("json_body") or {})
+            return {"data": {}}
+        return {"data": {}}
+
+    monkeypatch.setattr("tools.feishu.docs.feishu_api_request", _fake_request)
+
+    payload = json.loads(
+        _handle_create_doc(
+            {
+                "title": "Hello",
+                "markdown": "# Title\n- Alpha\n> Quote\n```python\nprint('hi')\n```",
+            }
+        )
+    )
+
+    children = create_children_payloads[0]["children"]
+    rendered = [item["text"]["elements"][0]["text_run"]["content"] for item in children]
+    assert rendered == [
+        "# Title",
+        "• Alpha",
+        "> Quote",
+        "```\n[python]\nprint('hi')\n```",
+    ]
+    assert payload["write_result"]["block_kinds"] == ["heading", "list", "quote", "code"]
 
 
 def test_feishu_update_doc_reports_title_update_note(monkeypatch):

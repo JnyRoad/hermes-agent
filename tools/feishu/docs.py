@@ -1,11 +1,11 @@
 """飞书文档工具。
 
-当前实现优先保证可用闭环：
+当前实现优先保证稳定闭环，同时逐步提升 Markdown 保真度：
 - 读取：使用 docx raw_content
-- 写入：使用 docx block API 按段落重建内容
+- 写入：使用 docx block API 重建文档内容
 
-这意味着更新阶段会把输入内容降级为“文本段落”写回文档，
-优先保证内容正确落盘，再逐步演进到更高保真的块级 Markdown 转换。
+现阶段仍使用稳定的 text block 写回文档，但会先解析 Markdown 块结构，
+尽量保留标题、列表、引用和代码块的语义，而不是把所有内容简单压平成纯段落。
 """
 
 from __future__ import annotations
@@ -30,6 +30,8 @@ _MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*")
 _MD_LIST_RE = re.compile(r"^\s*([-*+]|\d+\.)\s+")
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MD_EMPHASIS_RE = re.compile(r"(\*\*|__|\*|_|~~|`)")
+_MD_BLOCKQUOTE_RE = re.compile(r"^\s*>\s?")
+_MD_FENCE_RE = re.compile(r"^\s*(```+|~~~+)\s*([A-Za-z0-9_+-]*)\s*$")
 _DOC_TASK_ID_RE = re.compile(r"^doc_task_[a-f0-9]{12}$")
 
 _ASYNC_DOC_MARKDOWN_THRESHOLD = 12000
@@ -168,26 +170,124 @@ def _extract_doc_id(value: str) -> str:
     raise ValueError(f"Could not extract Feishu document ID from: {trimmed}")
 
 
-def _normalize_markdown_to_paragraphs(markdown: str) -> List[str]:
-    """将 Markdown 近似转换为文档段落文本。
+def _strip_inline_markdown(text: str) -> str:
+    """Best-effort inline Markdown cleanup for doc text blocks."""
+    cleaned = _MD_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2)})", str(text or ""))
+    cleaned = _MD_EMPHASIS_RE.sub("", cleaned)
+    return cleaned.strip()
 
-    这里保留内容语义，去掉大多数 Markdown 标记，避免用户看到原始符号。
-    """
+
+def _normalize_markdown_to_blocks(markdown: str) -> List[Dict[str, Any]]:
+    """Parse Markdown into stable doc text blocks with preserved structural cues."""
     text = str(markdown or "").replace("\r\n", "\n").replace("\r", "\n")
-    text = _MD_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2)})", text)
-    paragraphs: List[str] = []
-    for raw_line in text.split("\n"):
+    lines = text.split("\n")
+    blocks: List[Dict[str, Any]] = []
+    paragraph_buffer: List[str] = []
+    code_fence: Optional[str] = None
+    code_language = ""
+    code_lines: List[str] = []
+
+    def flush_paragraph() -> None:
+        nonlocal paragraph_buffer
+        if not paragraph_buffer:
+            return
+        merged = " ".join(item.strip() for item in paragraph_buffer if item.strip()).strip()
+        paragraph_buffer = []
+        if not merged:
+            return
+        blocks.append({"kind": "paragraph", "text": _strip_inline_markdown(merged)})
+
+    def flush_code_block() -> None:
+        nonlocal code_lines, code_fence, code_language
+        if code_fence is None:
+            return
+        body = "\n".join(code_lines).rstrip("\n")
+        prefix = f"[{code_language}]\n" if code_language else ""
+        blocks.append({"kind": "code", "text": f"{prefix}{body}".strip()})
+        code_lines = []
+        code_fence = None
+        code_language = ""
+
+    for raw_line in lines:
+        fence_match = _MD_FENCE_RE.match(raw_line)
+        if code_fence is not None:
+            if fence_match and fence_match.group(1) == code_fence:
+                flush_code_block()
+                continue
+            code_lines.append(raw_line)
+            continue
+        if fence_match:
+            flush_paragraph()
+            code_fence = fence_match.group(1)
+            code_language = str(fence_match.group(2) or "").strip()
+            code_lines = []
+            continue
+
         line = raw_line.rstrip()
-        line = _MD_HEADING_RE.sub("", line)
-        line = _MD_LIST_RE.sub("", line)
-        line = _MD_EMPHASIS_RE.sub("", line)
-        line = line.strip()
-        paragraphs.append(line)
-    while paragraphs and paragraphs[0] == "":
-        paragraphs.pop(0)
-    while paragraphs and paragraphs[-1] == "":
-        paragraphs.pop()
-    return paragraphs or [""]
+        if not line.strip():
+            flush_paragraph()
+            continue
+
+        heading_match = re.match(r"^\s{0,3}(#{1,6})\s+(.*)$", line)
+        if heading_match:
+            flush_paragraph()
+            blocks.append(
+                {
+                    "kind": "heading",
+                    "level": len(heading_match.group(1)),
+                    "text": _strip_inline_markdown(heading_match.group(2)),
+                }
+            )
+            continue
+
+        quote_match = _MD_BLOCKQUOTE_RE.match(line)
+        if quote_match:
+            flush_paragraph()
+            blocks.append({"kind": "quote", "text": _strip_inline_markdown(line[quote_match.end():])})
+            continue
+
+        list_match = re.match(r"^(\s*)([-*+]|\d+\.)\s+(.*)$", line)
+        if list_match:
+            flush_paragraph()
+            indent_level = len(list_match.group(1).replace("\t", "    ")) // 2
+            marker = list_match.group(2)
+            blocks.append(
+                {
+                    "kind": "list",
+                    "ordered": marker.endswith(".") and marker[:-1].isdigit(),
+                    "marker": marker,
+                    "indent": max(indent_level, 0),
+                    "text": _strip_inline_markdown(list_match.group(3)),
+                }
+            )
+            continue
+
+        paragraph_buffer.append(line)
+
+    flush_paragraph()
+    flush_code_block()
+    return blocks or [{"kind": "paragraph", "text": ""}]
+
+
+def _render_doc_block_text(block: Dict[str, Any]) -> str:
+    """Render a parsed Markdown block into stable text for Feishu doc text blocks."""
+    kind = str(block.get("kind") or "paragraph")
+    text = str(block.get("text") or "")
+    if kind == "heading":
+        level = int(block.get("level") or 1)
+        return f"{'#' * min(max(level, 1), 6)} {text}".strip()
+    if kind == "list":
+        indent = "  " * int(block.get("indent") or 0)
+        if block.get("ordered"):
+            marker = str(block.get("marker") or "1.")
+        else:
+            marker = "•"
+        return f"{indent}{marker} {text}".rstrip()
+    if kind == "quote":
+        return f"> {text}".rstrip()
+    if kind == "code":
+        return f"```\n{text}\n```".strip()
+    return text
 
 
 def _build_text_block(text: str) -> Dict[str, Any]:
@@ -278,9 +378,14 @@ def _rewrite_document_content(document_id: str, content: str) -> Dict[str, Any]:
     children = _list_root_children(document_id)
     child_ids = [str(item.get("block_id", "")).strip() for item in children if str(item.get("block_id", "")).strip()]
     _delete_root_children(document_id, child_ids)
-    paragraphs = _normalize_markdown_to_paragraphs(content)
+    markdown_blocks = _normalize_markdown_to_blocks(content)
+    paragraphs = [_render_doc_block_text(item) for item in markdown_blocks]
     _append_blocks(document_id, paragraphs, start_index=0)
-    return {"paragraph_count": len(paragraphs)}
+    return {
+        "paragraph_count": len(paragraphs),
+        "block_count": len(markdown_blocks),
+        "block_kinds": [str(item.get("kind") or "paragraph") for item in markdown_blocks],
+    }
 
 
 def _slice_content(content: str, offset: int = 0, limit: Optional[int] = None) -> str:
@@ -517,7 +622,7 @@ FEISHU_FETCH_DOC_SCHEMA = {
 
 FEISHU_CREATE_DOC_SCHEMA = {
     "name": "feishu_create_doc",
-    "description": "Create a Feishu doc. When markdown is provided, Hermes writes a simplified paragraph-based rendering into the new document.",
+    "description": "Create a Feishu doc. When markdown is provided, Hermes preserves headings, lists, quotes, and code fences while writing stable doc text blocks.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -534,7 +639,7 @@ FEISHU_CREATE_DOC_SCHEMA = {
 
 FEISHU_UPDATE_DOC_SCHEMA = {
     "name": "feishu_update_doc",
-    "description": "Update a Feishu doc by rewriting its text content. Supports overwrite, append, replace_all, replace_range, insert_before, insert_after, and delete_range.",
+    "description": "Update a Feishu doc by rewriting its content with stable Markdown-aware doc text blocks. Supports overwrite, append, replace_all, replace_range, insert_before, insert_after, and delete_range.",
     "parameters": {
         "type": "object",
         "properties": {
