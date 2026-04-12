@@ -367,6 +367,17 @@ def test_feishu_bitable_app_get_handler(monkeypatch):
     assert payload["app"]["name"] == "CRM"
 
 
+def test_feishu_bitable_app_copy_handler(monkeypatch):
+    from tools.feishu.bitable_app import _handle_bitable_app
+
+    monkeypatch.setattr(
+        "tools.feishu.bitable_app.feishu_api_request",
+        lambda *a, **kw: {"data": {"app": {"app_token": "app_copy", "name": "CRM Copy"}}},
+    )
+    payload = json.loads(_handle_bitable_app({"action": "copy", "app_token": "app_1", "name": "CRM Copy"}))
+    assert payload["app"]["app_token"] == "app_copy"
+
+
 def test_feishu_bitable_app_table_list_handler(monkeypatch):
     from tools.feishu.bitable_app_table import _handle_bitable_app_table
 

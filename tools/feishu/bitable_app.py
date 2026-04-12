@@ -84,7 +84,20 @@ def _handle_bitable_app(args: dict, **_kw) -> str:
             payload = data.get("data") or {}
             return json.dumps({"app": payload.get("app", payload)}, ensure_ascii=False)
 
-        return tool_error("Unsupported action. Supported actions: create, get, list, patch")
+        if action == "copy":
+            app_token = str(args.get("app_token", "")).strip()
+            name = str(args.get("name", "")).strip()
+            if not app_token or not name:
+                return tool_error("Parameters 'app_token' and 'name' are required for copy.")
+            body: dict[str, Any] = {"name": name}
+            folder_token = str(args.get("folder_token", "")).strip()
+            if folder_token:
+                body["folder_token"] = folder_token
+            data = feishu_api_request("POST", f"/open-apis/bitable/v1/apps/{app_token}/copy", json_body=body)
+            payload = data.get("data") or {}
+            return json.dumps({"app": payload.get("app", payload)}, ensure_ascii=False)
+
+        return tool_error("Unsupported action. Supported actions: create, get, list, patch, copy")
     except Exception as exc:
         logger.error("feishu_bitable_app error: %s", exc)
         return tool_error(f"Failed to execute feishu_bitable_app: {exc}")
@@ -92,14 +105,14 @@ def _handle_bitable_app(args: dict, **_kw) -> str:
 
 FEISHU_BITABLE_APP_SCHEMA = {
     "name": "feishu_bitable_app",
-    "description": "Manage Feishu bitable apps. Hermes currently supports create, get, list, and patch.",
+    "description": "Manage Feishu bitable apps. Hermes currently supports create, get, list, patch, and copy.",
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["create", "get", "list", "patch"], "description": "Bitable app action."},
+            "action": {"type": "string", "enum": ["create", "get", "list", "patch", "copy"], "description": "Bitable app action."},
             "name": {"type": "string", "description": "App name for create or patch action."},
             "app_token": {"type": "string", "description": "Bitable app token for get or patch action."},
-            "folder_token": {"type": "string", "description": "Parent folder token for create or list action."},
+            "folder_token": {"type": "string", "description": "Parent folder token for create, list, or copy action."},
             "page_size": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Page size for list action."},
             "page_token": {"type": "string", "description": "Pagination token for list action."},
             "is_advanced": {"type": "boolean", "description": "Whether to enable advanced permission mode for patch action."},
