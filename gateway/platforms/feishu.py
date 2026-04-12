@@ -280,6 +280,8 @@ class FeishuAdapterSettings:
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
+    require_mention: bool = True
+    respond_to_mention_all: bool = True
     reply_mode: str = "auto"
     dm_policy: str = "open"
     thread_session: bool = False
@@ -296,6 +298,8 @@ class FeishuGroupRule:
     policy: str  # "open" | "allowlist" | "blacklist" | "admin_only" | "disabled"
     allowlist: set[str] = field(default_factory=set)
     blacklist: set[str] = field(default_factory=set)
+    require_mention: Optional[bool] = None
+    respond_to_mention_all: Optional[bool] = None
 
 
 @dataclass
@@ -358,6 +362,23 @@ def _escape_markdown_text(text: str) -> str:
 
 def _to_boolean(value: Any) -> bool:
     return value is True or value == 1 or value == "true"
+
+
+def _coerce_optional_bool(value: Any) -> Optional[bool]:
+    """把可选布尔配置统一规范成 True/False/None。"""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return None
 
 
 def _is_style_enabled(style: Dict[str, Any] | None, key: str) -> bool:
@@ -1136,6 +1157,12 @@ class FeishuAdapter(BasePlatformAdapter):
                     policy=str(rule_cfg.get("policy", "open")).strip().lower(),
                     allowlist=set(str(u).strip() for u in raw_allowlist if str(u).strip()),
                     blacklist=set(str(u).strip() for u in rule_cfg.get("blacklist", []) if str(u).strip()),
+                    require_mention=_coerce_optional_bool(
+                        rule_cfg.get("require_mention", rule_cfg.get("requireMention"))
+                    ),
+                    respond_to_mention_all=_coerce_optional_bool(
+                        rule_cfg.get("respond_to_mention_all", rule_cfg.get("respondToMentionAll"))
+                    ),
                 )
 
         # Bot-level admins
@@ -1207,6 +1234,10 @@ class FeishuAdapter(BasePlatformAdapter):
             admins=admins,
             default_group_policy=default_group_policy,
             group_rules=group_rules,
+            require_mention=_to_boolean(extra.get("require_mention", extra.get("requireMention", True))),
+            respond_to_mention_all=_to_boolean(
+                extra.get("respond_to_mention_all", extra.get("respondToMentionAll", True))
+            ),
             reply_mode=str(extra.get("reply_mode", "auto")).strip().lower() or "auto",
             dm_policy=str(extra.get("dm_policy", "open")).strip().lower() or "open",
             thread_session=_to_boolean(extra.get("thread_session")),
@@ -1234,6 +1265,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._admins = set(settings.admins)
         self._default_group_policy = settings.default_group_policy or settings.group_policy
         self._group_rules = settings.group_rules
+        self._require_mention = settings.require_mention
+        self._respond_to_mention_all = settings.respond_to_mention_all
         self._bot_open_id = settings.bot_open_id
         self._bot_user_id = settings.bot_user_id
         self._bot_name = settings.bot_name
@@ -3603,10 +3636,19 @@ class FeishuAdapter(BasePlatformAdapter):
         """Require an explicit @mention before group messages enter the agent."""
         if not self._allow_group_message(sender_id, chat_id):
             return False
-        # @_all is Feishu's @everyone placeholder — always route to the bot.
+        rule = self._group_rules.get(chat_id) if chat_id else None
+        require_mention = self._require_mention if rule is None or rule.require_mention is None else rule.require_mention
+        respond_to_mention_all = (
+            self._respond_to_mention_all
+            if rule is None or rule.respond_to_mention_all is None
+            else rule.respond_to_mention_all
+        )
+        if not require_mention:
+            return True
+        # @_all 是飞书的全员提醒占位符，是否放行由 respond_to_mention_all 控制。
         raw_content = getattr(message, "content", "") or ""
         if "@_all" in raw_content:
-            return True
+            return bool(respond_to_mention_all)
         mentions = getattr(message, "mentions", None) or []
         if mentions:
             return self._message_mentions_bot(mentions)

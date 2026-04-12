@@ -827,6 +827,47 @@ class TestAdapterBehavior(unittest.TestCase):
         message_with_mention = SimpleNamespace(mentions=[SimpleNamespace(key="@_user_1")])
         self.assertFalse(adapter._should_accept_group_message(message_with_mention, sender_id, ""))
 
+    def test_group_message_can_disable_require_mention_globally(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "group_policy": "open",
+                    "require_mention": False,
+                }
+            )
+        )
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertTrue(adapter._should_accept_group_message(SimpleNamespace(mentions=[]), sender_id, ""))
+
+    def test_group_rule_can_override_require_mention(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "group_policy": "open",
+                    "require_mention": True,
+                    "group_rules": {
+                        "oc_chat_free": {
+                            "policy": "open",
+                            "require_mention": False,
+                        }
+                    },
+                }
+            )
+        )
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertTrue(
+            adapter._should_accept_group_message(SimpleNamespace(mentions=[]), sender_id, "oc_chat_free")
+        )
+        self.assertFalse(
+            adapter._should_accept_group_message(SimpleNamespace(mentions=[]), sender_id, "oc_chat_other")
+        )
+
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_message_with_other_user_mention_is_rejected_when_bot_identity_unknown(self):
         from gateway.config import PlatformConfig
@@ -3205,6 +3246,45 @@ class TestGroupMentionAtAll(unittest.TestCase):
         # Allowlisted user — should pass.
         allowed_sender = SimpleNamespace(open_id="ou_allowed", user_id=None)
         self.assertTrue(adapter._should_accept_group_message(message, allowed_sender, ""))
+
+    def test_at_all_can_be_disabled_globally(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "group_policy": "open",
+                    "respond_to_mention_all": False,
+                }
+            )
+        )
+        message = SimpleNamespace(content='{"text":"@_all attention"}', mentions=[])
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertFalse(adapter._should_accept_group_message(message, sender_id, ""))
+
+    def test_group_rule_can_enable_at_all_when_global_setting_disables_it(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "group_policy": "open",
+                    "respond_to_mention_all": False,
+                    "group_rules": {
+                        "oc_chat_all": {
+                            "policy": "open",
+                            "respondToMentionAll": True,
+                        }
+                    },
+                }
+            )
+        )
+        message = SimpleNamespace(content='{"text":"@_all attention"}', mentions=[])
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertTrue(adapter._should_accept_group_message(message, sender_id, "oc_chat_all"))
+        self.assertFalse(adapter._should_accept_group_message(message, sender_id, "oc_chat_other"))
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
