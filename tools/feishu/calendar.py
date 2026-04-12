@@ -6,6 +6,7 @@ import json
 import logging
 
 from tools.feishu.client import feishu_api_request
+from tools.feishu.scopes import ensure_authorization
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,14 @@ def _check_feishu_available() -> bool:
 def _handle_calendar(args: dict, **_kw) -> str:
     action = str(args.get("action", "")).strip().lower()
     try:
+        auth_result = ensure_authorization(
+            tool_name="feishu_calendar_calendar",
+            action=action,
+            title="Feishu Calendar Authorization Required",
+        )
+        if auth_result is not None:
+            return auth_result
+
         if action == "list":
             params = {
                 "page_size": max(1, min(int(args.get("page_size", 50) or 50), 1000)),

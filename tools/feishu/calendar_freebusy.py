@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from tools.feishu.client import feishu_api_request
+from tools.feishu.scopes import ensure_authorization
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,13 @@ def _handle_calendar_freebusy(args: dict, **_kw) -> str:
     if action != "list":
         return tool_error("Unsupported action. Supported actions: list")
     try:
+        auth_result = ensure_authorization(
+            tool_name="feishu_calendar_freebusy",
+            action=action,
+            title="Feishu Calendar Authorization Required",
+        )
+        if auth_result is not None:
+            return auth_result
         time_min = str(args.get("time_min", "")).strip()
         time_max = str(args.get("time_max", "")).strip()
         user_ids = [str(item).strip() for item in (args.get("user_ids") or []) if str(item).strip()]

@@ -7,6 +7,7 @@ import logging
 from typing import Any, Dict, List
 
 from tools.feishu.client import feishu_api_request
+from tools.feishu.scopes import ensure_authorization
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,13 @@ def _handle_calendar_event_attendee(args: dict, **_kw) -> str:
         event_id = str(args.get("event_id", "")).strip()
         if not calendar_id or not event_id:
             return tool_error("Parameters 'calendar_id' and 'event_id' are required.")
+        auth_result = ensure_authorization(
+            tool_name="feishu_calendar_event_attendee",
+            action=action,
+            title="Feishu Calendar Authorization Required",
+        )
+        if auth_result is not None:
+            return auth_result
 
         if action == "create":
             attendees = _normalize_attendees(args.get("attendees"))

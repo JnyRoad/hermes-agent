@@ -6,6 +6,7 @@ import json
 import logging
 
 from tools.feishu.client import feishu_api_request
+from tools.feishu.scopes import ensure_authorization
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,14 @@ def _handle_chat(args: dict, **_kw) -> str:
     action = str(args.get("action", "")).strip().lower()
     user_id_type = str(args.get("user_id_type", "open_id")).strip() or "open_id"
     try:
+        auth_result = ensure_authorization(
+            tool_name="feishu_chat",
+            action=action,
+            title="Feishu Chat Authorization Required",
+        )
+        if auth_result is not None:
+            return auth_result
+
         if action == "search":
             query = str(args.get("query", "")).strip()
             if not query:

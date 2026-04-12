@@ -6,6 +6,7 @@ import json
 import logging
 
 from tools.feishu.client import feishu_api_request
+from tools.feishu.scopes import ensure_authorization
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,13 @@ def _handle_chat_members(args: dict, **_kw) -> str:
     page_size = max(1, min(int(args.get("page_size", 50) or 50), 200))
     page_token = str(args.get("page_token", "")).strip()
     try:
+        auth_result = ensure_authorization(
+            tool_name="feishu_chat_members",
+            action="default",
+            title="Feishu Chat Authorization Required",
+        )
+        if auth_result is not None:
+            return auth_result
         params = {
             "member_id_type": member_id_type,
             "page_size": str(page_size),

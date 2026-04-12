@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 # 与官方插件 tool-scopes.ts 保持同粒度的工具动作键。
 TOOL_SCOPES: Dict[str, List[str]] = {
+    "feishu_calendar_calendar.list": ["calendar:calendar:read"],
+    "feishu_calendar_calendar.get": ["calendar:calendar:read"],
+    "feishu_calendar_calendar.primary": ["calendar:calendar:read"],
     "feishu_calendar_event.create": ["calendar:calendar.event:create", "calendar:calendar.event:update"],
     "feishu_calendar_event.list": ["calendar:calendar.event:read"],
     "feishu_calendar_event.get": ["calendar:calendar.event:read"],
@@ -34,6 +37,12 @@ TOOL_SCOPES: Dict[str, List[str]] = {
     "feishu_calendar_event.reply": ["calendar:calendar.event:reply"],
     "feishu_calendar_event.instances": ["calendar:calendar.event:read"],
     "feishu_calendar_event.instance_view": ["calendar:calendar.event:read"],
+    "feishu_calendar_event_attendee.create": ["calendar:calendar.event:update"],
+    "feishu_calendar_event_attendee.list": ["calendar:calendar.event:read"],
+    "feishu_calendar_freebusy.list": ["calendar:calendar.free_busy:read"],
+    "feishu_chat.search": ["im:chat:read"],
+    "feishu_chat.get": ["im:chat:read"],
+    "feishu_chat_members.default": ["im:chat.members:read"],
     "feishu_drive_file.list": ["space:document:retrieve"],
     "feishu_drive_file.get_meta": ["drive:drive.metadata:readonly"],
     "feishu_drive_file.copy": ["docs:document:copy"],
@@ -77,6 +86,22 @@ TOOL_SCOPES: Dict[str, List[str]] = {
     "feishu_task_task.get": ["task:task:read", "task:task:write"],
     "feishu_task_task.list": ["task:task:read", "task:task:write"],
     "feishu_task_task.patch": ["task:task:write", "task:task:writeonly"],
+    "feishu_task_tasklist.create": ["task:tasklist:write"],
+    "feishu_task_tasklist.get": ["task:tasklist:read", "task:tasklist:write"],
+    "feishu_task_tasklist.list": ["task:tasklist:read", "task:tasklist:write"],
+    "feishu_task_tasklist.tasks": ["task:tasklist:read", "task:tasklist:write"],
+    "feishu_task_tasklist.patch": ["task:tasklist:write"],
+    "feishu_task_tasklist.add_members": ["task:tasklist:write"],
+    "feishu_task_comment.create": ["task:comment:write"],
+    "feishu_task_comment.list": ["task:comment:read", "task:comment:write"],
+    "feishu_task_comment.get": ["task:comment:read", "task:comment:write"],
+    "feishu_task_section.create": ["task:task"],
+    "feishu_task_section.get": ["task:task"],
+    "feishu_task_section.list": ["task:task"],
+    "feishu_task_section.patch": ["task:task"],
+    "feishu_task_section.tasks": ["task:task"],
+    "feishu_task_subtask.create": ["task:task:write"],
+    "feishu_task_subtask.list": ["task:task:read", "task:task:write"],
 }
 
 SENSITIVE_SCOPES = {

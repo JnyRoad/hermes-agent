@@ -3048,6 +3048,179 @@ def test_feishu_im_send_auto_auth_marks_sensitive_scope(monkeypatch):
         unregister_adapter(Platform.FEISHU, adapter)
 
 
+def test_feishu_oauth_resolves_scopes_from_tool_action(monkeypatch):
+    from tools.feishu.oauth import _handle_feishu_oauth
+
+    adapter = SimpleNamespace(
+        get_authorization_status=lambda user_open_id, scopes=None: {
+            "authorized": False,
+            "granted_scopes": [],
+            "requested_scopes": list(scopes or []),
+            "missing_scopes": list(scopes or []),
+            "updated_at": None,
+            "updated_by": "",
+            "source": "",
+        },
+        send_oauth_request_card=AsyncMock(
+            return_value=SendResult(
+                success=True,
+                message_id="msg_auth_oauth_tool",
+                raw_response={"request_id": "fo_tool_1"},
+            )
+        ),
+    )
+
+    register_adapter(Platform.FEISHU, adapter)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "oc_chat_1")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_user_1")
+
+    try:
+        payload = json.loads(
+            _handle_feishu_oauth(
+                {
+                    "action": "authorize",
+                    "tool_name": "feishu_calendar_event",
+                    "action_name": "delete",
+                }
+            )
+        )
+        assert payload["status"] == "pending"
+        assert payload["scopes"] == ["calendar:calendar.event:delete"]
+        assert payload["targets"] == [{"tool_name": "feishu_calendar_event", "action": "delete"}]
+        adapter.send_oauth_request_card.assert_awaited_once()
+    finally:
+        unregister_adapter(Platform.FEISHU, adapter)
+
+
+def test_feishu_oauth_batch_resolves_multiple_tool_actions(monkeypatch):
+    from tools.feishu.oauth import _handle_feishu_oauth_batch
+
+    adapter = SimpleNamespace(
+        get_authorization_status=lambda user_open_id, scopes=None: {
+            "authorized": False,
+            "granted_scopes": [],
+            "requested_scopes": list(scopes or []),
+            "missing_scopes": list(scopes or []),
+            "updated_at": None,
+            "updated_by": "",
+            "source": "",
+        },
+        send_oauth_request_card=AsyncMock(
+            return_value=SendResult(
+                success=True,
+                message_id="msg_auth_batch_tool",
+                raw_response={"request_id": "fo_batch_tool_1"},
+            )
+        ),
+    )
+
+    register_adapter(Platform.FEISHU, adapter)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "oc_chat_1")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_user_1")
+
+    try:
+        payload = json.loads(
+            _handle_feishu_oauth_batch(
+                {
+                    "tool_actions": [
+                        {"tool_name": "feishu_drive_file", "action": "delete"},
+                        {"tool_name": "feishu_im_user_message", "action": "send"},
+                    ]
+                }
+            )
+        )
+        assert payload["status"] == "pending"
+        assert payload["requested_scopes"] == ["space:document:delete", "im:message", "im:message.send_as_user"]
+        assert payload["targets"] == [
+            {"tool_name": "feishu_drive_file", "action": "delete"},
+            {"tool_name": "feishu_im_user_message", "action": "send"},
+        ]
+        adapter.send_oauth_request_card.assert_awaited_once()
+    finally:
+        unregister_adapter(Platform.FEISHU, adapter)
+
+
+def test_feishu_tasklist_auto_auth_pending(monkeypatch):
+    from tools.feishu.tasklist import _handle_tasklist
+
+    adapter = SimpleNamespace(
+        get_authorization_status=lambda user_open_id, scopes=None: {
+            "authorized": False,
+            "granted_scopes": [],
+            "requested_scopes": list(scopes or []),
+            "missing_scopes": list(scopes or []),
+            "updated_at": None,
+            "updated_by": "",
+            "source": "",
+        },
+        send_oauth_request_card=AsyncMock(
+            return_value=SendResult(
+                success=True,
+                message_id="msg_auth_tasklist",
+                raw_response={"request_id": "fo_tasklist_1"},
+            )
+        ),
+    )
+
+    register_adapter(Platform.FEISHU, adapter)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "oc_chat_1")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_user_1")
+
+    try:
+        payload = json.loads(_handle_tasklist({"action": "list"}))
+        assert payload["status"] == "pending_authorization"
+        assert payload["tool"] == "feishu_task_tasklist"
+        assert payload["action"] == "list"
+        assert payload["missing_scopes"] == ["task:tasklist:read", "task:tasklist:write"]
+        adapter.send_oauth_request_card.assert_awaited_once()
+    finally:
+        unregister_adapter(Platform.FEISHU, adapter)
+
+
+def test_feishu_chat_members_auto_auth_pending(monkeypatch):
+    from tools.feishu.chat_members import _handle_chat_members
+
+    adapter = SimpleNamespace(
+        get_authorization_status=lambda user_open_id, scopes=None: {
+            "authorized": False,
+            "granted_scopes": [],
+            "requested_scopes": list(scopes or []),
+            "missing_scopes": list(scopes or []),
+            "updated_at": None,
+            "updated_by": "",
+            "source": "",
+        },
+        send_oauth_request_card=AsyncMock(
+            return_value=SendResult(
+                success=True,
+                message_id="msg_auth_chat_members",
+                raw_response={"request_id": "fo_chat_members_1"},
+            )
+        ),
+    )
+
+    register_adapter(Platform.FEISHU, adapter)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "oc_chat_1")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_user_1")
+
+    try:
+        payload = json.loads(_handle_chat_members({"chat_id": "oc_chat_2"}))
+        assert payload["status"] == "pending_authorization"
+        assert payload["tool"] == "feishu_chat_members"
+        assert payload["missing_scopes"] == ["im:chat.members:read"]
+        adapter.send_oauth_request_card.assert_awaited_once()
+    finally:
+        unregister_adapter(Platform.FEISHU, adapter)
+
+
 def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
     from gateway.platforms.feishu import FeishuAdapter, FeishuPendingOAuthRequest
 

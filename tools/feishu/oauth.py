@@ -18,6 +18,7 @@ import logging
 from typing import Any, Dict, List
 
 from tools.feishu.runtime import get_active_feishu_adapter, require_feishu_session
+from tools.feishu.scopes import get_required_scopes
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,43 @@ def _normalize_scopes(raw_scopes: Any) -> List[str]:
     return result
 
 
+def _normalize_tool_actions(raw_tool_actions: Any) -> List[Dict[str, str]]:
+    """把批量工具动作输入统一为稳定结构。"""
+    if not isinstance(raw_tool_actions, list):
+        return []
+    result: List[Dict[str, str]] = []
+    for item in raw_tool_actions:
+        if not isinstance(item, dict):
+            continue
+        tool_name = str(item.get("tool_name", "")).strip()
+        action = str(item.get("action", "")).strip().lower() or "default"
+        if not tool_name:
+            continue
+        result.append({"tool_name": tool_name, "action": action})
+    return result
+
+
+def _resolve_scope_request(args: Dict[str, Any]) -> Dict[str, Any]:
+    """支持显式 scopes 与 tool/action 推导两种授权输入方式。"""
+    scopes = _normalize_scopes(args.get("scopes"))
+    targets: List[Dict[str, str]] = []
+
+    tool_name = str(args.get("tool_name", "")).strip()
+    action_name = str(args.get("action_name", "")).strip().lower() or "default"
+    if tool_name:
+        scopes.extend(get_required_scopes(tool_name, action_name))
+        targets.append({"tool_name": tool_name, "action": action_name})
+
+    for item in _normalize_tool_actions(args.get("tool_actions")):
+        scopes.extend(get_required_scopes(item["tool_name"], item["action"]))
+        targets.append(item)
+
+    return {
+        "scopes": _normalize_scopes(scopes),
+        "targets": targets,
+    }
+
+
 def _resolve_target_open_id(args: Dict[str, Any], session: Dict[str, str]) -> str:
     """优先使用显式 user_open_id，否则回退到当前会话发送者。"""
     explicit = str(args.get("user_open_id", "") or "").strip()
@@ -76,9 +114,10 @@ def _resolve_target_open_id(args: Dict[str, Any], session: Dict[str, str]) -> st
 
 
 def _handle_authorize(args: Dict[str, Any]) -> str:
-    scopes = _normalize_scopes(args.get("scopes"))
+    scope_request = _resolve_scope_request(args)
+    scopes = scope_request["scopes"]
     if not scopes:
-        return tool_error("Parameter 'scopes' must be a non-empty array.")
+        return tool_error("Provide non-empty scopes, or specify tool_name/action_name, or tool_actions.")
     reason = str(args.get("reason", "")).strip() or "This action requires additional Feishu permissions."
     title = str(args.get("title", "")).strip() or "Feishu Authorization Required"
     try:
@@ -94,6 +133,7 @@ def _handle_authorize(args: Dict[str, Any]) -> str:
                     "granted_scopes": status["granted_scopes"],
                     "requested_scopes": status["requested_scopes"],
                     "missing_scopes": [],
+                    "targets": scope_request["targets"],
                     "updated_at": status["updated_at"],
                     "updated_by": status["updated_by"],
                     "source": status["source"],
@@ -120,6 +160,7 @@ def _handle_authorize(args: Dict[str, Any]) -> str:
                 "user_open_id": requester_open_id,
                 "scopes": scopes,
                 "missing_scopes": status["missing_scopes"],
+                "targets": scope_request["targets"],
                 "request_id": ((result.raw_response or {}) if isinstance(result.raw_response, dict) else {}).get("request_id"),
                 "message_id": result.message_id,
             },
@@ -135,12 +176,14 @@ def _handle_status(args: Dict[str, Any]) -> str:
         adapter = get_active_feishu_adapter()
         session = require_feishu_session()
         user_open_id = _resolve_target_open_id(args, session)
-        scopes = _normalize_scopes(args.get("scopes"))
+        scope_request = _resolve_scope_request(args)
+        scopes = scope_request["scopes"]
         status = adapter.get_authorization_status(user_open_id, scopes)
         return json.dumps(
             {
                 "status": "authorized" if status["authorized"] else "not_authorized",
                 "user_open_id": user_open_id,
+                "targets": scope_request["targets"],
                 **status,
             },
             ensure_ascii=False,
@@ -184,9 +227,10 @@ def _handle_feishu_oauth(args: Dict[str, Any], **_kw) -> str:
 
 
 def _handle_feishu_oauth_batch(args: Dict[str, Any], **_kw) -> str:
-    scopes = _normalize_scopes(args.get("scopes"))
+    scope_request = _resolve_scope_request(args)
+    scopes = scope_request["scopes"]
     if not scopes:
-        return tool_error("Parameter 'scopes' must be a non-empty array.")
+        return tool_error("Provide non-empty scopes, or specify tool_name/action_name, or tool_actions.")
     title = str(args.get("title", "")).strip() or "Feishu Batch Authorization Required"
     reason = str(args.get("reason", "")).strip() or "The requested batch of Feishu actions needs extra permissions."
     try:
@@ -203,6 +247,7 @@ def _handle_feishu_oauth_batch(args: Dict[str, Any], **_kw) -> str:
                     "granted_scopes": status["granted_scopes"],
                     "requested_scopes": scopes,
                     "missing_scopes": [],
+                    "targets": scope_request["targets"],
                 },
                 ensure_ascii=False,
             )
@@ -226,6 +271,7 @@ def _handle_feishu_oauth_batch(args: Dict[str, Any], **_kw) -> str:
                 "user_open_id": requester_open_id,
                 "requested_scopes": scopes,
                 "missing_scopes": missing_scopes,
+                "targets": scope_request["targets"],
                 "request_id": ((result.raw_response or {}) if isinstance(result.raw_response, dict) else {}).get("request_id"),
                 "message_id": result.message_id,
             },
@@ -257,6 +303,26 @@ FEISHU_OAUTH_SCHEMA = {
                 "items": {"type": "string"},
                 "description": "List of Feishu scopes involved in this authorization action.",
             },
+            "tool_name": {
+                "type": "string",
+                "description": "Optional tool name used to derive required scopes automatically.",
+            },
+            "action_name": {
+                "type": "string",
+                "description": "Optional action name used with tool_name. Defaults to default.",
+            },
+            "tool_actions": {
+                "type": "array",
+                "description": "Optional list of tool/action pairs used to derive scopes automatically.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tool_name": {"type": "string"},
+                        "action": {"type": "string"},
+                    },
+                    "required": ["tool_name"],
+                },
+            },
             "reason": {"type": "string", "description": "Why these scopes are needed."},
         },
         "required": [],
@@ -279,9 +345,29 @@ FEISHU_OAUTH_BATCH_SCHEMA = {
                 "items": {"type": "string"},
                 "description": "Batch of Feishu scopes required by upcoming actions.",
             },
+            "tool_name": {
+                "type": "string",
+                "description": "Optional single tool name used to derive scopes automatically.",
+            },
+            "action_name": {
+                "type": "string",
+                "description": "Optional single action used with tool_name. Defaults to default.",
+            },
+            "tool_actions": {
+                "type": "array",
+                "description": "Optional list of tool/action pairs used to derive scopes automatically.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tool_name": {"type": "string"},
+                        "action": {"type": "string"},
+                    },
+                    "required": ["tool_name"],
+                },
+            },
             "reason": {"type": "string", "description": "Why these scopes are required together."},
         },
-        "required": ["scopes"],
+        "required": [],
     },
 }
 

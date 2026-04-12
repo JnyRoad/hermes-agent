@@ -7,6 +7,7 @@ import logging
 from typing import Any, Dict
 
 from tools.feishu.client import feishu_api_request
+from tools.feishu.scopes import ensure_authorization
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,14 @@ def _check_feishu_available() -> bool:
 def _handle_task_comment(args: dict, **_kw) -> str:
     action = str(args.get("action", "")).strip().lower()
     try:
+        auth_result = ensure_authorization(
+            tool_name="feishu_task_comment",
+            action=action,
+            title="Feishu Task Authorization Required",
+        )
+        if auth_result is not None:
+            return auth_result
+
         if action == "create":
             task_guid = str(args.get("task_guid", "")).strip()
             content = str(args.get("content", "")).strip()
