@@ -1047,6 +1047,13 @@ def test_feishu_drive_file_upload_rejects_invalid_base64(monkeypatch):
     assert "Failed to decode file_content_base64" in payload["error"]
 
 
+def test_feishu_drive_file_upload_requires_file_input(monkeypatch):
+    from tools.feishu.drive import _handle_drive_file
+
+    payload = json.loads(_handle_drive_file({"action": "upload"}))
+    assert "Either file_path or file_content_base64 is required" in payload["error"]
+
+
 def test_feishu_drive_file_upload_handler_chunked(monkeypatch, tmp_path):
     from tools.feishu.drive import _handle_drive_file
 
@@ -1417,6 +1424,29 @@ def test_feishu_calendar_event_patch_handler(monkeypatch):
     assert payload["event"]["summary"] == "Updated"
 
 
+def test_feishu_calendar_event_patch_requires_updatable_field(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    monkeypatch.setattr("tools.feishu.calendar_event._calendar_id", lambda _args: "cal_1")
+    payload = json.loads(_handle_calendar_event({"action": "patch", "event_id": "evt_1"}))
+    assert "At least one updatable field is required for patch" in payload["error"]
+
+
+def test_feishu_calendar_event_reply_requires_rsvp_status(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    payload = json.loads(_handle_calendar_event({"action": "reply", "event_id": "evt_1"}))
+    assert "rsvp_status" in payload["error"]
+
+
+def test_feishu_calendar_event_instance_view_requires_time_range(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    payload = json.loads(_handle_calendar_event({"action": "instance_view"}))
+    assert "start_time" in payload["error"]
+    assert "end_time" in payload["error"]
+
+
 def test_feishu_calendar_freebusy_list_handler(monkeypatch):
     from tools.feishu.calendar_freebusy import _handle_calendar_freebusy
 
@@ -1551,6 +1581,13 @@ def test_feishu_task_task_patch_handler(monkeypatch):
     )
     payload = json.loads(_handle_task({"action": "patch", "task_guid": "task_1", "summary": "Updated"}))
     assert payload["task"]["summary"] == "Updated"
+
+
+def test_feishu_task_task_patch_requires_updatable_field(monkeypatch):
+    from tools.feishu.task import _handle_task
+
+    payload = json.loads(_handle_task({"action": "patch", "task_guid": "task_1"}))
+    assert "At least one updatable field is required for patch" in payload["error"]
 
 
 def test_feishu_task_tasklist_create_handler(monkeypatch):
@@ -1690,6 +1727,13 @@ def test_feishu_task_comment_get_handler(monkeypatch):
     assert payload["comment"]["content"] == "ok"
 
 
+def test_feishu_task_comment_get_requires_comment_id(monkeypatch):
+    from tools.feishu.task_comment import _handle_task_comment
+
+    payload = json.loads(_handle_task_comment({"action": "get"}))
+    assert "comment_id" in payload["error"]
+
+
 def test_feishu_task_subtask_create_handler(monkeypatch):
     from tools.feishu.task_subtask import _handle_task_subtask
 
@@ -1701,6 +1745,14 @@ def test_feishu_task_subtask_create_handler(monkeypatch):
         _handle_task_subtask({"action": "create", "task_guid": "task_1", "summary": "child"})
     )
     assert payload["subtask"]["guid"] == "sub_1"
+
+
+def test_feishu_task_subtask_create_requires_summary(monkeypatch):
+    from tools.feishu.task_subtask import _handle_task_subtask
+
+    payload = json.loads(_handle_task_subtask({"action": "create", "task_guid": "task_1"}))
+    assert "task_guid" in payload["error"]
+    assert "summary" in payload["error"]
 
 
 def test_feishu_task_subtask_list_handler(monkeypatch):
@@ -1755,6 +1807,13 @@ def test_feishu_task_section_patch_handler(monkeypatch):
     assert captured["path"].endswith("/sections/sec_1")
     assert captured["json_body"]["update_fields"] == ["name"]
     assert payload["section"]["name"] == "Done"
+
+
+def test_feishu_task_section_patch_requires_updatable_field(monkeypatch):
+    from tools.feishu.task_section import _handle_task_section
+
+    payload = json.loads(_handle_task_section({"action": "patch", "section_guid": "sec_1"}))
+    assert "At least one updatable field is required for patch" in payload["error"]
 
 
 def test_feishu_task_section_list_handler(monkeypatch):
