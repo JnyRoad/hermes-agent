@@ -661,6 +661,21 @@ def test_feishu_drive_file_upload_handler_chunked(monkeypatch, tmp_path):
     assert part_calls == [(0, b"abc"), (1, b"def"), (2, b"gh")]
 
 
+def test_feishu_drive_file_download_handler(monkeypatch, tmp_path):
+    from tools.feishu.drive import _handle_drive_file
+
+    monkeypatch.setattr(
+        "tools.feishu.drive.feishu_api_request_bytes",
+        lambda *a, **kw: (b"hello", {"content-type": "text/plain"}),
+    )
+    target = tmp_path / "demo.txt"
+    payload = json.loads(
+        _handle_drive_file({"action": "download", "file_token": "file_1", "output_path": str(target)})
+    )
+    assert payload["saved_path"] == str(target)
+    assert target.read_bytes() == b"hello"
+
+
 def test_feishu_wiki_space_handler(monkeypatch):
     from tools.feishu.wiki import _handle_wiki_space
 

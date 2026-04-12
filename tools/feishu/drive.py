@@ -10,7 +10,7 @@ from pathlib import Path
 
 import httpx
 
-from tools.feishu.client import feishu_api_request, get_feishu_base_url, get_tenant_access_token
+from tools.feishu.client import feishu_api_request, feishu_api_request_bytes, get_feishu_base_url, get_tenant_access_token
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -269,7 +269,33 @@ def _handle_drive_file(args: dict, **_kw) -> str:
                 ensure_ascii=False,
             )
 
-        return tool_error("Unsupported action. Supported actions: list, get_meta, copy, move, upload")
+        if action == "download":
+            file_token = str(args.get("file_token", "")).strip()
+            output_path = str(args.get("output_path", "")).strip()
+            if not file_token:
+                return tool_error("Missing required parameter: file_token")
+            content, _headers = feishu_api_request_bytes("GET", f"/open-apis/drive/v1/files/{file_token}/download")
+            if output_path:
+                target = Path(output_path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+                target.chmod(0o600)
+                return json.dumps(
+                    {
+                        "saved_path": str(target),
+                        "size": len(content),
+                    },
+                    ensure_ascii=False,
+                )
+            return json.dumps(
+                {
+                    "file_content_base64": base64.b64encode(content).decode("ascii"),
+                    "size": len(content),
+                },
+                ensure_ascii=False,
+            )
+
+        return tool_error("Unsupported action. Supported actions: list, get_meta, copy, move, upload, download")
     except Exception as exc:
         logger.error("feishu_drive_file error: %s", exc)
         return tool_error(f"Failed to execute feishu_drive_file: {exc}")
@@ -277,13 +303,13 @@ def _handle_drive_file(args: dict, **_kw) -> str:
 
 FEISHU_DRIVE_FILE_SCHEMA = {
     "name": "feishu_drive_file",
-    "description": "Manage Feishu Drive files. Supported actions in Hermes now: list, get_meta, copy, move, and upload.",
+    "description": "Manage Feishu Drive files. Supported actions in Hermes now: list, get_meta, copy, move, upload, and download.",
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "get_meta", "copy", "move", "upload"],
+                "enum": ["list", "get_meta", "copy", "move", "upload", "download"],
                 "description": "Drive action to execute.",
             },
             "folder_token": {"type": "string", "description": "Folder token for list action."},
@@ -322,6 +348,7 @@ FEISHU_DRIVE_FILE_SCHEMA = {
             "file_path": {"type": "string", "description": "Absolute local file path for upload action."},
             "file_content_base64": {"type": "string", "description": "Base64-encoded file content for upload action."},
             "file_name": {"type": "string", "description": "Target file name for upload action, or override when using file_path."},
+            "output_path": {"type": "string", "description": "Optional local file path for download action."},
         },
         "required": ["action"],
     },
