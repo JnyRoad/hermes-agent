@@ -258,6 +258,14 @@ def test_feishu_doc_comments_list_handler(monkeypatch):
     assert payload["items"][0]["reply_list"]["replies"][0]["reply_id"] == "r1"
 
 
+def test_feishu_doc_comments_requires_file_target(monkeypatch):
+    from tools.feishu.doc_comments import _handle_doc_comments
+
+    payload = json.loads(_handle_doc_comments({"action": "list", "file_type": "docx"}))
+    assert "file_token" in payload["error"]
+    assert "file_type" in payload["error"]
+
+
 def test_feishu_doc_comments_reply_handler_fallback(monkeypatch):
     from tools.feishu.doc_comments import _handle_doc_comments
 
@@ -286,6 +294,17 @@ def test_feishu_doc_comments_reply_handler_fallback(monkeypatch):
     assert payload["reply_id"] == "r1"
 
 
+def test_feishu_doc_comments_reply_requires_comment_id(monkeypatch):
+    from tools.feishu.doc_comments import _handle_doc_comments
+
+    payload = json.loads(
+        _handle_doc_comments(
+            {"action": "reply", "file_token": "dox_1", "file_type": "docx", "elements": [{"type": "text", "text": "ok"}]}
+        )
+    )
+    assert "comment_id" in payload["error"]
+
+
 def test_feishu_doc_comments_patch_handler(monkeypatch):
     from tools.feishu.doc_comments import _handle_doc_comments
 
@@ -302,6 +321,15 @@ def test_feishu_doc_comments_patch_handler(monkeypatch):
         )
     )
     assert payload["success"] is True
+
+
+def test_feishu_doc_comments_patch_requires_is_solved_value(monkeypatch):
+    from tools.feishu.doc_comments import _handle_doc_comments
+
+    payload = json.loads(
+        _handle_doc_comments({"action": "patch", "file_token": "dox_1", "file_type": "docx", "comment_id": "c1"})
+    )
+    assert "is_solved_value" in payload["error"]
 
 
 def test_feishu_doc_comments_list_replies_handler(monkeypatch):
@@ -484,6 +512,20 @@ def test_feishu_bitable_app_patch_handler(monkeypatch):
     assert payload["app"]["name"] == "CRM Pro"
 
 
+def test_feishu_bitable_app_patch_requires_app_token(monkeypatch):
+    from tools.feishu.bitable_app import _handle_bitable_app
+
+    payload = json.loads(_handle_bitable_app({"action": "patch", "name": "CRM"}))
+    assert "app_token" in payload["error"]
+
+
+def test_feishu_bitable_app_patch_requires_updatable_field(monkeypatch):
+    from tools.feishu.bitable_app import _handle_bitable_app
+
+    payload = json.loads(_handle_bitable_app({"action": "patch", "app_token": "app_1"}))
+    assert "At least one updatable field is required for patch" in payload["error"]
+
+
 def test_feishu_bitable_app_copy_handler(monkeypatch):
     from tools.feishu.bitable_app import _handle_bitable_app
 
@@ -493,6 +535,14 @@ def test_feishu_bitable_app_copy_handler(monkeypatch):
     )
     payload = json.loads(_handle_bitable_app({"action": "copy", "app_token": "app_1", "name": "CRM Copy"}))
     assert payload["app"]["app_token"] == "app_copy"
+
+
+def test_feishu_bitable_app_copy_requires_name(monkeypatch):
+    from tools.feishu.bitable_app import _handle_bitable_app
+
+    payload = json.loads(_handle_bitable_app({"action": "copy", "app_token": "app_1"}))
+    assert "app_token" in payload["error"]
+    assert "name" in payload["error"]
 
 
 def test_feishu_bitable_app_table_list_handler(monkeypatch):
@@ -834,6 +884,24 @@ def test_feishu_bitable_app_table_field_delete_handler(monkeypatch):
     assert payload["field_id"] == "fld_1"
 
 
+def test_feishu_bitable_app_table_field_update_requires_field_id(monkeypatch):
+    from tools.feishu.bitable_app_table_field import _handle_bitable_app_table_field
+
+    payload = json.loads(
+        _handle_bitable_app_table_field({"action": "update", "app_token": "app_1", "table_id": "tbl_1"})
+    )
+    assert "field_id" in payload["error"]
+
+
+def test_feishu_bitable_app_table_field_delete_requires_field_id(monkeypatch):
+    from tools.feishu.bitable_app_table_field import _handle_bitable_app_table_field
+
+    payload = json.loads(
+        _handle_bitable_app_table_field({"action": "delete", "app_token": "app_1", "table_id": "tbl_1"})
+    )
+    assert "field_id" in payload["error"]
+
+
 def test_feishu_bitable_app_table_view_list_handler(monkeypatch):
     from tools.feishu.bitable_app_table_view import _handle_bitable_app_table_view
 
@@ -898,6 +966,27 @@ def test_feishu_bitable_app_table_view_patch_handler(monkeypatch):
     assert captured["path"].endswith("/apps/app_1/tables/tbl_1/views/viw_1")
     assert captured["json_body"] == {"view_name": "Board v2"}
     assert payload["view"]["view_name"] == "Board v2"
+
+
+def test_feishu_bitable_app_table_view_get_requires_view_id(monkeypatch):
+    from tools.feishu.bitable_app_table_view import _handle_bitable_app_table_view
+
+    payload = json.loads(
+        _handle_bitable_app_table_view({"action": "get", "app_token": "app_1", "table_id": "tbl_1"})
+    )
+    assert "view_id" in payload["error"]
+
+
+def test_feishu_bitable_app_table_view_patch_requires_view_name(monkeypatch):
+    from tools.feishu.bitable_app_table_view import _handle_bitable_app_table_view
+
+    payload = json.loads(
+        _handle_bitable_app_table_view(
+            {"action": "patch", "app_token": "app_1", "table_id": "tbl_1", "view_id": "viw_1"}
+        )
+    )
+    assert "view_id" in payload["error"]
+    assert "view_name" in payload["error"]
 
 
 def test_feishu_drive_file_list_handler(monkeypatch):
@@ -1156,6 +1245,13 @@ def test_feishu_wiki_space_get_handler(monkeypatch):
     assert payload["space"]["name"] == "KB"
 
 
+def test_feishu_wiki_space_get_requires_space_id(monkeypatch):
+    from tools.feishu.wiki import _handle_wiki_space
+
+    payload = json.loads(_handle_wiki_space({"action": "get"}))
+    assert "space_id" in payload["error"]
+
+
 def test_feishu_wiki_space_node_handler(monkeypatch):
     from tools.feishu.wiki import _handle_wiki_space_node
 
@@ -1178,6 +1274,13 @@ def test_feishu_wiki_space_node_list_handler(monkeypatch):
     assert payload["nodes"][0]["node_token"] == "wik_1"
 
 
+def test_feishu_wiki_space_node_get_requires_token(monkeypatch):
+    from tools.feishu.wiki import _handle_wiki_space_node
+
+    payload = json.loads(_handle_wiki_space_node({"action": "get"}))
+    assert "token" in payload["error"]
+
+
 def test_feishu_wiki_space_node_create_handler(monkeypatch):
     from tools.feishu.wiki import _handle_wiki_space_node
 
@@ -1191,6 +1294,14 @@ def test_feishu_wiki_space_node_create_handler(monkeypatch):
         )
     )
     assert payload["node"]["node_token"] == "wik_new"
+
+
+def test_feishu_wiki_space_node_create_requires_core_fields(monkeypatch):
+    from tools.feishu.wiki import _handle_wiki_space_node
+
+    payload = json.loads(_handle_wiki_space_node({"action": "create", "space_id": "sp1"}))
+    assert "obj_type" in payload["error"]
+    assert "node_type" in payload["error"]
 
 
 def test_feishu_wiki_space_node_move_handler(monkeypatch):
@@ -1208,6 +1319,14 @@ def test_feishu_wiki_space_node_move_handler(monkeypatch):
     assert payload["node"]["parent_node_token"] == "wik_parent"
 
 
+def test_feishu_wiki_space_node_move_requires_node_token(monkeypatch):
+    from tools.feishu.wiki import _handle_wiki_space_node
+
+    payload = json.loads(_handle_wiki_space_node({"action": "move", "space_id": "sp1"}))
+    assert "space_id" in payload["error"]
+    assert "node_token" in payload["error"]
+
+
 def test_feishu_wiki_space_node_copy_handler(monkeypatch):
     from tools.feishu.wiki import _handle_wiki_space_node
 
@@ -1221,6 +1340,14 @@ def test_feishu_wiki_space_node_copy_handler(monkeypatch):
         )
     )
     assert payload["node"]["node_token"] == "wik_copy"
+
+
+def test_feishu_wiki_space_node_copy_requires_node_token(monkeypatch):
+    from tools.feishu.wiki import _handle_wiki_space_node
+
+    payload = json.loads(_handle_wiki_space_node({"action": "copy", "space_id": "sp1"}))
+    assert "space_id" in payload["error"]
+    assert "node_token" in payload["error"]
 
 
 def test_feishu_calendar_calendar_list_handler(monkeypatch):
