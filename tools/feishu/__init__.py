@@ -13,6 +13,7 @@ from . import calendar_freebusy  # noqa: F401
 from . import chat  # noqa: F401
 from . import chat_members  # noqa: F401
 from . import doc_comments  # noqa: F401
+from . import doc_media  # noqa: F401
 from . import docs  # noqa: F401
 from . import drive  # noqa: F401
 from . import im  # noqa: F401

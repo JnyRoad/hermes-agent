@@ -1,6 +1,7 @@
 """飞书工具注册与调用测试。"""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -25,6 +26,7 @@ def test_feishu_toolset_is_included_in_hermes_feishu():
     assert "feishu_bitable_app_table_view" in resolved
     assert "feishu_sheet" in resolved
     assert "feishu_doc_comments" in resolved
+    assert "feishu_doc_media" in resolved
     assert "feishu_fetch_doc" in resolved
     assert "feishu_ask_user_question" in resolved
     assert "feishu_chat" in resolved
@@ -207,6 +209,59 @@ def test_feishu_doc_comments_patch_handler(monkeypatch):
         )
     )
     assert payload["success"] is True
+
+
+def test_feishu_doc_media_insert_handler(monkeypatch, tmp_path):
+    from tools.feishu.doc_media import _handle_doc_media
+
+    media_file = tmp_path / "demo.png"
+    media_file.write_bytes(b"png-data")
+
+    responses = [
+        {"data": {"children": [{"block_id": "blk_1"}]}},
+        {"data": {}},
+    ]
+
+    monkeypatch.setattr("tools.feishu.doc_media.feishu_api_request", lambda *a, **kw: responses.pop(0))
+    monkeypatch.setattr(
+        "tools.feishu.doc_media._upload_doc_media",
+        lambda **kw: {"file_token": "file_1"},
+    )
+    payload = json.loads(
+        _handle_doc_media(
+            {
+                "action": "insert",
+                "doc_id": "dox_1",
+                "file_path": str(media_file),
+                "type": "image",
+                "align": "center",
+            }
+        )
+    )
+    assert payload["success"] is True
+    assert payload["file_token"] == "file_1"
+
+
+def test_feishu_doc_media_download_handler(monkeypatch, tmp_path):
+    from tools.feishu.doc_media import _handle_doc_media
+
+    monkeypatch.setattr(
+        "tools.feishu.doc_media.feishu_api_request_bytes",
+        lambda *a, **kw: (b"hello", {"content-type": "text/plain"}),
+    )
+    output = tmp_path / "artifact"
+    payload = json.loads(
+        _handle_doc_media(
+            {
+                "action": "download",
+                "resource_token": "file_1",
+                "resource_type": "media",
+                "output_path": str(output),
+            }
+        )
+    )
+    assert payload["saved_path"].endswith(".txt")
+    assert Path(payload["saved_path"]).read_bytes() == b"hello"
 
 
 def test_feishu_bitable_app_list_handler(monkeypatch):

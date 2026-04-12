@@ -215,6 +215,7 @@ TOOLSETS = {
             "feishu_sheet",
             "feishu_fetch_doc",
             "feishu_doc_comments",
+            "feishu_doc_media",
             "feishu_create_doc",
             "feishu_update_doc",
             "feishu_drive_file",
