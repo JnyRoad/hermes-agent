@@ -24,6 +24,7 @@ def test_feishu_toolset_is_included_in_hermes_feishu():
     assert "feishu_bitable_app_table_record" in resolved
     assert "feishu_bitable_app_table_view" in resolved
     assert "feishu_sheet" in resolved
+    assert "feishu_doc_comments" in resolved
     assert "feishu_fetch_doc" in resolved
     assert "feishu_ask_user_question" in resolved
     assert "feishu_chat" in resolved
@@ -145,6 +146,67 @@ def test_feishu_sheet_create_handler(monkeypatch):
     )
     assert payload["spreadsheet_token"] == "sht_new"
     assert payload["initial_write"] == "sheet_1!A1:B2"
+
+
+def test_feishu_doc_comments_list_handler(monkeypatch):
+    from tools.feishu.doc_comments import _handle_doc_comments
+
+    def _fake_request(method, path, **kwargs):
+        if path == "/open-apis/drive/v1/files/dox_1/comments":
+            return {"data": {"items": [{"comment_id": "c1", "reply_list": {"replies": [{}]}}], "has_more": False}}
+        if path == "/open-apis/drive/v1/files/dox_1/comments/c1/replies":
+            return {"data": {"items": [{"reply_id": "r1"}], "has_more": False}}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr("tools.feishu.doc_comments.feishu_api_request", _fake_request)
+    payload = json.loads(_handle_doc_comments({"action": "list", "file_token": "dox_1", "file_type": "docx"}))
+    assert payload["items"][0]["reply_list"]["replies"][0]["reply_id"] == "r1"
+
+
+def test_feishu_doc_comments_reply_handler_fallback(monkeypatch):
+    from tools.feishu.doc_comments import _handle_doc_comments
+
+    calls = []
+
+    def _fake_request(method, path, **kwargs):
+        calls.append(kwargs.get("json_body"))
+        if len(calls) == 1:
+            raise RuntimeError("first format rejected")
+        return {"data": {"reply_id": "r1"}}
+
+    monkeypatch.setattr("tools.feishu.doc_comments.feishu_api_request", _fake_request)
+    payload = json.loads(
+        _handle_doc_comments(
+            {
+                "action": "reply",
+                "file_token": "dox_1",
+                "file_type": "docx",
+                "comment_id": "c1",
+                "elements": [{"type": "text", "text": "ok"}],
+            }
+        )
+    )
+    assert calls[0] == {"content": {"elements": [{"type": "text_run", "text_run": {"text": "ok"}}]}}
+    assert calls[1] == {"reply_elements": [{"type": "text_run", "text_run": {"text": "ok"}}]}
+    assert payload["reply_id"] == "r1"
+
+
+def test_feishu_doc_comments_patch_handler(monkeypatch):
+    from tools.feishu.doc_comments import _handle_doc_comments
+
+    monkeypatch.setattr("tools.feishu.doc_comments.feishu_api_request", lambda *a, **kw: {"data": {}})
+    payload = json.loads(
+        _handle_doc_comments(
+            {
+                "action": "patch",
+                "file_token": "dox_1",
+                "file_type": "docx",
+                "comment_id": "c1",
+                "is_solved_value": True,
+            }
+        )
+    )
+    assert payload["success"] is True
 
 
 def test_feishu_bitable_app_list_handler(monkeypatch):
