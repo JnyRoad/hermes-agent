@@ -363,6 +363,7 @@ class FeishuPendingOAuthRequest:
     tool_name: str = ""
     tool_action: str = "default"
     replay_id: str = ""
+    replay_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -382,6 +383,7 @@ class FeishuPendingAppScopeRequest:
     tool_name: str = ""
     tool_action: str = "default"
     replay_id: str = ""
+    replay_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -393,6 +395,21 @@ class FeishuAuthorizationGrant:
     updated_at: float
     updated_by: str = ""
     source: str = "manual_confirm"
+
+
+def _merge_replay_ids(*values: Any) -> List[str]:
+    """Normalize replay identifiers into a stable de-duplicated list."""
+    result: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        candidates = value if isinstance(value, list) else [value]
+        for candidate in candidates:
+            replay_id = str(candidate or "").strip()
+            if not replay_id or replay_id in seen:
+                continue
+            seen.add(replay_id)
+            result.append(replay_id)
+    return result
 
 
 @dataclass(frozen=True)
@@ -1969,6 +1986,9 @@ class FeishuAdapter(BasePlatformAdapter):
         tool_name = str(metadata.get("tool_name", "") or "").strip()
         tool_action = str(metadata.get("action", "") or "").strip().lower() or "default"
         replay_id = str(metadata.get("replay_id", "") or "").strip()
+        replay_ids = _merge_replay_ids(metadata.get("replay_ids"), replay_id)
+        replay_ids = _merge_replay_ids(metadata.get("replay_ids"), replay_id)
+        replay_ids = _merge_replay_ids(metadata.get("replay_ids"), replay_id)
 
         for state in self._pending_oauth_requests.values():
             if state.chat_id != chat_id:
@@ -2002,8 +2022,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 state.tool_name = state.tool_name or tool_name
             if tool_action:
                 state.tool_action = state.tool_action or tool_action
-            if replay_id:
-                state.replay_id = state.replay_id or replay_id
+            merged_replay_ids = _merge_replay_ids(state.replay_ids, state.replay_id, replay_ids)
+            state.replay_ids = merged_replay_ids
+            state.replay_id = merged_replay_ids[0] if merged_replay_ids else ""
             return SendResult(
                 success=True,
                 message_id=state.message_id,
@@ -2059,7 +2080,8 @@ class FeishuAdapter(BasePlatformAdapter):
                     account_id=account_id,
                     tool_name=tool_name,
                     tool_action=tool_action,
-                    replay_id=replay_id,
+                    replay_id=replay_ids[0] if replay_ids else replay_id,
+                    replay_ids=list(replay_ids),
                 )
                 result.raw_response = {
                     **(result.raw_response if isinstance(result.raw_response, dict) else {}),
@@ -2118,6 +2140,7 @@ class FeishuAdapter(BasePlatformAdapter):
         tool_name = str(metadata.get("tool_name", "") or "").strip()
         tool_action = str(metadata.get("action", "") or "").strip().lower() or "default"
         replay_id = str(metadata.get("replay_id", "") or "").strip()
+        replay_ids = _merge_replay_ids(metadata.get("replay_ids"), replay_id)
 
         for state in self._pending_app_scope_requests.values():
             if state.chat_id != chat_id:
@@ -2172,8 +2195,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 state.tool_name = state.tool_name or tool_name
             if tool_action:
                 state.tool_action = state.tool_action or tool_action
-            if replay_id:
-                state.replay_id = state.replay_id or replay_id
+            merged_replay_ids = _merge_replay_ids(state.replay_ids, state.replay_id, replay_ids)
+            state.replay_ids = merged_replay_ids
+            state.replay_id = merged_replay_ids[0] if merged_replay_ids else ""
             return SendResult(
                 success=True,
                 message_id=state.message_id,
@@ -2239,7 +2263,8 @@ class FeishuAdapter(BasePlatformAdapter):
                     account_id=account_id,
                     tool_name=tool_name,
                     tool_action=tool_action,
-                    replay_id=replay_id,
+                    replay_id=replay_ids[0] if replay_ids else replay_id,
+                    replay_ids=list(replay_ids),
                 )
                 result.raw_response = {
                     **(result.raw_response if isinstance(result.raw_response, dict) else {}),
@@ -3174,43 +3199,76 @@ class FeishuAdapter(BasePlatformAdapter):
         目标是把“缺权限 -> 授权 -> 重放”闭环收敛到平台侧，而不是再依赖模型理解
         提示文本后自行重试一次。
         """
-        replay_id = str(state.replay_id or "").strip()
-        if not replay_id:
+        replay_ids = _merge_replay_ids(getattr(state, "replay_ids", []), getattr(state, "replay_id", ""))
+        if not replay_ids:
             return False
         pending_replays = getattr(self, "_pending_tool_replays", None)
         if not isinstance(pending_replays, dict):
             return False
-        replay = pending_replays.pop(replay_id, None)
-        if not isinstance(replay, dict):
-            return False
-
-        tool_name = str(replay.get("tool_name", "") or "").strip()
-        args = replay.get("args") if isinstance(replay.get("args"), dict) else {}
-        if not tool_name:
-            return False
 
         from tools.registry import registry
 
-        result_text = await asyncio.to_thread(registry.dispatch, tool_name, args, task_id=None, user_task=None)
-        try:
-            parsed = json.loads(result_text)
-        except Exception:
-            parsed = {"raw_result": result_text}
+        replay_results: List[Dict[str, Any]] = []
+        replayed_any = False
+        had_failure = False
+        for replay_id in replay_ids:
+            replay = pending_replays.pop(replay_id, None)
+            if not isinstance(replay, dict):
+                replay_results.append(
+                    {
+                        "replay_id": replay_id,
+                        "tool_name": "",
+                        "status": "missing",
+                        "result": {"error": "Pending replay state was not found."},
+                    }
+                )
+                had_failure = True
+                continue
 
-        if isinstance(parsed, dict) and parsed.get("error"):
-            body = (
-                f"Feishu authorized tool replay failed.\n\n"
-                f"Tool: `{tool_name}`\n"
-                f"Authorized user: `{requester_open_id}`\n\n"
-                f"Error:\n```json\n{json.dumps(parsed, ensure_ascii=False, indent=2)}\n```"
+            tool_name = str(replay.get("tool_name", "") or "").strip()
+            args = replay.get("args") if isinstance(replay.get("args"), dict) else {}
+            if not tool_name:
+                replay_results.append(
+                    {
+                        "replay_id": replay_id,
+                        "tool_name": "",
+                        "status": "invalid",
+                        "result": {"error": "Pending replay tool name was missing."},
+                    }
+                )
+                had_failure = True
+                continue
+
+            result_text = await asyncio.to_thread(registry.dispatch, tool_name, args, task_id=None, user_task=None)
+            try:
+                parsed = json.loads(result_text)
+            except Exception:
+                parsed = {"raw_result": result_text}
+            status = "ok"
+            if isinstance(parsed, dict) and parsed.get("error"):
+                status = "error"
+                had_failure = True
+            replay_results.append(
+                {
+                    "replay_id": replay_id,
+                    "tool_name": tool_name,
+                    "status": status,
+                    "result": parsed,
+                }
             )
-        else:
-            body = (
-                f"Feishu authorized tool replay completed.\n\n"
-                f"Tool: `{tool_name}`\n"
-                f"Authorized user: `{requester_open_id}`\n\n"
-                f"Result:\n```json\n{json.dumps(parsed, ensure_ascii=False, indent=2)}\n```"
-            )
+            replayed_any = True
+
+        if not replay_results:
+            return False
+
+        body_header = "Feishu authorized tool replay completed."
+        if had_failure:
+            body_header = "Feishu authorized tool replay completed with issues."
+        body = (
+            f"{body_header}\n\n"
+            f"Authorized user: `{requester_open_id}`\n\n"
+            f"Replay results:\n```json\n{json.dumps(replay_results, ensure_ascii=False, indent=2)}\n```"
+        )
         send_result = await self.send(
             state.chat_id,
             body,
@@ -3219,7 +3277,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 "account_id": state.account_id or None,
             },
         )
-        return bool(send_result.success)
+        return bool(send_result.success and replayed_any)
 
     def _is_card_action_duplicate(self, token: str) -> bool:
         """Return True if this card action token was already processed within the dedup window."""
@@ -3479,6 +3537,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         "tool_name": state.tool_name,
                         "action": state.tool_action,
                         "replay_id": state.replay_id or None,
+                        "replay_ids": list(_merge_replay_ids(state.replay_ids, state.replay_id)),
                     },
                 )
                 logger.info(

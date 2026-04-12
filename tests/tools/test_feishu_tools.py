@@ -3706,6 +3706,7 @@ def test_feishu_adapter_promotes_app_scope_request_to_user_oauth(monkeypatch):
         tool_name="feishu_calendar_event",
         tool_action="delete",
         replay_id="fr_1",
+        replay_ids=["fr_1"],
     )
     adapter.record_authorization_grant(
         user_open_id="ou_requester",
@@ -3741,6 +3742,61 @@ def test_feishu_adapter_promotes_app_scope_request_to_user_oauth(monkeypatch):
     assert kwargs["scopes"] == ["calendar:calendar.event:delete"]
     assert kwargs["metadata"]["requester_open_id"] == "ou_requester"
     assert kwargs["metadata"]["replay_id"] == "fr_1"
+    assert kwargs["metadata"]["replay_ids"] == ["fr_1"]
+
+
+def test_feishu_adapter_merges_pending_app_scope_request_replay_ids(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingAppScopeRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._client = object()
+    adapter._pending_app_scope_requests["fas_existing"] = FeishuPendingAppScopeRequest(
+        request_id="fas_existing",
+        chat_id="oc_chat_1",
+        message_id="msg_app_scope_1",
+        scopes=["calendar:calendar.event:delete"],
+        reason="Need app scopes.",
+        title="App Auth",
+        owner_open_id="ou_owner",
+        requester_open_id="ou_user_1",
+        thread_id="omt_1",
+        account_id="feishu-cn",
+        tool_name="feishu_calendar_event",
+        tool_action="delete",
+        replay_id="fr_existing",
+        replay_ids=["fr_existing"],
+    )
+    adapter._update_interactive_card = AsyncMock()
+
+    import asyncio
+
+    result = asyncio.run(
+        adapter.send_app_scope_request_card(
+            chat_id="oc_chat_1",
+            scopes=["im:message:send_as_bot"],
+            reason="Need more app scopes.",
+            title="App Auth",
+            metadata={
+                "thread_id": "omt_1",
+                "account_id": "feishu-cn",
+                "owner_open_id": "ou_owner",
+                "requester_open_id": "ou_user_1",
+                "tool_name": "feishu_im_user_message",
+                "action": "send",
+                "replay_id": "fr_later",
+            },
+        )
+    )
+
+    assert result.success is True
+    state = adapter._pending_app_scope_requests["fas_existing"]
+    assert state.replay_id == "fr_existing"
+    assert state.replay_ids == ["fr_existing", "fr_later"]
+    adapter._update_interactive_card.assert_awaited_once()
 
 
 def test_feishu_adapter_rejects_app_scope_completion_before_scopes_exist(monkeypatch):
@@ -3809,6 +3865,8 @@ def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
         account_id="feishu-cn",
         tool_name="feishu_get_user",
         tool_action="default",
+        replay_id="fr_existing",
+        replay_ids=["fr_existing"],
     )
     adapter._update_interactive_card = AsyncMock()
 
@@ -3826,6 +3884,7 @@ def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
                 "requester_open_id": "ou_user_1",
                 "tool_name": "feishu_calendar_event",
                 "action": "get",
+                "replay_id": "fr_later",
             },
         )
     )
@@ -3837,6 +3896,8 @@ def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
     assert state.scopes == ["contact:user.base:readonly", "calendar:calendar.readonly"]
     assert state.tool_name == "feishu_get_user"
     assert state.tool_action == "default"
+    assert state.replay_id == "fr_existing"
+    assert state.replay_ids == ["fr_existing", "fr_later"]
     adapter._update_interactive_card.assert_awaited_once()
     assert adapter._update_interactive_card.await_args.kwargs["account_id"] == "feishu-cn"
 
@@ -3861,6 +3922,7 @@ def test_feishu_adapter_records_oauth_completion(monkeypatch):
         tool_name="feishu_drive_file",
         tool_action="delete",
         replay_id="fr_1",
+        replay_ids=["fr_1"],
     )
     adapter._resolve_sender_profile = AsyncMock(
         return_value={"user_id": "ou_operator", "user_name": "Alice", "user_id_alt": "ou_operator"}
@@ -3900,9 +3962,77 @@ def test_feishu_adapter_records_oauth_completion(monkeypatch):
     adapter.send.assert_awaited_once()
     sent_text = adapter.send.await_args.args[1]
     assert "Feishu authorized tool replay completed" in sent_text
-    assert "`feishu_drive_file`" in sent_text
+    assert '"tool_name": "feishu_drive_file"' in sent_text
     assert adapter.send.await_args.kwargs["metadata"]["account_id"] == "feishu-cn"
     adapter._handle_message_with_guards.assert_not_awaited()
+
+
+def test_feishu_adapter_replays_all_merged_oauth_actions(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingOAuthRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._pending_oauth_requests["fo_1"] = FeishuPendingOAuthRequest(
+        request_id="fo_1",
+        chat_id="oc_chat_1",
+        message_id="msg_auth_1",
+        scopes=["contact:user.base:readonly", "calendar:calendar.event:delete"],
+        reason="Need multiple scopes.",
+        title="Auth",
+        requester_open_id="ou_requester",
+        account_id="feishu-cn",
+        tool_name="feishu_drive_file",
+        tool_action="delete",
+        replay_id="fr_1",
+        replay_ids=["fr_1", "fr_2"],
+    )
+    adapter._resolve_sender_profile = AsyncMock(
+        return_value={"user_id": "ou_operator", "user_name": "Alice", "user_id_alt": "ou_operator"}
+    )
+    adapter.get_chat_info = AsyncMock(return_value={"name": "Backend Chat", "chat_type": "group"})
+    adapter._update_interactive_card = AsyncMock()
+    adapter._handle_message_with_guards = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg_result"))
+    adapter._pending_tool_replays = {
+        "fr_1": {
+            "tool_name": "feishu_drive_file",
+            "args": {"action": "delete", "file_token": "file_1", "type": "file"},
+            "chat_id": "oc_chat_1",
+            "thread_id": "",
+            "user_id": "ou_requester",
+        },
+        "fr_2": {
+            "tool_name": "feishu_calendar_event",
+            "args": {"action": "delete", "calendar_id": "cal_1", "event_id": "evt_1"},
+            "chat_id": "oc_chat_1",
+            "thread_id": "",
+            "user_id": "ou_requester",
+        },
+    }
+    monkeypatch.setattr(
+        "tools.registry.registry.dispatch",
+        lambda name, args, **kwargs: json.dumps({"success": True, "tool": name, "args": args}, ensure_ascii=False),
+    )
+
+    event = SimpleNamespace(
+        token="tok_auth_multi",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_requester"),
+        action=SimpleNamespace(tag="button", value={"hermes_action": "complete_oauth", "request_id": "fo_1"}),
+    )
+
+    import asyncio
+
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+    adapter.send.assert_awaited_once()
+    sent_text = adapter.send.await_args.args[1]
+    assert "completed" in sent_text
+    assert '"tool_name": "feishu_drive_file"' in sent_text
+    assert '"tool_name": "feishu_calendar_event"' in sent_text
 
 
 def test_feishu_adapter_rejects_oauth_completion_from_other_user(monkeypatch):
