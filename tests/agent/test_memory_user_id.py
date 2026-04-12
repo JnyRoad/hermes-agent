@@ -56,6 +56,13 @@ class RecordingProvider(MemoryProvider):
         pass
 
 
+class BuiltinRecordingProvider(RecordingProvider):
+    """模拟内置记忆提供者，验证 builtin + external 并存路径。"""
+
+    def __init__(self):
+        super().__init__("builtin")
+
+
 # ---------------------------------------------------------------------------
 # MemoryManager user_id threading tests
 # ---------------------------------------------------------------------------
@@ -109,11 +116,9 @@ class TestMemoryManagerUserIdThreading:
         assert "user_id" not in p._init_kwargs
 
     def test_multiple_providers_all_receive_user_id(self):
-        from agent.builtin_memory_provider import BuiltinMemoryProvider
-
         mgr = MemoryManager()
         # Use builtin + one external (MemoryManager only allows one external)
-        builtin = BuiltinMemoryProvider()
+        builtin = BuiltinRecordingProvider()
         ext = RecordingProvider("external")
         mgr.add_provider(builtin)
         mgr.add_provider(ext)

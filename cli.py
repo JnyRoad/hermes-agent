@@ -78,6 +78,24 @@ _project_env = Path(__file__).parent / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
 
 
+def _chrome_debug_data_dir() -> str:
+    """返回 Chrome 调试实例的用户数据目录。
+
+    优先使用当前 profile 的 HERMES_HOME。若目录不可写，则回退到系统临时目录，
+    保证浏览器调试辅助功能在受限环境和测试环境中也能安全降级。
+    """
+    primary_dir = get_hermes_home() / "chrome-debug"
+    try:
+        primary_dir.mkdir(parents=True, exist_ok=True)
+        return str(primary_dir)
+    except OSError:
+        import tempfile
+
+        fallback_dir = Path(tempfile.gettempdir()) / "hermes-chrome-debug"
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        return str(fallback_dir)
+
+
 # =============================================================================
 # Configuration Loading
 # =============================================================================
@@ -5524,8 +5542,10 @@ class HermesCLI:
             return False
 
         # Dedicated profile dir so debug Chrome won't collide with normal Chrome
-        data_dir = str(_hermes_home / "chrome-debug")
-        os.makedirs(data_dir, exist_ok=True)
+        try:
+            data_dir = _chrome_debug_data_dir()
+        except OSError:
+            return False
 
         chrome = candidates[0]
         try:
@@ -5615,7 +5635,7 @@ class HermesCLI:
                 else:
                     print("   ⚠ Could not auto-launch Chrome")
                     # Show manual instructions as fallback
-                    _data_dir = str(_hermes_home / "chrome-debug")
+                    _data_dir = _chrome_debug_data_dir()
                     sys_name = _plat.system()
                     if sys_name == "Darwin":
                         chrome_cmd = (

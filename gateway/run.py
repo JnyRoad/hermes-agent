@@ -2649,15 +2649,22 @@ class GatewayRunner:
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
-                            proc = await asyncio.create_subprocess_shell(
+                            import subprocess
+
+                            # 快捷命令是显式的同步旁路入口，直接执行受限子进程，
+                            # 避免异步 subprocess 在不同事件循环实现下出现回收挂起。
+                            result = subprocess.run(
                                 exec_cmd,
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE,
+                                shell=True,
+                                capture_output=True,
+                                text=True,
+                                timeout=30,
                             )
-                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-                            output = (stdout or stderr).decode().strip()
+                            output = (result.stdout or result.stderr).strip()
                             return output if output else "Command returned no output."
                         except asyncio.TimeoutError:
+                            return "Quick command timed out (30s)."
+                        except subprocess.TimeoutExpired:
                             return "Quick command timed out (30s)."
                         except Exception as e:
                             return f"Quick command error: {e}"
@@ -7816,7 +7823,9 @@ class GatewayRunner:
                     return
                 await asyncio.sleep(0.05)
 
-        stream_task = asyncio.create_task(_start_stream_consumer())
+        stream_task = None
+        if self.adapters.get(source.platform) is not None:
+            stream_task = asyncio.create_task(_start_stream_consumer())
         
         # Track this agent as running for this session (for interrupt support)
         # We do this in a callback after the agent is created

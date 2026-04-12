@@ -137,7 +137,9 @@ class TestGatewayQuickCommands:
         runner._is_user_authorized = MagicMock(return_value=True)
 
         event = self._make_event("limits")
-        result = await runner._handle_message(event)
+        completed = subprocess.CompletedProcess(args="echo ok", returncode=0, stdout="ok\n", stderr="")
+        with patch("subprocess.run", return_value=completed):
+            result = await runner._handle_message(event)
         assert result == "ok"
 
     @pytest.mark.asyncio
@@ -157,7 +159,7 @@ class TestGatewayQuickCommands:
     @pytest.mark.asyncio
     async def test_timeout_returns_error(self):
         from gateway.run import GatewayRunner
-        import asyncio
+        import subprocess
         runner = GatewayRunner.__new__(GatewayRunner)
         runner.config = {"quick_commands": {"slow": {"type": "exec", "command": "sleep 100"}}}
         runner._running_agents = {}
@@ -165,7 +167,7 @@ class TestGatewayQuickCommands:
         runner._is_user_authorized = MagicMock(return_value=True)
 
         event = self._make_event("slow")
-        with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("sleep 100", 30)):
             result = await runner._handle_message(event)
         assert result is not None
         assert "timed out" in result.lower()
@@ -184,5 +186,7 @@ class TestGatewayQuickCommands:
         runner._is_user_authorized = MagicMock(return_value=True)
 
         event = self._make_event("limits")
-        result = await runner._handle_message(event)
+        completed = subprocess.CompletedProcess(args="echo ok", returncode=0, stdout="ok\n", stderr="")
+        with patch("subprocess.run", return_value=completed):
+            result = await runner._handle_message(event)
         assert result == "ok"
