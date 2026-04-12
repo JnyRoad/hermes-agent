@@ -3091,6 +3091,37 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertFalse(cfg["enabled"])
         self.assertEqual(cfg["edit_interval"], 0.6)
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_feishu_formats_tool_progress_as_markdown_trace(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        rendered = adapter.format_tool_progress_content(
+            [
+                '📄 feishu_fetch_doc: "spec.md"',
+                '🗓️ feishu_calendar_event: "team sync"',
+            ]
+        )
+
+        self.assertIn("**Tool Activity**", rendered)
+        self.assertIn('- 📄 feishu_fetch_doc: "spec.md"', rendered)
+        self.assertIn('_Running tools for this request..._', rendered)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_gateway_progress_renderer_uses_adapter_formatter(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.run import _render_progress_content
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        rendered = _render_progress_content(adapter, ['📄 feishu_fetch_doc: "spec.md"'])
+
+        self.assertIn("**Tool Activity**", rendered)
+        self.assertIn('- 📄 feishu_fetch_doc: "spec.md"', rendered)
+
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
 class TestWebhookSecurity(unittest.TestCase):

@@ -1247,6 +1247,10 @@ class BasePlatformAdapter(ABC):
                     pass
             self._typing_paused.discard(chat_id)
 
+    def format_tool_progress_content(self, progress_lines: list[str]) -> str:
+        """将工具进度行渲染为平台可直接发送的文本内容。"""
+        return "\n".join(str(line) for line in progress_lines if str(line).strip())
+
     def pause_typing_for_chat(self, chat_id: str) -> None:
         """Pause typing indicator for a chat (e.g. during approval waits).
 

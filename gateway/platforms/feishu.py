@@ -4254,6 +4254,17 @@ class FeishuAdapter(BasePlatformAdapter):
             "cursor": default_cursor,
         }
 
+    def format_tool_progress_content(self, progress_lines: List[str]) -> str:
+        """将工具进度渲染为飞书更易读的富文本轨迹。"""
+        cleaned_lines = [str(line).strip() for line in progress_lines if str(line).strip()]
+        if not cleaned_lines:
+            return ""
+        rendered_lines = ["**Tool Activity**", ""]
+        rendered_lines.extend(f"- {line}" for line in cleaned_lines)
+        rendered_lines.append("")
+        rendered_lines.append("_Running tools for this request..._")
+        return "\n".join(rendered_lines)
+
     async def _send_uploaded_file_message(
         self,
         *,

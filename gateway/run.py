@@ -296,6 +296,16 @@ def _expand_whatsapp_auth_aliases(identifier: str) -> set:
 
     return resolved
 
+
+def _render_progress_content(adapter: BasePlatformAdapter, progress_lines: List[str]) -> str:
+    """通过平台适配器渲染工具进度，默认回退为纯文本拼接。"""
+    try:
+        return adapter.format_tool_progress_content(progress_lines)
+    except Exception:
+        logger.debug("[%s] Failed to format tool progress content", adapter.name, exc_info=True)
+    return "\n".join(str(line) for line in progress_lines if str(line).strip())
+
+
 logger = logging.getLogger(__name__)
 
 # Sentinel placed into _running_agents immediately when a session starts
@@ -7413,7 +7423,7 @@ class GatewayRunner:
 
                     if can_edit and progress_msg_id is not None:
                         # Try to edit the existing progress message
-                        full_text = "\n".join(progress_lines)
+                        full_text = _render_progress_content(adapter, progress_lines)
                         result = await adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=progress_msg_id,
@@ -7434,7 +7444,7 @@ class GatewayRunner:
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
+                            full_text = _render_progress_content(adapter, progress_lines)
                             result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
                         else:
                             # Editing unsupported: send just this line
@@ -7465,7 +7475,7 @@ class GatewayRunner:
                             break
                     # Final edit with all remaining tools (only if editing works)
                     if can_edit and progress_lines and progress_msg_id:
-                        full_text = "\n".join(progress_lines)
+                        full_text = _render_progress_content(adapter, progress_lines)
                         try:
                             await adapter.edit_message(
                                 chat_id=source.chat_id,
