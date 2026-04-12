@@ -28,6 +28,37 @@ def _validate_fields(value: Any, field_name: str = "fields") -> dict[str, Any]:
     return value
 
 
+def _validate_batch_records(value: Any, *, require_record_id: bool) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("records must be a non-empty array")
+    if len(value) > 500:
+        raise ValueError("records exceeds the maximum size of 500")
+    validated: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"records[{index}] must be an object")
+        current: dict[str, Any] = {}
+        if require_record_id:
+            record_id = str(item.get("record_id", "")).strip()
+            if not record_id:
+                raise ValueError(f"records[{index}].record_id is required")
+            current["record_id"] = record_id
+        current["fields"] = _validate_fields(item.get("fields"), field_name=f"records[{index}].fields")
+        validated.append(current)
+    return validated
+
+
+def _validate_record_ids(value: Any) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("record_ids must be a non-empty array")
+    if len(value) > 500:
+        raise ValueError("record_ids exceeds the maximum size of 500")
+    result = [str(item).strip() for item in value if str(item).strip()]
+    if len(result) != len(value):
+        raise ValueError("record_ids cannot contain empty values")
+    return result
+
+
 def _handle_bitable_app_table_record(args: dict, **_kw) -> str:
     action = str(args.get("action", "")).strip().lower()
     app_token = str(args.get("app_token", "")).strip()
@@ -110,7 +141,56 @@ def _handle_bitable_app_table_record(args: dict, **_kw) -> str:
                 ensure_ascii=False,
             )
 
-        return tool_error("Unsupported action. Supported actions: create, list, update, delete")
+        if action == "batch_create":
+            records = _validate_batch_records(args.get("records"), require_record_id=False)
+            data = feishu_api_request(
+                "POST",
+                f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_create",
+                json_body={"records": records},
+            )
+            payload = data.get("data") or {}
+            return json.dumps(
+                {
+                    "records": payload.get("records", []),
+                    "total": payload.get("total"),
+                },
+                ensure_ascii=False,
+            )
+
+        if action == "batch_update":
+            records = _validate_batch_records(args.get("records"), require_record_id=True)
+            data = feishu_api_request(
+                "POST",
+                f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_update",
+                json_body={"records": records},
+            )
+            payload = data.get("data") or {}
+            return json.dumps(
+                {
+                    "records": payload.get("records", []),
+                    "total": payload.get("total"),
+                },
+                ensure_ascii=False,
+            )
+
+        if action == "batch_delete":
+            record_ids = _validate_record_ids(args.get("record_ids"))
+            data = feishu_api_request(
+                "POST",
+                f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_delete",
+                json_body={"record_ids": record_ids},
+            )
+            payload = data.get("data") or {}
+            return json.dumps(
+                {
+                    "deleted": True,
+                    "record_ids": record_ids,
+                    "total": payload.get("total"),
+                },
+                ensure_ascii=False,
+            )
+
+        return tool_error("Unsupported action. Supported actions: create, list, update, delete, batch_create, batch_update, batch_delete")
     except Exception as exc:
         logger.error("feishu_bitable_app_table_record error: %s", exc)
         return tool_error(f"Failed to execute feishu_bitable_app_table_record: {exc}")
@@ -118,11 +198,11 @@ def _handle_bitable_app_table_record(args: dict, **_kw) -> str:
 
 FEISHU_BITABLE_APP_TABLE_RECORD_SCHEMA = {
     "name": "feishu_bitable_app_table_record",
-    "description": "Manage Feishu bitable records. Hermes currently supports create, list, update, and delete.",
+    "description": "Manage Feishu bitable records. Hermes currently supports create, list, update, delete, batch_create, batch_update, and batch_delete.",
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["create", "list", "update", "delete"], "description": "Bitable record action."},
+            "action": {"type": "string", "enum": ["create", "list", "update", "delete", "batch_create", "batch_update", "batch_delete"], "description": "Bitable record action."},
             "app_token": {"type": "string", "description": "Bitable app token."},
             "table_id": {"type": "string", "description": "Bitable table ID."},
             "record_id": {"type": "string", "description": "Record ID for update or delete action."},
@@ -138,6 +218,16 @@ FEISHU_BITABLE_APP_TABLE_RECORD_SCHEMA = {
             "automatic_fields": {"type": "boolean", "description": "Whether to return automatic fields in list action."},
             "page_size": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Page size for list action."},
             "page_token": {"type": "string", "description": "Pagination token for list action."},
+            "records": {
+                "type": "array",
+                "description": "Batch record payload for batch_create or batch_update.",
+                "items": {"type": "object"},
+            },
+            "record_ids": {
+                "type": "array",
+                "description": "Record ID list for batch_delete.",
+                "items": {"type": "string"},
+            },
         },
         "required": ["action", "app_token", "table_id"],
     },
