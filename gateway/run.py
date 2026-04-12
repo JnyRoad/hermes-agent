@@ -4166,7 +4166,15 @@ class GatewayRunner:
 
         if subcommand == "status":
             scopes = _parse_scope_tokens(payload_args)
-            status = adapter.get_authorization_status(user_open_id, scopes or None)
+            account_id = getattr(event.source, "account_id", None)
+            if account_id:
+                status = adapter.get_authorization_status(
+                    user_open_id,
+                    scopes or None,
+                    account_id=account_id,
+                )
+            else:
+                status = adapter.get_authorization_status(user_open_id, scopes or None)
             lines = [
                 "🔐 **Feishu Authorization Status**",
                 f"- Authorized: {'yes' if status.get('authorized') else 'no'}",
@@ -4185,7 +4193,15 @@ class GatewayRunner:
 
         if subcommand == "revoke":
             scopes = _parse_scope_tokens(payload_args)
-            status = adapter.revoke_authorization(user_open_id, scopes or None)
+            account_id = getattr(event.source, "account_id", None)
+            if account_id:
+                status = adapter.revoke_authorization(
+                    user_open_id,
+                    scopes or None,
+                    account_id=account_id,
+                )
+            else:
+                status = adapter.revoke_authorization(user_open_id, scopes or None)
             target = ", ".join(scopes) if scopes else "all local Feishu scopes"
             return (
                 "🗑 **Feishu authorization revoked**\n"
@@ -4205,6 +4221,7 @@ class GatewayRunner:
                 title="Feishu Authorization Required",
                 metadata={
                     "thread_id": thread_id,
+                    "account_id": getattr(event.source, "account_id", None),
                     "requester_open_id": user_open_id,
                     "tool_name": "feishu_oauth",
                     "action": "authorize",
@@ -4235,6 +4252,7 @@ class GatewayRunner:
             title="Feishu Authorization Required",
             metadata={
                 "thread_id": thread_id,
+                "account_id": getattr(event.source, "account_id", None),
                 "requester_open_id": user_open_id,
                 "tool_name": tool_name,
                 "action": action_name,

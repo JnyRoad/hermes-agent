@@ -1205,7 +1205,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._approval_counter = itertools.count(1)
         self._pending_questions: Dict[str, FeishuPendingQuestion] = {}
         self._pending_oauth_requests: Dict[str, FeishuPendingOAuthRequest] = {}
-        self._authorization_grants: Dict[str, FeishuAuthorizationGrant] = {}
+        self._authorization_grants: Dict[str, Dict[str, FeishuAuthorizationGrant]] = {}
         self._load_seen_message_ids()
         self._load_authorization_grants()
 
@@ -2902,6 +2902,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     scopes=state.scopes,
                     updated_by=open_id,
                     source="interactive_confirm",
+                    account_id=account_id or state.account_id or None,
                 )
                 await self._update_interactive_card(
                     message_id=state.message_id,
@@ -4277,25 +4278,31 @@ class FeishuAdapter(BasePlatformAdapter):
         except (OSError, json.JSONDecodeError):
             logger.warning("[Feishu] Failed to load OAuth grant state from %s", self._oauth_state_path, exc_info=True)
             return
-        app_payload = payload.get(self._app_id, {}) if isinstance(payload, dict) else {}
-        if not isinstance(app_payload, dict):
+        if not isinstance(payload, dict):
             return
-        grants: Dict[str, FeishuAuthorizationGrant] = {}
-        for open_id, item in app_payload.items():
-            if not isinstance(item, dict):
+        grants_by_app: Dict[str, Dict[str, FeishuAuthorizationGrant]] = {}
+        for app_id, app_payload in payload.items():
+            app_id = str(app_id or "").strip()
+            if not app_id or not isinstance(app_payload, dict):
                 continue
-            scopes = [str(scope).strip() for scope in item.get("scopes", []) if str(scope).strip()]
-            open_id = str(open_id or "").strip()
-            if not open_id or not scopes:
-                continue
-            grants[open_id] = FeishuAuthorizationGrant(
-                user_open_id=open_id,
-                scopes=scopes,
-                updated_at=float(item.get("updated_at") or 0.0),
-                updated_by=str(item.get("updated_by", "") or ""),
-                source=str(item.get("source", "manual_confirm") or "manual_confirm"),
-            )
-        self._authorization_grants = grants
+            app_grants: Dict[str, FeishuAuthorizationGrant] = {}
+            for open_id, item in app_payload.items():
+                if not isinstance(item, dict):
+                    continue
+                scopes = [str(scope).strip() for scope in item.get("scopes", []) if str(scope).strip()]
+                open_id = str(open_id or "").strip()
+                if not open_id or not scopes:
+                    continue
+                app_grants[open_id] = FeishuAuthorizationGrant(
+                    user_open_id=open_id,
+                    scopes=scopes,
+                    updated_at=float(item.get("updated_at") or 0.0),
+                    updated_by=str(item.get("updated_by", "") or ""),
+                    source=str(item.get("source", "manual_confirm") or "manual_confirm"),
+                )
+            if app_grants:
+                grants_by_app[app_id] = app_grants
+        self._authorization_grants = grants_by_app
 
     def _persist_authorization_grants(self) -> None:
         """把当前飞书应用的本地授权状态写回磁盘。"""
@@ -4309,18 +4316,42 @@ class FeishuAdapter(BasePlatformAdapter):
                 payload = {}
             except (OSError, json.JSONDecodeError):
                 payload = {}
-            payload[self._app_id] = {
-                open_id: {
-                    "scopes": grant.scopes,
-                    "updated_at": grant.updated_at,
-                    "updated_by": grant.updated_by,
-                    "source": grant.source,
+            for app_id, app_grants in sorted(self._authorization_grants.items()):
+                payload[app_id] = {
+                    open_id: {
+                        "scopes": grant.scopes,
+                        "updated_at": grant.updated_at,
+                        "updated_by": grant.updated_by,
+                        "source": grant.source,
+                    }
+                    for open_id, grant in sorted(app_grants.items())
                 }
-                for open_id, grant in sorted(self._authorization_grants.items())
-            }
             self._oauth_state_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         except OSError:
             logger.warning("[Feishu] Failed to persist OAuth grant state to %s", self._oauth_state_path, exc_info=True)
+
+    def _resolve_authorization_account_id(self, account_id: Optional[str] = None) -> str:
+        """解析授权状态所属账号，缺省时回退到当前会话或默认账号。"""
+        if account_id:
+            return str(account_id).strip() or "default"
+        try:
+            from gateway.session_context import get_session_env
+
+            session_account_id = str(get_session_env("HERMES_SESSION_ACCOUNT_ID", "") or "").strip()
+            if session_account_id:
+                return session_account_id
+        except Exception:
+            logger.debug("[Feishu] Failed to read session account id for authorization lookup", exc_info=True)
+        return "default"
+
+    def _resolve_authorization_app_id(self, account_id: Optional[str] = None) -> str:
+        """根据账号标识解析授权状态所属的飞书应用。"""
+        resolved_account_id = self._resolve_authorization_account_id(account_id)
+        account = self._accounts.get(resolved_account_id)
+        app_id = str(getattr(account, "app_id", "") or "").strip()
+        if app_id:
+            return app_id
+        return self._app_id
 
     @staticmethod
     def _normalize_scope_list(items: List[str]) -> List[str]:
@@ -4339,10 +4370,12 @@ class FeishuAdapter(BasePlatformAdapter):
         self,
         user_open_id: str,
         requested_scopes: Optional[List[str]] = None,
+        account_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """查询指定用户在当前飞书应用上的授权状态。"""
         open_id = str(user_open_id or "").strip()
-        grant = self._authorization_grants.get(open_id)
+        app_id = self._resolve_authorization_app_id(account_id)
+        grant = self._authorization_grants.get(app_id, {}).get(open_id)
         granted_scopes = list(grant.scopes) if grant else []
         requested = self._normalize_scope_list(requested_scopes or [])
         granted_set = set(granted_scopes)
@@ -4355,6 +4388,8 @@ class FeishuAdapter(BasePlatformAdapter):
             "updated_at": grant.updated_at if grant else None,
             "updated_by": grant.updated_by if grant else "",
             "source": grant.source if grant else "",
+            "account_id": self._resolve_authorization_account_id(account_id),
+            "app_id": app_id,
         }
 
     def record_authorization_grant(
@@ -4364,14 +4399,17 @@ class FeishuAdapter(BasePlatformAdapter):
         scopes: List[str],
         updated_by: str = "",
         source: str = "manual_confirm",
+        account_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """记录用户已确认获得的授权范围。"""
         open_id = str(user_open_id or "").strip()
         if not open_id:
             raise ValueError("user_open_id is required")
-        existing = self._authorization_grants.get(open_id)
+        app_id = self._resolve_authorization_app_id(account_id)
+        app_grants = self._authorization_grants.setdefault(app_id, {})
+        existing = app_grants.get(open_id)
         merged_scopes = self._normalize_scope_list([*(existing.scopes if existing else []), *scopes])
-        self._authorization_grants[open_id] = FeishuAuthorizationGrant(
+        app_grants[open_id] = FeishuAuthorizationGrant(
             user_open_id=open_id,
             scopes=merged_scopes,
             updated_at=time.time(),
@@ -4379,16 +4417,23 @@ class FeishuAdapter(BasePlatformAdapter):
             source=source,
         )
         self._persist_authorization_grants()
-        return self.get_authorization_status(open_id)
+        return self.get_authorization_status(open_id, account_id=account_id)
 
-    def revoke_authorization(self, user_open_id: str, scopes: Optional[List[str]] = None) -> Dict[str, Any]:
+    def revoke_authorization(
+        self,
+        user_open_id: str,
+        scopes: Optional[List[str]] = None,
+        account_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """撤销用户的全部或部分本地授权状态。"""
         open_id = str(user_open_id or "").strip()
         if not open_id:
             raise ValueError("user_open_id is required")
-        grant = self._authorization_grants.get(open_id)
+        app_id = self._resolve_authorization_app_id(account_id)
+        app_grants = self._authorization_grants.get(app_id, {})
+        grant = app_grants.get(open_id)
         if not grant:
-            return self.get_authorization_status(open_id)
+            return self.get_authorization_status(open_id, account_id=account_id)
         revoke_scopes = self._normalize_scope_list(scopes or [])
         if revoke_scopes:
             revoke_set = set(revoke_scopes)
@@ -4396,7 +4441,7 @@ class FeishuAdapter(BasePlatformAdapter):
         else:
             remaining_scopes = []
         if remaining_scopes:
-            self._authorization_grants[open_id] = FeishuAuthorizationGrant(
+            app_grants[open_id] = FeishuAuthorizationGrant(
                 user_open_id=open_id,
                 scopes=remaining_scopes,
                 updated_at=time.time(),
@@ -4404,9 +4449,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 source="revoke",
             )
         else:
-            self._authorization_grants.pop(open_id, None)
+            app_grants.pop(open_id, None)
+            if not app_grants:
+                self._authorization_grants.pop(app_id, None)
         self._persist_authorization_grants()
-        return self.get_authorization_status(open_id)
+        return self.get_authorization_status(open_id, account_id=account_id)
 
     def _is_duplicate(self, message_id: str) -> bool:
         now = time.time()

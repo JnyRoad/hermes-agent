@@ -243,7 +243,15 @@ def ensure_authorization(
         except Exception:
             logger.debug("failed to register pending Feishu tool replay", exc_info=True)
 
-    status = adapter.get_authorization_status(user_open_id, required_scopes)
+    account_id = session.get("account_id") or None
+    if account_id:
+        status = adapter.get_authorization_status(
+            user_open_id,
+            required_scopes,
+            account_id=account_id,
+        )
+    else:
+        status = adapter.get_authorization_status(user_open_id, required_scopes)
     if status.get("authorized") and not force_request:
         return None
 

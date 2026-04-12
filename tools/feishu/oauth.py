@@ -65,6 +65,20 @@ def _normalize_scopes(raw_scopes: Any) -> List[str]:
     return result
 
 
+def _get_authorization_status(adapter: Any, user_open_id: str, scopes: List[str], account_id: str | None) -> Dict[str, Any]:
+    """兼容旧测试替身，只在存在账号标识时传递 account_id。"""
+    if account_id:
+        return adapter.get_authorization_status(user_open_id, scopes, account_id=account_id)
+    return adapter.get_authorization_status(user_open_id, scopes)
+
+
+def _revoke_authorization(adapter: Any, user_open_id: str, scopes: List[str] | None, account_id: str | None) -> Dict[str, Any]:
+    """兼容旧测试替身，只在存在账号标识时传递 account_id。"""
+    if account_id:
+        return adapter.revoke_authorization(user_open_id, scopes, account_id=account_id)
+    return adapter.revoke_authorization(user_open_id, scopes)
+
+
 def _normalize_tool_actions(raw_tool_actions: Any) -> List[Dict[str, str]]:
     """把批量工具动作输入统一为稳定结构。"""
     if not isinstance(raw_tool_actions, list):
@@ -124,7 +138,8 @@ def _handle_authorize(args: Dict[str, Any]) -> str:
         adapter = get_active_feishu_adapter()
         session = require_feishu_session()
         requester_open_id = _resolve_target_open_id(args, session)
-        status = adapter.get_authorization_status(requester_open_id, scopes)
+        account_id = session.get("account_id") or None
+        status = _get_authorization_status(adapter, requester_open_id, scopes, account_id)
         if status["authorized"]:
             return json.dumps(
                 {
@@ -148,6 +163,7 @@ def _handle_authorize(args: Dict[str, Any]) -> str:
                 title=title,
                 metadata={
                     "thread_id": session["thread_id"] or None,
+                    "account_id": account_id,
                     "requester_open_id": requester_open_id,
                 },
             )
@@ -178,7 +194,7 @@ def _handle_status(args: Dict[str, Any]) -> str:
         user_open_id = _resolve_target_open_id(args, session)
         scope_request = _resolve_scope_request(args)
         scopes = scope_request["scopes"]
-        status = adapter.get_authorization_status(user_open_id, scopes)
+        status = _get_authorization_status(adapter, user_open_id, scopes, session.get("account_id") or None)
         return json.dumps(
             {
                 "status": "authorized" if status["authorized"] else "not_authorized",
@@ -199,7 +215,7 @@ def _handle_revoke(args: Dict[str, Any]) -> str:
         session = require_feishu_session()
         user_open_id = _resolve_target_open_id(args, session)
         scopes = _normalize_scopes(args.get("scopes"))
-        status = adapter.revoke_authorization(user_open_id, scopes or None)
+        status = _revoke_authorization(adapter, user_open_id, scopes or None, session.get("account_id") or None)
         return json.dumps(
             {
                 "status": "revoked",
@@ -237,7 +253,8 @@ def _handle_feishu_oauth_batch(args: Dict[str, Any], **_kw) -> str:
         adapter = get_active_feishu_adapter()
         session = require_feishu_session()
         requester_open_id = _resolve_target_open_id(args, session)
-        status = adapter.get_authorization_status(requester_open_id, scopes)
+        account_id = session.get("account_id") or None
+        status = _get_authorization_status(adapter, requester_open_id, scopes, account_id)
         missing_scopes = list(status["missing_scopes"])
         if not missing_scopes:
             return json.dumps(
@@ -259,6 +276,7 @@ def _handle_feishu_oauth_batch(args: Dict[str, Any], **_kw) -> str:
                 title=title,
                 metadata={
                     "thread_id": session["thread_id"] or None,
+                    "account_id": account_id,
                     "requester_open_id": requester_open_id,
                 },
             )

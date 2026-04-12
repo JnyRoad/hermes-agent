@@ -3516,6 +3516,47 @@ def test_feishu_adapter_rejects_oauth_completion_from_other_user(monkeypatch):
     adapter._handle_message_with_guards.assert_not_awaited()
 
 
+def test_feishu_adapter_authorization_status_is_scoped_by_account():
+    from gateway.platforms.feishu import FeishuAdapter
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={
+            "app_id": "cli_primary",
+            "app_secret": "secret_primary",
+            "accounts": {
+                "feishu-cn": {
+                    "app_id": "cli_secondary",
+                    "app_secret": "secret_secondary",
+                }
+            },
+        },
+    )
+    adapter = FeishuAdapter(config)
+
+    adapter.record_authorization_grant(
+        user_open_id="ou_requester",
+        scopes=["contact:user.base:readonly"],
+        account_id="feishu-cn",
+    )
+
+    primary_status = adapter.get_authorization_status(
+        "ou_requester",
+        ["contact:user.base:readonly"],
+        account_id="default",
+    )
+    secondary_status = adapter.get_authorization_status(
+        "ou_requester",
+        ["contact:user.base:readonly"],
+        account_id="feishu-cn",
+    )
+
+    assert primary_status["authorized"] is False
+    assert secondary_status["authorized"] is True
+    assert primary_status["app_id"] == "cli_primary"
+    assert secondary_status["app_id"] == "cli_secondary"
+
+
 def test_feishu_adapter_routes_question_answer(monkeypatch):
     from gateway.platforms.feishu import FeishuAdapter, FeishuPendingQuestion
 
