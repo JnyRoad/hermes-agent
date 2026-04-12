@@ -133,6 +133,47 @@ def test_feishu_sheet_write_handler(monkeypatch):
     assert payload["updated_cells"] == 4
 
 
+def test_feishu_sheet_append_handler(monkeypatch):
+    from tools.feishu.sheet import _handle_sheet
+
+    monkeypatch.setattr(
+        "tools.feishu.sheet.feishu_api_request",
+        lambda *a, **kw: {
+            "data": {
+                "tableRange": "sheet_1!A1:B3",
+                "updates": {
+                    "updatedRange": "sheet_1!A3:B3",
+                    "updatedRows": 1,
+                    "updatedColumns": 2,
+                    "updatedCells": 2,
+                    "revision": 6,
+                },
+            }
+        },
+    )
+    payload = json.loads(
+        _handle_sheet({"action": "append", "spreadsheet_token": "sht_1", "sheet_id": "sheet_1", "values": [["3", "4"]]})
+    )
+    assert payload["updated_range"] == "sheet_1!A3:B3"
+    assert payload["updated_cells"] == 2
+
+
+def test_feishu_sheet_find_handler(monkeypatch):
+    from tools.feishu.sheet import _handle_sheet
+
+    monkeypatch.setattr(
+        "tools.feishu.sheet.feishu_api_request",
+        lambda *a, **kw: {
+            "data": {"valueRange": {"range": "sheet_1!A1:B2", "values": [["Alice", "Dev"], ["Bob", "QA"]]}}
+        },
+    )
+    payload = json.loads(
+        _handle_sheet({"action": "find", "spreadsheet_token": "sht_1", "sheet_id": "sheet_1", "find": "Bob"})
+    )
+    assert payload["matched_cells"][0]["range"] == "sheet_1!A2"
+    assert payload["matched_cells"][0]["value"] == "Bob"
+
+
 def test_feishu_sheet_create_handler(monkeypatch):
     from tools.feishu.sheet import _handle_sheet
 
@@ -148,6 +189,37 @@ def test_feishu_sheet_create_handler(monkeypatch):
     )
     assert payload["spreadsheet_token"] == "sht_new"
     assert payload["initial_write"] == "sheet_1!A1:B2"
+
+
+def test_feishu_sheet_export_handler(monkeypatch, tmp_path):
+    from tools.feishu.sheet import _handle_sheet
+
+    calls = []
+
+    def _fake_request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        if path == "/open-apis/drive/v1/export_tasks":
+            return {"data": {"ticket": "ticket_1"}}
+        if path == "/open-apis/drive/v1/export_tasks/ticket_1":
+            return {"data": {"result": {"job_status": 0, "file_token": "file_1", "file_name": "Budget.xlsx", "file_size": 10}}}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr("tools.feishu.sheet.feishu_api_request", _fake_request)
+    monkeypatch.setattr("tools.feishu.sheet.feishu_api_request_bytes", lambda *a, **kw: (b"xlsx-bytes", {}))
+    monkeypatch.setattr("tools.feishu.sheet.time.sleep", lambda _seconds: None)
+    output = tmp_path / "budget.xlsx"
+    payload = json.loads(
+        _handle_sheet(
+            {
+                "action": "export",
+                "spreadsheet_token": "sht_1",
+                "file_extension": "xlsx",
+                "output_path": str(output),
+            }
+        )
+    )
+    assert payload["file_path"] == str(output)
+    assert output.read_bytes() == b"xlsx-bytes"
 
 
 def test_feishu_doc_comments_list_handler(monkeypatch):

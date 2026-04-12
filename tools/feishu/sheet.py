@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 from urllib.parse import quote, urlparse, parse_qs
 
-from tools.feishu.client import feishu_api_request, get_feishu_base_url
+from tools.feishu.client import feishu_api_request, feishu_api_request_bytes, get_feishu_base_url
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -15,6 +16,8 @@ logger = logging.getLogger(__name__)
 _MAX_READ_ROWS = 200
 _MAX_WRITE_ROWS = 5000
 _MAX_WRITE_COLS = 100
+_EXPORT_POLL_INTERVAL_SECONDS = 1
+_EXPORT_POLL_MAX_RETRIES = 30
 
 
 def _check_feishu_available() -> bool:
@@ -147,6 +150,62 @@ def _sheet_web_url(token: str) -> str:
     return f"https://www.feishu.cn/sheets/{token}"
 
 
+def _append_range(token: str, args: dict) -> str:
+    explicit_range = str(args.get("range", "")).strip()
+    if explicit_range:
+        return explicit_range
+    sheet_id = str(args.get("sheet_id", "")).strip() or _get_default_sheet_id(token)
+    return sheet_id
+
+
+def _split_sheet_range(range_value: str) -> tuple[str, str]:
+    if "!" not in range_value:
+        return range_value, ""
+    sheet_id, cell_range = range_value.split("!", 1)
+    return sheet_id, cell_range
+
+
+def _cell_matches(value: Any, needle: str, *, match_case: bool, match_entire_cell: bool, search_by_regex: bool) -> bool:
+    import re
+
+    text = "" if value is None else str(value)
+    target = needle
+    flags = 0 if match_case else re.IGNORECASE
+    if search_by_regex:
+        pattern = re.compile(target, flags)
+        if match_entire_cell:
+            return bool(pattern.fullmatch(text))
+        return bool(pattern.search(text))
+    if not match_case:
+        text = text.lower()
+        target = target.lower()
+    if match_entire_cell:
+        return text == target
+    return target in text
+
+
+def _find_matches(values: list[list[Any]], needle: str, *, match_case: bool, match_entire_cell: bool, search_by_regex: bool) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for row_index, row in enumerate(values, start=1):
+        for col_index, cell in enumerate(row, start=1):
+            if _cell_matches(
+                cell,
+                needle,
+                match_case=match_case,
+                match_entire_cell=match_entire_cell,
+                search_by_regex=search_by_regex,
+            ):
+                matches.append(
+                    {
+                        "row": row_index,
+                        "column": col_index,
+                        "value": cell,
+                        "a1": f"{_col_letter(col_index)}{row_index}",
+                    }
+                )
+    return matches
+
+
 def _handle_sheet(args: dict, **_kw) -> str:
     action = str(args.get("action", "")).strip().lower()
     try:
@@ -251,7 +310,126 @@ def _handle_sheet(args: dict, **_kw) -> str:
                 ensure_ascii=False,
             )
 
-        return tool_error("Unsupported action. Supported actions: info, read, write, create")
+        if action == "append":
+            values = _normalize_values(args)
+            range_value = _append_range(token, {"range": args.get("range"), "sheet_id": sheet_id})
+            data = feishu_api_request(
+                "POST",
+                f"/open-apis/sheets/v2/spreadsheets/{token}/values_append",
+                json_body={"valueRange": {"range": range_value, "values": values}},
+            )
+            payload = data.get("data") or {}
+            updates = payload.get("updates") or {}
+            return json.dumps(
+                {
+                    "table_range": payload.get("tableRange"),
+                    "updated_range": updates.get("updatedRange"),
+                    "updated_rows": updates.get("updatedRows"),
+                    "updated_columns": updates.get("updatedColumns"),
+                    "updated_cells": updates.get("updatedCells"),
+                    "revision": updates.get("revision"),
+                },
+                ensure_ascii=False,
+            )
+
+        if action == "find":
+            sheet_id_for_find = str(args.get("sheet_id", "")).strip()
+            needle = str(args.get("find", "")).strip()
+            if not sheet_id_for_find or not needle:
+                return tool_error("Parameters 'sheet_id' and 'find' are required for find.")
+            suffix_range = str(args.get("range", "")).strip()
+            read_range = f"{sheet_id_for_find}!{suffix_range}" if suffix_range else sheet_id_for_find
+            data = feishu_api_request(
+                "GET",
+                f"/open-apis/sheets/v2/spreadsheets/{token}/values/{quote(read_range, safe='')}",
+                params={"valueRenderOption": "ToString"},
+            )
+            value_range = (data.get("data") or {}).get("valueRange") or {}
+            values = _flatten_values(value_range.get("values", []))
+            matches = _find_matches(
+                values,
+                needle,
+                match_case=bool(args.get("match_case", True)),
+                match_entire_cell=bool(args.get("match_entire_cell", False)),
+                search_by_regex=bool(args.get("search_by_regex", False)),
+            )
+            base_sheet_id, _ = _split_sheet_range(value_range.get("range", read_range))
+            for item in matches:
+                item["range"] = f"{base_sheet_id}!{item['a1']}"
+            return json.dumps(
+                {
+                    "matched_cells": matches,
+                    "rows_count": len(values),
+                },
+                ensure_ascii=False,
+            )
+
+        if action == "export":
+            file_extension = str(args.get("file_extension", "")).strip().lower()
+            if file_extension not in {"xlsx", "csv"}:
+                return tool_error("Parameter 'file_extension' must be xlsx or csv.")
+            export_sheet_id = str(args.get("sheet_id", "")).strip()
+            if file_extension == "csv" and not export_sheet_id:
+                return tool_error("sheet_id is required for CSV export.")
+            create_data = {
+                "file_extension": file_extension,
+                "token": token,
+                "type": "sheet",
+            }
+            if export_sheet_id:
+                create_data["sub_id"] = export_sheet_id
+            task = feishu_api_request("POST", "/open-apis/drive/v1/export_tasks", json_body=create_data)
+            ticket = str((task.get("data") or {}).get("ticket", "")).strip()
+            if not ticket:
+                return tool_error("Failed to create export task: no ticket returned.")
+            file_token = ""
+            file_name = ""
+            file_size = None
+            for _ in range(_EXPORT_POLL_MAX_RETRIES):
+                time.sleep(_EXPORT_POLL_INTERVAL_SECONDS)
+                poll = feishu_api_request(
+                    "GET",
+                    f"/open-apis/drive/v1/export_tasks/{ticket}",
+                    params={"token": token},
+                )
+                result = ((poll.get("data") or {}).get("result") or {})
+                job_status = result.get("job_status")
+                if job_status == 0:
+                    file_token = str(result.get("file_token", "")).strip()
+                    file_name = str(result.get("file_name", "")).strip()
+                    file_size = result.get("file_size")
+                    break
+                if isinstance(job_status, int) and job_status >= 3:
+                    return tool_error(result.get("job_error_msg") or f"Export failed with status={job_status}")
+            if not file_token:
+                return tool_error("Export timeout: task did not complete within 30 seconds.")
+            output_path = str(args.get("output_path", "")).strip()
+            if not output_path:
+                return json.dumps(
+                    {
+                        "file_token": file_token,
+                        "file_name": file_name,
+                        "file_size": file_size,
+                    },
+                    ensure_ascii=False,
+                )
+            content, _headers = feishu_api_request_bytes("GET", f"/open-apis/drive/v1/export_tasks/file/{file_token}/download")
+            from pathlib import Path
+
+            target = Path(output_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            target.chmod(0o600)
+            return json.dumps(
+                {
+                    "file_path": str(target),
+                    "file_name": file_name,
+                    "file_size": file_size,
+                },
+                ensure_ascii=False,
+            )
+
+        return tool_error("Unsupported action. Supported actions: info, read, write, append, find, create, export")
     except Exception as exc:
         logger.error("feishu_sheet error: %s", exc)
         return tool_error(f"Failed to execute feishu_sheet: {exc}")
@@ -259,11 +437,11 @@ def _handle_sheet(args: dict, **_kw) -> str:
 
 FEISHU_SHEET_SCHEMA = {
     "name": "feishu_sheet",
-    "description": "Operate Feishu spreadsheets. Hermes currently supports info, read, write, and create.",
+    "description": "Operate Feishu spreadsheets. Hermes currently supports info, read, write, append, find, create, and export.",
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["info", "read", "write", "create"], "description": "Sheet action."},
+            "action": {"type": "string", "enum": ["info", "read", "write", "append", "find", "create", "export"], "description": "Sheet action."},
             "url": {"type": "string", "description": "Spreadsheet URL. Can also be a wiki URL pointing to a spreadsheet."},
             "spreadsheet_token": {"type": "string", "description": "Spreadsheet token. Use this instead of url when already known."},
             "sheet_id": {"type": "string", "description": "Worksheet ID used when range is omitted."},
@@ -274,10 +452,16 @@ FEISHU_SHEET_SCHEMA = {
                 "description": "Render option for read. Default ToString.",
             },
             "values": {"type": "array", "description": "2D array for write action.", "items": {"type": "array"}},
+            "find": {"type": "string", "description": "Find text or regex pattern for find action."},
+            "match_case": {"type": "boolean", "description": "Whether find is case-sensitive. Default true."},
+            "match_entire_cell": {"type": "boolean", "description": "Whether find must match the whole cell. Default false."},
+            "search_by_regex": {"type": "boolean", "description": "Whether find uses regex matching. Default false."},
             "title": {"type": "string", "description": "Spreadsheet title for create action."},
             "folder_token": {"type": "string", "description": "Optional parent folder token for create action."},
             "headers": {"type": "array", "items": {"type": "string"}, "description": "Optional header row written after create."},
             "data": {"type": "array", "description": "Optional initial data rows written after create.", "items": {"type": "array"}},
+            "file_extension": {"type": "string", "enum": ["xlsx", "csv"], "description": "Export format for export action."},
+            "output_path": {"type": "string", "description": "Optional local file path for export action."},
         },
         "required": ["action"],
     },
