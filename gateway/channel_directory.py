@@ -18,6 +18,20 @@ logger = logging.getLogger(__name__)
 
 DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
 
+# 会话发现只适用于消息平台。这里显式维护平台清单，避免基础设施型平台
+# 被隐式带入目录，也让新增平台的行为更清晰可审查。
+_SESSION_DISCOVERY_PLATFORMS = frozenset({
+    "discord",
+    "email",
+    "feishu",
+    "homeassistant",
+    "matrix",
+    "signal",
+    "slack",
+    "telegram",
+    "whatsapp",
+})
+
 
 def _normalize_channel_query(value: str) -> str:
     return value.lstrip("#").strip().lower()
@@ -76,13 +90,11 @@ def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         except Exception as e:
             logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
 
-    # Platforms that don't support direct channel enumeration get session-based
-    # discovery automatically.  Skip infrastructure entries that aren't messaging
-    # platforms — everything else falls through to _build_from_sessions().
-    _SKIP_SESSION_DISCOVERY = frozenset({"local", "api_server", "webhook"})
+    # Session discovery explicitly covers messaging platforms like "email"
+    # that do not have a direct channel enumeration API.
     for plat in Platform:
         plat_name = plat.value
-        if plat_name in _SKIP_SESSION_DISCOVERY or plat_name in platforms:
+        if plat_name not in _SESSION_DISCOVERY_PLATFORMS or plat_name in platforms:
             continue
         platforms[plat_name] = _build_from_sessions(plat_name)
 
