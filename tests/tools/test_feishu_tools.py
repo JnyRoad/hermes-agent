@@ -283,6 +283,48 @@ def test_feishu_doc_comments_patch_handler(monkeypatch):
     assert payload["success"] is True
 
 
+def test_feishu_doc_comments_list_replies_handler(monkeypatch):
+    from tools.feishu.doc_comments import _handle_doc_comments
+
+    monkeypatch.setattr(
+        "tools.feishu.doc_comments.feishu_api_request",
+        lambda *a, **kw: {"data": {"items": [{"reply_id": "r1"}], "has_more": False}},
+    )
+    payload = json.loads(
+        _handle_doc_comments({"action": "list_replies", "file_token": "dox_1", "file_type": "docx", "comment_id": "c1"})
+    )
+    assert payload["items"][0]["reply_id"] == "r1"
+
+
+def test_feishu_doc_comments_create_handler(monkeypatch):
+    from tools.feishu.doc_comments import _handle_doc_comments
+
+    captured = {}
+
+    def _fake_request(method, path, **kwargs):
+        captured["method"] = method
+        captured["path"] = path
+        captured["json_body"] = kwargs.get("json_body")
+        return {"data": {"comment_id": "c1"}}
+
+    monkeypatch.setattr("tools.feishu.doc_comments.feishu_api_request", _fake_request)
+    payload = json.loads(
+        _handle_doc_comments(
+            {
+                "action": "create",
+                "file_token": "dox_1",
+                "file_type": "docx",
+                "elements": [{"type": "text", "text": "hello"}],
+            }
+        )
+    )
+    assert captured["method"] == "POST"
+    assert captured["path"].endswith("/files/dox_1/comments")
+    replies = captured["json_body"]["reply_list"]["replies"]
+    assert replies[0]["content"]["elements"][0]["text_run"]["text"] == "hello"
+    assert payload["comment_id"] == "c1"
+
+
 def test_feishu_doc_media_insert_handler(monkeypatch, tmp_path):
     from tools.feishu.doc_media import _handle_doc_media
 
@@ -882,6 +924,17 @@ def test_feishu_wiki_space_create_handler(monkeypatch):
     assert payload["space"]["space_id"] == "sp_new"
 
 
+def test_feishu_wiki_space_get_handler(monkeypatch):
+    from tools.feishu.wiki import _handle_wiki_space
+
+    monkeypatch.setattr(
+        "tools.feishu.wiki.feishu_api_request",
+        lambda *a, **kw: {"data": {"space": {"space_id": "sp1", "name": "KB"}}},
+    )
+    payload = json.loads(_handle_wiki_space({"action": "get", "space_id": "sp1"}))
+    assert payload["space"]["name"] == "KB"
+
+
 def test_feishu_wiki_space_node_handler(monkeypatch):
     from tools.feishu.wiki import _handle_wiki_space_node
 
@@ -891,6 +944,17 @@ def test_feishu_wiki_space_node_handler(monkeypatch):
     )
     payload = json.loads(_handle_wiki_space_node({"action": "get", "token": "wikcn1"}))
     assert payload["node"]["node_token"] == "wikcn1"
+
+
+def test_feishu_wiki_space_node_list_handler(monkeypatch):
+    from tools.feishu.wiki import _handle_wiki_space_node
+
+    monkeypatch.setattr(
+        "tools.feishu.wiki.feishu_api_request",
+        lambda *a, **kw: {"data": {"items": [{"node_token": "wik_1"}], "has_more": False}},
+    )
+    payload = json.loads(_handle_wiki_space_node({"action": "list", "space_id": "sp1"}))
+    assert payload["nodes"][0]["node_token"] == "wik_1"
 
 
 def test_feishu_wiki_space_node_create_handler(monkeypatch):
@@ -1128,6 +1192,42 @@ def test_feishu_calendar_event_instance_view_handler(monkeypatch):
     assert payload["events"][0]["event_id"] == "evt_3"
 
 
+def test_feishu_calendar_event_get_handler(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    def _fake_request(method, path, **kwargs):
+        if path == "/open-apis/calendar/v4/calendars/primary":
+            return {"data": {"calendars": [{"calendar": {"calendar_id": "cal_1"}}]}}
+        if path == "/open-apis/calendar/v4/calendars/cal_1/events/evt_1":
+            return {"data": {"event": {"event_id": "evt_1", "summary": "Demo"}}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr("tools.feishu.calendar_event.feishu_api_request", _fake_request)
+    payload = json.loads(_handle_calendar_event({"action": "get", "event_id": "evt_1"}))
+    assert payload["event"]["summary"] == "Demo"
+
+
+def test_feishu_calendar_event_patch_handler(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    captured = {}
+
+    def _fake_request(method, path, **kwargs):
+        if path == "/open-apis/calendar/v4/calendars/primary":
+            return {"data": {"calendars": [{"calendar": {"calendar_id": "cal_1"}}]}}
+        captured["method"] = method
+        captured["path"] = path
+        captured["json_body"] = kwargs.get("json_body")
+        return {"data": {"event": {"event_id": "evt_1", "summary": "Updated"}}}
+
+    monkeypatch.setattr("tools.feishu.calendar_event.feishu_api_request", _fake_request)
+    payload = json.loads(_handle_calendar_event({"action": "patch", "event_id": "evt_1", "summary": "Updated"}))
+    assert captured["method"] == "PATCH"
+    assert captured["path"].endswith("/calendars/cal_1/events/evt_1")
+    assert captured["json_body"]["summary"] == "Updated"
+    assert payload["event"]["summary"] == "Updated"
+
+
 def test_feishu_calendar_freebusy_list_handler(monkeypatch):
     from tools.feishu.calendar_freebusy import _handle_calendar_freebusy
 
@@ -1245,6 +1345,17 @@ def test_feishu_task_tasklist_get_handler(monkeypatch):
     )
     payload = json.loads(_handle_tasklist({"action": "get", "tasklist_guid": "tl_1"}))
     assert payload["tasklist"]["name"] == "Inbox"
+
+
+def test_feishu_task_tasklist_list_handler(monkeypatch):
+    from tools.feishu.tasklist import _handle_tasklist
+
+    monkeypatch.setattr(
+        "tools.feishu.tasklist.feishu_api_request",
+        lambda *a, **kw: {"data": {"items": [{"guid": "tl_1"}], "has_more": False}},
+    )
+    payload = json.loads(_handle_tasklist({"action": "list"}))
+    assert payload["tasklists"][0]["guid"] == "tl_1"
 
 
 def test_feishu_task_tasklist_tasks_handler(monkeypatch):
