@@ -209,6 +209,7 @@ TOOLSETS = {
             "feishu_search_doc_wiki",
             "feishu_bitable_app",
             "feishu_bitable_app_table",
+            "feishu_bitable_app_table_record",
             "feishu_sheet",
             "feishu_fetch_doc",
             "feishu_create_doc",

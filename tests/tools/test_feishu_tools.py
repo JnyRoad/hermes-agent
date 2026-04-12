@@ -20,6 +20,7 @@ def test_feishu_toolset_is_included_in_hermes_feishu():
     assert "feishu_search_doc_wiki" in resolved
     assert "feishu_bitable_app" in resolved
     assert "feishu_bitable_app_table" in resolved
+    assert "feishu_bitable_app_table_record" in resolved
     assert "feishu_sheet" in resolved
     assert "feishu_fetch_doc" in resolved
     assert "feishu_ask_user_question" in resolved
@@ -215,6 +216,52 @@ def test_feishu_bitable_app_table_create_sanitizes_field_property(monkeypatch):
     assert "property" not in fields[0]
     assert "property" not in fields[1]
     assert payload["table_id"] == "tbl_1"
+
+
+def test_feishu_bitable_app_table_record_list_handler(monkeypatch):
+    from tools.feishu.bitable_app_table_record import _handle_bitable_app_table_record
+
+    monkeypatch.setattr(
+        "tools.feishu.bitable_app_table_record.feishu_api_request",
+        lambda *a, **kw: {
+            "data": {"items": [{"record_id": "rec_1", "fields": {"Name": "Alice"}}], "has_more": False}
+        },
+    )
+    payload = json.loads(
+        _handle_bitable_app_table_record({"action": "list", "app_token": "app_1", "table_id": "tbl_1"})
+    )
+    assert payload["items"][0]["record_id"] == "rec_1"
+
+
+def test_feishu_bitable_app_table_record_create_handler(monkeypatch):
+    from tools.feishu.bitable_app_table_record import _handle_bitable_app_table_record
+
+    monkeypatch.setattr(
+        "tools.feishu.bitable_app_table_record.feishu_api_request",
+        lambda *a, **kw: {"data": {"record": {"record_id": "rec_1", "fields": {"Name": "Alice"}}}},
+    )
+    payload = json.loads(
+        _handle_bitable_app_table_record(
+            {"action": "create", "app_token": "app_1", "table_id": "tbl_1", "fields": {"Name": "Alice"}}
+        )
+    )
+    assert payload["record"]["record_id"] == "rec_1"
+
+
+def test_feishu_bitable_app_table_record_delete_handler(monkeypatch):
+    from tools.feishu.bitable_app_table_record import _handle_bitable_app_table_record
+
+    monkeypatch.setattr(
+        "tools.feishu.bitable_app_table_record.feishu_api_request",
+        lambda *a, **kw: {"data": {}},
+    )
+    payload = json.loads(
+        _handle_bitable_app_table_record(
+            {"action": "delete", "app_token": "app_1", "table_id": "tbl_1", "record_id": "rec_1"}
+        )
+    )
+    assert payload["deleted"] is True
+    assert payload["record_id"] == "rec_1"
 
 
 def test_feishu_drive_file_list_handler(monkeypatch):
