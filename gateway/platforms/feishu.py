@@ -344,6 +344,7 @@ class FeishuPendingQuestion:
     header: str
     note: str = ""
     thread_id: str = ""
+    account_id: str = ""
 
 
 @dataclass
@@ -1798,6 +1799,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     "session_key": session_key,
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
+                    "account_id": str((metadata or {}).get("account_id") or "").strip(),
                 }
             return result
         except Exception as exc:
@@ -1871,6 +1873,8 @@ class FeishuAdapter(BasePlatformAdapter):
                     options=list(options[:5]),
                     header=header,
                     note=note,
+                    thread_id=str((metadata or {}).get("thread_id") or "").strip(),
+                    account_id=str((metadata or {}).get("account_id") or "").strip(),
                 )
                 result.raw_response = {
                     **(result.raw_response if isinstance(result.raw_response, dict) else {}),
@@ -2025,12 +2029,16 @@ class FeishuAdapter(BasePlatformAdapter):
         template: str = "green",
         button_label: str = "",
         button_value: Optional[Dict[str, Any]] = None,
+        account_id: Optional[str] = None,
     ) -> None:
         """更新交互卡片。
 
         默认更新为只读状态；当传入按钮参数时保留一个可点击按钮。
         """
         if not message_id:
+            return
+        client = self._resolve_client(account_id=account_id)
+        if not client:
             return
         elements: List[Dict[str, Any]] = [
             {"tag": "markdown", "content": body_markdown},
@@ -2060,13 +2068,22 @@ class FeishuAdapter(BasePlatformAdapter):
         payload = json.dumps(card, ensure_ascii=False)
         body = self._build_update_message_body(msg_type="interactive", content=payload)
         request = self._build_update_message_request(message_id=message_id, request_body=body)
-        await asyncio.to_thread(self._client.im.v1.message.update, request)
+        await asyncio.to_thread(client.im.v1.message.update, request)
 
     async def _update_approval_card(
-        self, message_id: str, label: str, user_name: str, choice: str,
+        self,
+        message_id: str,
+        label: str,
+        user_name: str,
+        choice: str,
+        *,
+        account_id: Optional[str] = None,
     ) -> None:
         """Replace the approval card with a resolved status card."""
-        if not self._client or not message_id:
+        if not message_id:
+            return
+        client = self._resolve_client(account_id=account_id)
+        if not client:
             return
         icon = "❌" if choice == "deny" else "✅"
         card = {
@@ -2086,7 +2103,7 @@ class FeishuAdapter(BasePlatformAdapter):
             payload = json.dumps(card, ensure_ascii=False)
             body = self._build_update_message_body(msg_type="interactive", content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
-            await asyncio.to_thread(self._client.im.v1.message.update, request)
+            await asyncio.to_thread(client.im.v1.message.update, request)
         except Exception as exc:
             logger.warning("[Feishu] Failed to update approval card %s: %s", message_id, exc)
 
@@ -2851,6 +2868,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         f"**Answer:** {answer}"
                     ),
                     template="green",
+                    account_id=account_id or state.account_id or None,
                 )
 
                 chat_info = await self.get_chat_info(chat_id, account_id=account_id)
@@ -2914,6 +2932,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         f"**Scopes:** {', '.join(state.scopes)}"
                     ),
                     template="green",
+                    account_id=account_id or state.account_id or None,
                 )
                 replayed = await self._execute_pending_tool_replay(
                     state=state,
@@ -2997,7 +3016,13 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.error("Failed to resolve gateway approval from Feishu button: %s", exc)
 
             # Update the card to show the decision
-            await self._update_approval_card(state.get("message_id", ""), label, user_name, choice)
+            await self._update_approval_card(
+                state.get("message_id", ""),
+                label,
+                user_name,
+                choice,
+                account_id=self._extract_event_account_id(data) or str(state.get("account_id", "") or "").strip() or None,
+            )
             return
 
         synthetic_text = f"/card {action_tag}"
