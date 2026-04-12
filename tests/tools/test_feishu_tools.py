@@ -1322,6 +1322,14 @@ def test_feishu_calendar_event_create_handler(monkeypatch):
     assert payload["attendees"][0]["id"] == "ou_1"
 
 
+def test_feishu_calendar_event_create_requires_core_fields(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    payload = json.loads(_handle_calendar_event({"action": "create", "summary": "Demo"}))
+    assert "start_time" in payload["error"]
+    assert "end_time" in payload["error"]
+
+
 def test_feishu_calendar_event_delete_handler(monkeypatch):
     from tools.feishu.calendar_event import _handle_calendar_event
 
@@ -1335,6 +1343,14 @@ def test_feishu_calendar_event_delete_handler(monkeypatch):
     monkeypatch.setattr("tools.feishu.calendar_event.feishu_api_request", _fake_request)
     payload = json.loads(_handle_calendar_event({"action": "delete", "event_id": "evt_1"}))
     assert payload["success"] is True
+
+
+def test_feishu_calendar_event_list_requires_time_range(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    payload = json.loads(_handle_calendar_event({"action": "list"}))
+    assert "start_time" in payload["error"]
+    assert "end_time" in payload["error"]
 
 
 def test_feishu_calendar_event_search_handler(monkeypatch):
@@ -1352,6 +1368,13 @@ def test_feishu_calendar_event_search_handler(monkeypatch):
     assert payload["events"][0]["event_id"] == "evt_2"
 
 
+def test_feishu_calendar_event_search_requires_query(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    payload = json.loads(_handle_calendar_event({"action": "search"}))
+    assert "query" in payload["error"]
+
+
 def test_feishu_calendar_event_reply_handler(monkeypatch):
     from tools.feishu.calendar_event import _handle_calendar_event
 
@@ -1366,6 +1389,20 @@ def test_feishu_calendar_event_reply_handler(monkeypatch):
     payload = json.loads(_handle_calendar_event({"action": "reply", "event_id": "evt_1", "rsvp_status": "accept"}))
     assert payload["success"] is True
     assert payload["rsvp_status"] == "accept"
+
+
+def test_feishu_calendar_event_get_requires_event_id(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    payload = json.loads(_handle_calendar_event({"action": "get"}))
+    assert "event_id" in payload["error"]
+
+
+def test_feishu_calendar_event_delete_requires_event_id(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    payload = json.loads(_handle_calendar_event({"action": "delete"}))
+    assert "event_id" in payload["error"]
 
 
 def test_feishu_calendar_event_instances_handler(monkeypatch):
@@ -1395,6 +1432,14 @@ def test_feishu_calendar_event_instances_handler(monkeypatch):
         )
     )
     assert payload["instances"][0]["event_id"] == "evt_1"
+
+
+def test_feishu_calendar_event_instances_requires_time_range(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+
+    payload = json.loads(_handle_calendar_event({"action": "instances", "event_id": "evt_1"}))
+    assert "start_time" in payload["error"]
+    assert "end_time" in payload["error"]
 
 
 def test_feishu_calendar_event_instance_view_handler(monkeypatch):
@@ -1582,6 +1627,13 @@ def test_feishu_task_task_create_handler(monkeypatch):
     assert payload["task"]["guid"] == "task_1"
 
 
+def test_feishu_task_task_create_requires_summary(monkeypatch):
+    from tools.feishu.task import _handle_task
+
+    payload = json.loads(_handle_task({"action": "create"}))
+    assert "summary" in payload["error"]
+
+
 def test_feishu_task_task_list_handler(monkeypatch):
     from tools.feishu.task import _handle_task
 
@@ -1602,6 +1654,13 @@ def test_feishu_task_task_get_handler(monkeypatch):
     )
     payload = json.loads(_handle_task({"action": "get", "task_guid": "task_1"}))
     assert payload["task"]["summary"] == "Ship"
+
+
+def test_feishu_task_task_get_requires_task_guid(monkeypatch):
+    from tools.feishu.task import _handle_task
+
+    payload = json.loads(_handle_task({"action": "get"}))
+    assert "task_guid" in payload["error"]
 
 
 def test_feishu_task_task_patch_handler(monkeypatch):
@@ -1644,6 +1703,13 @@ def test_feishu_task_tasklist_get_handler(monkeypatch):
     assert payload["tasklist"]["name"] == "Inbox"
 
 
+def test_feishu_task_tasklist_get_requires_tasklist_guid(monkeypatch):
+    from tools.feishu.tasklist import _handle_tasklist
+
+    payload = json.loads(_handle_tasklist({"action": "get"}))
+    assert "tasklist_guid" in payload["error"]
+
+
 def test_feishu_task_tasklist_list_handler(monkeypatch):
     from tools.feishu.tasklist import _handle_tasklist
 
@@ -1666,6 +1732,13 @@ def test_feishu_task_tasklist_tasks_handler(monkeypatch):
     assert payload["tasks"][0]["guid"] == "task_1"
 
 
+def test_feishu_task_tasklist_tasks_requires_tasklist_guid(monkeypatch):
+    from tools.feishu.tasklist import _handle_tasklist
+
+    payload = json.loads(_handle_tasklist({"action": "tasks"}))
+    assert "tasklist_guid" in payload["error"]
+
+
 def test_feishu_task_tasklist_patch_handler(monkeypatch):
     from tools.feishu.tasklist import _handle_tasklist
 
@@ -1685,6 +1758,20 @@ def test_feishu_task_tasklist_patch_handler(monkeypatch):
     assert payload["tasklist"]["name"] == "Inbox 2"
 
 
+def test_feishu_task_tasklist_patch_requires_tasklist_guid(monkeypatch):
+    from tools.feishu.tasklist import _handle_tasklist
+
+    payload = json.loads(_handle_tasklist({"action": "patch", "name": "Inbox 2"}))
+    assert "tasklist_guid" in payload["error"]
+
+
+def test_feishu_task_tasklist_patch_requires_updatable_field(monkeypatch):
+    from tools.feishu.tasklist import _handle_tasklist
+
+    payload = json.loads(_handle_tasklist({"action": "patch", "tasklist_guid": "tl_1"}))
+    assert "At least one updatable field is required for patch" in payload["error"]
+
+
 def test_feishu_task_tasklist_add_members_handler(monkeypatch):
     from tools.feishu.tasklist import _handle_tasklist
 
@@ -1702,6 +1789,13 @@ def test_feishu_task_tasklist_add_members_handler(monkeypatch):
         )
     )
     assert payload["tasklist"]["guid"] == "tl_1"
+
+
+def test_feishu_task_tasklist_add_members_requires_tasklist_guid(monkeypatch):
+    from tools.feishu.tasklist import _handle_tasklist
+
+    payload = json.loads(_handle_tasklist({"action": "add_members", "members": [{"id": "ou_1"}]}))
+    assert "tasklist_guid" in payload["error"]
 
 
 def test_feishu_task_tasklist_add_members_requires_non_empty_members(monkeypatch):
@@ -1824,6 +1918,13 @@ def test_feishu_task_section_create_handler(monkeypatch):
         _handle_task_section({"action": "create", "name": "Doing", "resource_type": "tasklist", "resource_id": "tl_1"})
     )
     assert payload["section"]["guid"] == "sec_1"
+
+
+def test_feishu_task_section_create_requires_name_and_resource_type(monkeypatch):
+    from tools.feishu.task_section import _handle_task_section
+
+    payload = json.loads(_handle_task_section({"action": "create", "name": "Doing"}))
+    assert "resource_type" in payload["error"]
 
 
 def test_feishu_task_section_get_handler(monkeypatch):
