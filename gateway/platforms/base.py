@@ -1251,6 +1251,18 @@ class BasePlatformAdapter(ABC):
         """将工具进度行渲染为平台可直接发送的文本内容。"""
         return "\n".join(str(line) for line in progress_lines if str(line).strip())
 
+    @staticmethod
+    def build_reply_metadata(source: Any) -> Optional[Dict[str, Any]]:
+        """根据来源构造平台回包 metadata。"""
+        metadata: Dict[str, Any] = {}
+        thread_id = getattr(source, "thread_id", None)
+        account_id = getattr(source, "account_id", None)
+        if thread_id:
+            metadata["thread_id"] = thread_id
+        if account_id:
+            metadata["account_id"] = account_id
+        return metadata or None
+
     def pause_typing_for_chat(self, chat_id: str) -> None:
         """Pause typing indicator for a chat (e.g. during approval waits).
 
@@ -1437,7 +1449,7 @@ class BasePlatformAdapter(ABC):
                     self.name, cmd, session_key,
                 )
                 try:
-                    _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                    _thread_meta = self.build_reply_metadata(event.source)
                     response = await self._message_handler(event)
                     if response:
                         await self._send_with_retry(
@@ -1533,7 +1545,7 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         
         # Start continuous typing indicator (refreshes every 2 seconds)
-        _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        _thread_metadata = self.build_reply_metadata(event.source)
         typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id, metadata=_thread_metadata))
         
         try:
@@ -1754,7 +1766,7 @@ class BasePlatformAdapter(ABC):
             try:
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                _thread_metadata = self.build_reply_metadata(event.source)
                 await self.send(
                     chat_id=event.source.chat_id,
                     content=(
@@ -1820,6 +1832,7 @@ class BasePlatformAdapter(ABC):
         chat_topic: Optional[str] = None,
         user_id_alt: Optional[str] = None,
         chat_id_alt: Optional[str] = None,
+        account_id: Optional[str] = None,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform."""
         # Normalize empty topic to None
@@ -1836,6 +1849,7 @@ class BasePlatformAdapter(ABC):
             chat_topic=chat_topic.strip() if chat_topic else None,
             user_id_alt=user_id_alt,
             chat_id_alt=chat_id_alt,
+            account_id=str(account_id) if account_id else None,
         )
     
     @abstractmethod

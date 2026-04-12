@@ -280,6 +280,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             patch("gateway.platforms.feishu.release_scoped_lock"),
             patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
             patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+            patch.object(adapter, "_build_lark_client_for_account", return_value=SimpleNamespace()),
             patch("gateway.platforms.feishu.web", web_module),
         ):
             _mock_event_dispatcher_builder(mock_handler_class)
@@ -329,6 +330,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             patch("gateway.platforms.feishu.release_scoped_lock"),
             patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
             patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+            patch.object(adapter, "_build_lark_client_for_account", return_value=SimpleNamespace()),
             patch("gateway.platforms.feishu.web", web_module),
         ):
             _mock_event_dispatcher_builder(mock_handler_class)
@@ -2215,6 +2217,60 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(sleeps, [1])
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_send_routes_to_secondary_account_client(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                        }
+                    },
+                }
+            )
+        )
+        captured = {"primary": 0, "secondary": 0}
+
+        class _PrimaryMessageAPI:
+            def create(self, request):
+                captured["primary"] += 1
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_primary"))
+
+        class _SecondaryMessageAPI:
+            def create(self, request):
+                captured["secondary"] += 1
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_secondary"))
+
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_PrimaryMessageAPI())))
+        adapter._clients_by_account = {
+            "default": adapter._client,
+            "feishu-cn": SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_SecondaryMessageAPI()))),
+        }
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="hello secondary",
+                    metadata={"account_id": "feishu-cn"},
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_secondary")
+        self.assertEqual(captured["primary"], 0)
+        self.assertEqual(captured["secondary"], 1)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_does_not_retry_deterministic_api_failure(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -3227,6 +3283,56 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertIn("ou_secondary", adapter._bot_open_ids)
         self.assertIn("ouu_secondary", adapter._bot_user_ids)
         self.assertIn("Hermes CN", adapter._bot_names)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_get_chat_info_uses_account_scoped_cache(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                        }
+                    },
+                }
+            )
+        )
+
+        class _PrimaryChatAPI:
+            def get(self, request):
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(name="Primary Chat", chat_type="group"),
+                )
+
+        class _SecondaryChatAPI:
+            def get(self, request):
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(name="Secondary Chat", chat_type="group"),
+                )
+
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(chat=_PrimaryChatAPI())))
+        adapter._clients_by_account = {
+            "default": adapter._client,
+            "feishu-cn": SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(chat=_SecondaryChatAPI()))),
+        }
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            primary = asyncio.run(adapter.get_chat_info("oc_chat", account_id="default"))
+            secondary = asyncio.run(adapter.get_chat_info("oc_chat", account_id="feishu-cn"))
+
+        self.assertEqual(primary["name"], "Primary Chat")
+        self.assertEqual(secondary["name"], "Secondary Chat")
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")

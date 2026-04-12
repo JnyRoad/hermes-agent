@@ -1169,6 +1169,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._settings = self._load_settings(config.extra or {})
         self._apply_settings(self._settings)
         self._client: Optional[Any] = None
+        self._clients_by_account: Dict[str, Any] = {}
         self._ws_client: Optional[Any] = None
         self._ws_future: Optional[asyncio.Future] = None
         self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -1488,6 +1489,26 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Failed to attach account metadata to event", exc_info=True)
         return data
 
+    @staticmethod
+    def _extract_event_account_id(data: Any) -> Optional[str]:
+        """从事件对象中提取账号标识。"""
+        event = getattr(data, "event", None)
+        for candidate in (
+            getattr(data, "_hermes_feishu_account_id", None),
+            getattr(event, "_hermes_feishu_account_id", None),
+            getattr(getattr(event, "notice_meta", None), "_hermes_feishu_account_id", None),
+        ):
+            if candidate:
+                return str(candidate)
+        return None
+
+    def _resolve_client(self, account_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> Any:
+        """根据账号标识选择飞书客户端，未命中时回退主账号。"""
+        resolved_account_id = str(
+            (metadata or {}).get("account_id") or account_id or "default"
+        ).strip()
+        return self._clients_by_account.get(resolved_account_id) or self._client
+
     async def connect(self) -> bool:
         """Connect to Feishu/Lark."""
         if not FEISHU_AVAILABLE:
@@ -1577,6 +1598,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_thread_loop = None
         self._loop = None
         self._event_handler = None
+        self._clients_by_account.clear()
         self._persist_seen_message_ids()
         await self._release_app_lock()
 
@@ -1627,7 +1649,8 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a Feishu message."""
-        if not self._client:
+        client = self._resolve_client(metadata=metadata)
+        if not client:
             return SendResult(success=False, error="Not connected")
 
         formatted = self.format_message(content)
@@ -1681,16 +1704,18 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_id: str,
         message_id: str,
         content: str,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent Feishu text/post message."""
-        if not self._client:
+        client = self._resolve_client(metadata=metadata)
+        if not client:
             return SendResult(success=False, error="Not connected")
 
         try:
             msg_type, payload = self._build_outbound_payload(content)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
-            response = await asyncio.to_thread(self._client.im.v1.message.update, request)
+            response = await asyncio.to_thread(client.im.v1.message.update, request)
             result = self._finalize_send_result(response, "update failed")
             if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
                 logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
@@ -1699,7 +1724,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
                 )
                 fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
-                fallback_response = await asyncio.to_thread(self._client.im.v1.message.update, fallback_request)
+                fallback_response = await asyncio.to_thread(client.im.v1.message.update, fallback_request)
                 result = self._finalize_send_result(fallback_response, "update failed")
             if result.success:
                 result.message_id = message_id
@@ -2245,23 +2270,25 @@ class FeishuAdapter(BasePlatformAdapter):
             metadata=metadata,
         )
 
-    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+    async def get_chat_info(self, chat_id: str, account_id: Optional[str] = None) -> Dict[str, Any]:
         """Return real chat metadata from Feishu when available."""
         fallback = {
             "chat_id": chat_id,
             "name": chat_id,
             "type": "dm",
         }
-        if not self._client:
+        client = self._resolve_client(account_id=account_id)
+        if not client:
             return fallback
+        cache_key = f"{account_id or 'default'}:{chat_id}"
 
-        cached = self._chat_info_cache.get(chat_id)
+        cached = self._chat_info_cache.get(cache_key)
         if cached is not None:
             return dict(cached)
 
         try:
             request = self._build_get_chat_request(chat_id)
-            response = await asyncio.to_thread(self._client.im.v1.chat.get, request)
+            response = await asyncio.to_thread(client.im.v1.chat.get, request)
             if not response or getattr(response, "success", lambda: False)() is False:
                 code = getattr(response, "code", "unknown")
                 msg = getattr(response, "msg", "chat lookup failed")
@@ -2276,7 +2303,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 "type": self._map_chat_type(raw_chat_type),
                 "raw_type": raw_chat_type or None,
             }
-            self._chat_info_cache[chat_id] = info
+            self._chat_info_cache[cache_key] = info
             return dict(info)
         except Exception:
             logger.warning("[Feishu] Failed to get chat info for %s", chat_id, exc_info=True)
@@ -2592,8 +2619,9 @@ class FeishuAdapter(BasePlatformAdapter):
         action = "added" if "created" in event_type else "removed"
         synthetic_text = f"reaction:{action}:{emoji_type}"
 
-        sender_profile = await self._resolve_sender_profile(user_id_obj)
-        chat_info = await self.get_chat_info(chat_id)
+        account_id = self._extract_event_account_id(data)
+        sender_profile = await self._resolve_sender_profile(user_id_obj, account_id=account_id)
+        chat_info = await self.get_chat_info(chat_id, account_id=account_id)
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -2602,6 +2630,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=None,
             user_id_alt=sender_profile["user_id_alt"],
+            account_id=account_id,
         )
         synthetic_event = MessageEvent(
             text=synthetic_text,
@@ -2663,7 +2692,11 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Unable to resolve comment context for %s", comment_id)
             return
 
-        sender_profile = await self._resolve_sender_profile(SimpleNamespace(open_id=sender_open_id, user_id=None))
+        account_id = self._extract_event_account_id(data)
+        sender_profile = await self._resolve_sender_profile(
+            SimpleNamespace(open_id=sender_open_id, user_id=None),
+            account_id=account_id,
+        )
         source = self.build_source(
             chat_id=_build_feishu_comment_target(
                 file_type=context["file_type"],
@@ -2676,6 +2709,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=context["comment_id"],
             user_id_alt=sender_profile["user_id_alt"],
+            account_id=account_id,
         )
         synthetic_event = MessageEvent(
             text=context["prompt"],
@@ -2791,8 +2825,9 @@ class FeishuAdapter(BasePlatformAdapter):
                     logger.debug("[Feishu] Question %s already resolved or unknown", question_id)
                     return
 
+                account_id = self._extract_event_account_id(data)
                 sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
-                sender_profile = await self._resolve_sender_profile(sender_id)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=account_id)
                 user_name = sender_profile.get("user_name") or open_id
                 await self._update_interactive_card(
                     message_id=state.message_id,
@@ -2805,7 +2840,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     template="green",
                 )
 
-                chat_info = await self.get_chat_info(chat_id)
+                chat_info = await self.get_chat_info(chat_id, account_id=account_id)
                 source = self.build_source(
                     chat_id=chat_id,
                     chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -2814,6 +2849,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     user_name=sender_profile["user_name"],
                     thread_id=state.thread_id or None,
                     user_id_alt=sender_profile["user_id_alt"],
+                    account_id=account_id,
                 )
                 synthetic_event = MessageEvent(
                     text=f"{state.question}\nAnswer: {answer}",
@@ -2843,8 +2879,9 @@ class FeishuAdapter(BasePlatformAdapter):
                     self._pending_oauth_requests[request_id] = state
                     return
 
+                account_id = self._extract_event_account_id(data)
                 sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
-                sender_profile = await self._resolve_sender_profile(sender_id)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=account_id)
                 user_name = sender_profile.get("user_name") or open_id
                 authorized_open_id = state.requester_open_id or open_id
                 self.record_authorization_grant(
@@ -2877,7 +2914,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     )
                     return
 
-                chat_info = await self.get_chat_info(chat_id)
+                chat_info = await self.get_chat_info(chat_id, account_id=account_id)
                 source = self.build_source(
                     chat_id=chat_id,
                     chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -2886,6 +2923,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     user_name=sender_profile["user_name"],
                     thread_id=None,
                     user_id_alt=sender_profile["user_id_alt"],
+                    account_id=account_id,
                 )
                 synthetic_event = MessageEvent(
                     text=(
@@ -2928,8 +2966,9 @@ class FeishuAdapter(BasePlatformAdapter):
             label = label_map.get(choice, "Resolved")
 
             # Resolve sender name for the status card
+            account_id = self._extract_event_account_id(data)
             sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
-            sender_profile = await self._resolve_sender_profile(sender_id)
+            sender_profile = await self._resolve_sender_profile(sender_id, account_id=account_id)
             user_name = sender_profile.get("user_name") or open_id
 
             # Resolve the approval — unblocks the agent thread
@@ -2954,9 +2993,10 @@ class FeishuAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        account_id = self._extract_event_account_id(data)
         sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
-        sender_profile = await self._resolve_sender_profile(sender_id)
-        chat_info = await self.get_chat_info(chat_id)
+        sender_profile = await self._resolve_sender_profile(sender_id, account_id=account_id)
+        chat_info = await self.get_chat_info(chat_id, account_id=account_id)
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -2965,6 +3005,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=None,
             user_id_alt=sender_profile["user_id_alt"],
+            account_id=account_id,
         )
         synthetic_event = MessageEvent(
             text=synthetic_text,
@@ -3003,12 +3044,13 @@ class FeishuAdapter(BasePlatformAdapter):
         async with chat_lock:
             message_id = event.message_id
             if message_id:
-                await self._add_ack_reaction(message_id)
+                await self._add_ack_reaction(message_id, account_id=getattr(event.source, "account_id", None))
             await self.handle_message(event)
 
-    async def _add_ack_reaction(self, message_id: str) -> Optional[str]:
+    async def _add_ack_reaction(self, message_id: str, *, account_id: Optional[str] = None) -> Optional[str]:
         """Add a persistent ACK emoji reaction to signal the message was received."""
-        if not self._client or not message_id:
+        client = self._resolve_client(account_id=account_id)
+        if not client or not message_id:
             return None
         try:
             from lark_oapi.api.im.v1 import (  # lazy import — keeps optional dep optional
@@ -3026,7 +3068,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 .request_body(body)
                 .build()
             )
-            response = await asyncio.to_thread(self._client.im.v1.message_reaction.create, request)
+            response = await asyncio.to_thread(client.im.v1.message_reaction.create, request)
             if response and getattr(response, "success", lambda: False)():
                 data = getattr(response, "data", None)
                 return getattr(data, "reaction_id", None)
@@ -3112,9 +3154,10 @@ class FeishuAdapter(BasePlatformAdapter):
             len(media_urls),
         )
 
+        account_id = self._extract_event_account_id(data)
         chat_id = getattr(message, "chat_id", "") or ""
-        chat_info = await self.get_chat_info(chat_id)
-        sender_profile = await self._resolve_sender_profile(sender_id)
+        chat_info = await self.get_chat_info(chat_id, account_id=account_id)
+        sender_profile = await self._resolve_sender_profile(sender_id, account_id=account_id)
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -3123,6 +3166,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=getattr(message, "thread_id", None) or None,
             user_id_alt=sender_profile["user_id_alt"],
+            account_id=account_id,
         )
         normalized = MessageEvent(
             text=text,
@@ -3894,25 +3938,26 @@ class FeishuAdapter(BasePlatformAdapter):
             return "dm"
         return "group"
 
-    async def _resolve_sender_profile(self, sender_id: Any) -> Dict[str, Optional[str]]:
+    async def _resolve_sender_profile(self, sender_id: Any, *, account_id: Optional[str] = None) -> Dict[str, Optional[str]]:
         open_id = getattr(sender_id, "open_id", None) or None
         user_id = getattr(sender_id, "user_id", None) or None
         union_id = getattr(sender_id, "union_id", None) or None
         primary_id = open_id or user_id
-        display_name = await self._resolve_sender_name_from_api(primary_id or union_id)
+        display_name = await self._resolve_sender_name_from_api(primary_id or union_id, account_id=account_id)
         return {
             "user_id": primary_id,
             "user_name": display_name,
             "user_id_alt": union_id,
         }
 
-    async def _resolve_sender_name_from_api(self, sender_id: Optional[str]) -> Optional[str]:
+    async def _resolve_sender_name_from_api(self, sender_id: Optional[str], *, account_id: Optional[str] = None) -> Optional[str]:
         """Fetch the sender's display name from the Feishu contact API with a 10-minute cache.
 
         ID-type detection mirrors openclaw: ou_ → open_id, on_ → union_id, else user_id.
         Failures are silently suppressed; the message pipeline must not block on name resolution.
         """
-        if not sender_id or not self._client:
+        client = self._resolve_client(account_id=account_id)
+        if not sender_id or not client:
             return None
         trimmed = sender_id.strip()
         if not trimmed:
@@ -3932,7 +3977,7 @@ class FeishuAdapter(BasePlatformAdapter):
             else:
                 id_type = "user_id"
             request = GetUserRequest.builder().user_id(trimmed).user_id_type(id_type).build()
-            response = await asyncio.to_thread(self._client.contact.v3.user.get, request)
+            response = await asyncio.to_thread(client.contact.v3.user.get, request)
             if not response or not response.success():
                 return None
             user = getattr(getattr(response, "data", None), "user", None)
@@ -4131,15 +4176,18 @@ class FeishuAdapter(BasePlatformAdapter):
             return True
         return False
 
-    async def _hydrate_bot_identity(self) -> None:
+    async def _hydrate_bot_identity(self, *, account_id: Optional[str] = None) -> None:
         """Best-effort discovery of bot identity for precise group mention gating."""
-        if not self._client:
+        client = self._resolve_client(account_id=account_id)
+        if not client:
             return
-        if any((self._bot_open_id, self._bot_user_id, self._bot_name)):
+        if account_id is None and any((self._bot_open_id, self._bot_user_id, self._bot_name)):
             return
         try:
-            request = self._build_get_application_request(app_id=self._app_id, lang="en_us")
-            response = await asyncio.to_thread(self._client.application.v6.application.get, request)
+            target_account = self._accounts.get(account_id or "default")
+            target_app_id = target_account.app_id if target_account else self._app_id
+            request = self._build_get_application_request(app_id=target_app_id, lang="en_us")
+            response = await asyncio.to_thread(client.application.v6.application.get, request)
             if not response or not response.success():
                 code = getattr(response, "code", None)
                 if code == 99991672:
@@ -4152,7 +4200,15 @@ class FeishuAdapter(BasePlatformAdapter):
             app = getattr(getattr(response, "data", None), "app", None)
             app_name = (getattr(app, "app_name", None) or "").strip()
             if app_name:
-                self._bot_name = app_name
+                if account_id and target_account:
+                    updated_account = FeishuAccountSettings(
+                        **{**target_account.__dict__, "bot_name": app_name}
+                    )
+                    self._accounts[account_id] = updated_account
+                    self._account_by_app_id[updated_account.app_id] = updated_account
+                    self._bot_names.add(app_name)
+                else:
+                    self._bot_name = app_name
         except Exception:
             logger.debug("[Feishu] Failed to hydrate bot identity", exc_info=True)
 
@@ -4432,7 +4488,8 @@ class FeishuAdapter(BasePlatformAdapter):
         file_name: Optional[str] = None,
         outbound_message_type: str = "file",
     ) -> SendResult:
-        if not self._client:
+        client = self._resolve_client(metadata=metadata)
+        if not client:
             return SendResult(success=False, error="Not connected")
         if not os.path.exists(file_path):
             return SendResult(success=False, error=f"File not found: {file_path}")
@@ -4450,7 +4507,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     file=file_obj,
                 )
                 request = self._build_file_upload_request(body)
-                upload_response = await asyncio.to_thread(self._client.im.v1.file.create, request)
+                upload_response = await asyncio.to_thread(client.im.v1.file.create, request)
             file_key = self._extract_response_field(upload_response, "file_key")
             if not file_key:
                 return self._response_error_result(
@@ -4494,6 +4551,9 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
+        client = self._resolve_client(metadata=metadata)
+        if not client:
+            raise RuntimeError("Not connected")
         comment_target = self._parse_comment_target(chat_id)
         if comment_target is not None:
             text_payload = payload
@@ -4512,7 +4572,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 uuid_value=str(uuid.uuid4()),
             )
             request = self._build_reply_message_request(reply_to, body)
-            return await asyncio.to_thread(self._client.im.v1.message.reply, request)
+            return await asyncio.to_thread(client.im.v1.message.reply, request)
 
         body = self._build_create_message_body(
             receive_id=chat_id,
@@ -4521,7 +4581,7 @@ class FeishuAdapter(BasePlatformAdapter):
             uuid_value=str(uuid.uuid4()),
         )
         request = self._build_create_message_request("chat_id", body)
-        return await asyncio.to_thread(self._client.im.v1.message.create, request)
+        return await asyncio.to_thread(client.im.v1.message.create, request)
 
     @staticmethod
     def _parse_comment_target(chat_id: str) -> Optional[Dict[str, str]]:
@@ -4646,6 +4706,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if loop is None or loop.is_closed():
             raise RuntimeError("adapter loop is not ready")
         await self._hydrate_bot_identity()
+        self._clients_by_account = {"default": self._client}
         self._ws_client = FeishuWSClient(
             app_id=self._app_id,
             app_secret=self._app_secret,
@@ -4665,10 +4726,19 @@ class FeishuAdapter(BasePlatformAdapter):
             raise RuntimeError("aiohttp not installed; webhook mode unavailable")
         domain = FEISHU_DOMAIN if self._domain_name != "lark" else LARK_DOMAIN
         self._client = self._build_lark_client(domain)
+        self._clients_by_account = {"default": self._client}
+        for account in self._accounts.values():
+            if account.account_id == "default" or not account.enabled or account.connection_mode != "webhook":
+                continue
+            account_domain = FEISHU_DOMAIN if account.domain_name != "lark" else LARK_DOMAIN
+            self._clients_by_account[account.account_id] = self._build_lark_client_for_account(account, account_domain)
         self._event_handler = self._build_event_handler()
         if self._event_handler is None:
             raise RuntimeError("failed to build Feishu event handler")
         await self._hydrate_bot_identity()
+        for account in self._accounts.values():
+            if account.account_id != "default" and account.enabled and account.connection_mode == "webhook":
+                await self._hydrate_bot_identity(account_id=account.account_id)
         app = web.Application()
         webhook_paths = {self._webhook_path}
         webhook_paths.update(
@@ -4688,6 +4758,17 @@ class FeishuAdapter(BasePlatformAdapter):
             lark.Client.builder()
             .app_id(self._app_id)
             .app_secret(self._app_secret)
+            .domain(domain)
+            .log_level(lark.LogLevel.WARNING)
+            .build()
+        )
+
+    def _build_lark_client_for_account(self, account: FeishuAccountSettings, domain: Any) -> Any:
+        """按账号配置构造飞书客户端。"""
+        return (
+            lark.Client.builder()
+            .app_id(account.app_id)
+            .app_secret(account.app_secret)
             .domain(domain)
             .log_level(lark.LogLevel.WARNING)
             .build()
