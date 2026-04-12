@@ -1942,6 +1942,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     "hermes_action": "complete_oauth",
                     "request_id": state.request_id,
                 },
+                account_id=account_id or state.account_id or None,
             )
             state.scopes = merged_scopes
             state.reason = merged_reason
@@ -2858,8 +2859,9 @@ class FeishuAdapter(BasePlatformAdapter):
                     return
 
                 account_id = self._extract_event_account_id(data)
+                resolved_account_id = account_id or state.account_id or None
                 sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
-                sender_profile = await self._resolve_sender_profile(sender_id, account_id=account_id)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
                 user_name = sender_profile.get("user_name") or open_id
                 await self._update_interactive_card(
                     message_id=state.message_id,
@@ -2870,10 +2872,10 @@ class FeishuAdapter(BasePlatformAdapter):
                         f"**Answer:** {answer}"
                     ),
                     template="green",
-                    account_id=account_id or state.account_id or None,
+                    account_id=resolved_account_id,
                 )
 
-                chat_info = await self.get_chat_info(chat_id, account_id=account_id)
+                chat_info = await self.get_chat_info(chat_id, account_id=resolved_account_id)
                 source = self.build_source(
                     chat_id=chat_id,
                     chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -2882,7 +2884,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     user_name=sender_profile["user_name"],
                     thread_id=state.thread_id or None,
                     user_id_alt=sender_profile["user_id_alt"],
-                    account_id=account_id,
+                    account_id=resolved_account_id,
                 )
                 synthetic_event = MessageEvent(
                     text=f"{state.question}\nAnswer: {answer}",
@@ -2913,8 +2915,9 @@ class FeishuAdapter(BasePlatformAdapter):
                     return
 
                 account_id = self._extract_event_account_id(data)
+                resolved_account_id = account_id or state.account_id or None
                 sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
-                sender_profile = await self._resolve_sender_profile(sender_id, account_id=account_id)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
                 user_name = sender_profile.get("user_name") or open_id
                 authorized_open_id = state.requester_open_id or open_id
                 self.record_authorization_grant(
@@ -2922,7 +2925,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     scopes=state.scopes,
                     updated_by=open_id,
                     source="interactive_confirm",
-                    account_id=account_id or state.account_id or None,
+                    account_id=resolved_account_id,
                 )
                 await self._update_interactive_card(
                     message_id=state.message_id,
@@ -2934,7 +2937,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         f"**Scopes:** {', '.join(state.scopes)}"
                     ),
                     template="green",
-                    account_id=account_id or state.account_id or None,
+                    account_id=resolved_account_id,
                 )
                 replayed = await self._execute_pending_tool_replay(
                     state=state,
@@ -2949,7 +2952,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     )
                     return
 
-                chat_info = await self.get_chat_info(chat_id, account_id=account_id)
+                chat_info = await self.get_chat_info(chat_id, account_id=resolved_account_id)
                 source = self.build_source(
                     chat_id=chat_id,
                     chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -2958,7 +2961,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     user_name=sender_profile["user_name"],
                     thread_id=None,
                     user_id_alt=sender_profile["user_id_alt"],
-                    account_id=account_id,
+                    account_id=resolved_account_id,
                 )
                 synthetic_event = MessageEvent(
                     text=(

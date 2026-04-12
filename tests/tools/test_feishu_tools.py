@@ -3387,6 +3387,7 @@ def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
         title="Auth",
         thread_id="omt_1",
         requester_open_id="ou_user_1",
+        account_id="feishu-cn",
         tool_name="feishu_get_user",
         tool_action="default",
     )
@@ -3402,6 +3403,7 @@ def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
             title="Auth",
             metadata={
                 "thread_id": "omt_1",
+                "account_id": "feishu-cn",
                 "requester_open_id": "ou_user_1",
                 "tool_name": "feishu_calendar_event",
                 "action": "get",
@@ -3417,6 +3419,7 @@ def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
     assert state.tool_name == "feishu_get_user"
     assert state.tool_action == "default"
     adapter._update_interactive_card.assert_awaited_once()
+    assert adapter._update_interactive_card.await_args.kwargs["account_id"] == "feishu-cn"
 
 
 def test_feishu_adapter_records_oauth_completion(monkeypatch):
@@ -3435,6 +3438,7 @@ def test_feishu_adapter_records_oauth_completion(monkeypatch):
         reason="Need basic profile.",
         title="Auth",
         requester_open_id="ou_requester",
+        account_id="feishu-cn",
         tool_name="feishu_drive_file",
         tool_action="delete",
         replay_id="fr_1",
@@ -3473,10 +3477,12 @@ def test_feishu_adapter_records_oauth_completion(monkeypatch):
     assert status["authorized"] is True
     assert status["missing_scopes"] == []
     adapter._update_interactive_card.assert_awaited_once()
+    assert adapter._update_interactive_card.await_args.kwargs["account_id"] == "feishu-cn"
     adapter.send.assert_awaited_once()
     sent_text = adapter.send.await_args.args[1]
     assert "Feishu authorized tool replay completed" in sent_text
     assert "`feishu_drive_file`" in sent_text
+    assert adapter.send.await_args.kwargs["metadata"]["account_id"] == "feishu-cn"
     adapter._handle_message_with_guards.assert_not_awaited()
 
 
