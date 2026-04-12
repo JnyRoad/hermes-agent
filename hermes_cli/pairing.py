@@ -36,6 +36,45 @@ def _notify_feishu_pairing_approval(user_open_id: str) -> None:
     )
 
 
+def _maybe_notify_feishu_onboarding(user_open_id: str) -> bool:
+    """当配对用户就是应用 owner 时，主动发送 onboarding 指引。"""
+    from tools.feishu.client import (
+        get_app_granted_scopes_by_token_type,
+        get_app_info,
+        feishu_api_request,
+    )
+    from tools.feishu.scopes import split_sensitive_scopes
+
+    app_info = get_app_info()
+    effective_owner_open_id = str(app_info.get("effective_owner_open_id", "") or "").strip()
+    if not effective_owner_open_id or effective_owner_open_id != str(user_open_id or "").strip():
+        return False
+
+    granted_user_scopes = get_app_granted_scopes_by_token_type("user")
+    safe_scopes, _sensitive_scopes = split_sensitive_scopes(granted_user_scopes)
+    if not safe_scopes:
+        return False
+
+    command = "/feishu-auth scope " + ",".join(safe_scopes)
+    content = (
+        "You are the Feishu app owner.\n\n"
+        "To finish Hermes onboarding, run this command in the current Feishu chat:\n"
+        f"{command}\n\n"
+        "This requests the app's currently granted user scopes and skips sensitive scopes."
+    )
+    feishu_api_request(
+        "POST",
+        "/open-apis/im/v1/messages",
+        params={"receive_id_type": "open_id"},
+        json_body={
+            "receive_id": user_open_id,
+            "msg_type": "text",
+            "content": json.dumps({"text": content}, ensure_ascii=False),
+        },
+    )
+    return True
+
+
 def pairing_command(args):
     """Handle hermes pairing subcommands."""
     from gateway.pairing import PairingStore
@@ -107,6 +146,13 @@ def _cmd_approve(store, platform: str, code: str):
             except Exception as exc:
                 logger.warning("Failed to notify Feishu pairing approval for %s: %s", uid, exc)
                 print("  Warning: pairing succeeded, but the Feishu approval notice could not be delivered.\n")
+            try:
+                onboarding_sent = _maybe_notify_feishu_onboarding(uid)
+                if onboarding_sent:
+                    print("  Sent a Feishu onboarding message for the app owner.\n")
+            except Exception as exc:
+                logger.warning("Failed to notify Feishu onboarding for %s: %s", uid, exc)
+                print("  Warning: pairing succeeded, but the Feishu onboarding guidance could not be delivered.\n")
     else:
         print(f"\n  Code '{code}' not found or expired for platform '{platform}'.")
         print("  Run 'hermes pairing list' to see pending codes.\n")

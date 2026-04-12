@@ -18,7 +18,7 @@ from tools.feishu.runtime import get_feishu_platform_extra
 logger = logging.getLogger(__name__)
 
 _TOKEN_CACHE: dict[str, tuple[str, float]] = {}
-_APP_SCOPE_CACHE: dict[str, tuple[list[str], float]] = {}
+_APP_SCOPE_CACHE: dict[str, tuple[dict[str, Any], float]] = {}
 
 
 class FeishuAPIError(RuntimeError):
@@ -168,11 +168,21 @@ def get_app_granted_scopes(force_refresh: bool = False) -> List[str]:
 
     依赖 `application:application:self_manage`。如果应用未开通该权限，飞书会返回 99991672。
     """
+    return get_app_granted_scopes_by_token_type(token_type=None, force_refresh=force_refresh)
+
+
+def get_app_granted_scopes_by_token_type(
+    token_type: Optional[str] = None,
+    *,
+    force_refresh: bool = False,
+) -> List[str]:
+    """按 token 类型查询当前飞书应用已开通的权限列表。"""
     key = _cache_key()
     now = time.time()
     cached = _APP_SCOPE_CACHE.get(key)
     if cached and not force_refresh and cached[1] > now + 30:
-        return list(cached[0])
+        raw_scopes = list(cached[0].get("scopes") or [])
+        return _filter_scopes_by_token_type(raw_scopes, token_type)
 
     app_id, _ = get_feishu_credentials()
     data = feishu_api_request(
@@ -181,12 +191,54 @@ def get_app_granted_scopes(force_refresh: bool = False) -> List[str]:
         params={"lang": "zh_cn"},
     )
     app = data.get("data", {}).get("app", {}) if isinstance(data.get("data"), dict) else {}
-    raw_scopes = app.get("scopes") or app.get("online_version", {}).get("scopes") or []
-    scopes = [
-        str(item.get("scope", "")).strip()
-        for item in raw_scopes
+    raw_scopes = [
+        item
+        for item in (app.get("scopes") or app.get("online_version", {}).get("scopes") or [])
         if isinstance(item, dict) and str(item.get("scope", "")).strip()
     ]
-    deduped = list(dict.fromkeys(scopes))
-    _APP_SCOPE_CACHE[key] = (deduped, now + 30)
-    return deduped
+    _APP_SCOPE_CACHE[key] = ({"scopes": raw_scopes, "app": app}, now + 30)
+    return _filter_scopes_by_token_type(raw_scopes, token_type)
+
+
+def _filter_scopes_by_token_type(raw_scopes: List[Dict[str, Any]], token_type: Optional[str]) -> List[str]:
+    """按 token 类型筛选 scope，并保持顺序稳定。"""
+    result: List[str] = []
+    seen: set[str] = set()
+    normalized_token_type = str(token_type or "").strip().lower()
+    for item in raw_scopes:
+        scope = str(item.get("scope", "")).strip()
+        if not scope or scope in seen:
+            continue
+        token_types = item.get("token_types")
+        if normalized_token_type and isinstance(token_types, list):
+            allowed = {str(entry or "").strip().lower() for entry in token_types if str(entry or "").strip()}
+            if allowed and normalized_token_type not in allowed:
+                continue
+        seen.add(scope)
+        result.append(scope)
+    return result
+
+
+def get_app_info(force_refresh: bool = False) -> Dict[str, Any]:
+    """读取飞书应用信息，并给出统一的 owner 判定结果。"""
+    key = _cache_key()
+    now = time.time()
+    cached = _APP_SCOPE_CACHE.get(key)
+    if not cached or force_refresh or cached[1] <= now + 30:
+        get_app_granted_scopes_by_token_type(force_refresh=force_refresh)
+        cached = _APP_SCOPE_CACHE.get(key)
+    payload = dict((cached or ({}, 0))[0] or {})
+    app = dict(payload.get("app") or {})
+    owner = app.get("owner") if isinstance(app.get("owner"), dict) else {}
+    creator_id = str(app.get("creator_id", "") or "").strip()
+    owner_open_id = str(owner.get("owner_id", "") or "").strip()
+    owner_type = owner.get("owner_type", owner.get("type"))
+    effective_owner_open_id = owner_open_id if owner_type == 2 and owner_open_id else (creator_id or owner_open_id)
+    return {
+        "app_id": str(app.get("app_id", "") or "").strip(),
+        "creator_id": creator_id,
+        "owner_open_id": owner_open_id,
+        "owner_type": owner_type,
+        "effective_owner_open_id": effective_owner_open_id,
+        "scopes": list(payload.get("scopes") or []),
+    }
