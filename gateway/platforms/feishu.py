@@ -329,6 +329,8 @@ class FeishuPendingOAuthRequest:
     title: str
     thread_id: str = ""
     requester_open_id: str = ""
+    tool_name: str = ""
+    tool_action: str = "default"
 
 
 @dataclass
@@ -1657,6 +1659,8 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata = dict(metadata or {})
         thread_id = str(metadata.get("thread_id", "") or "").strip()
         requester_open_id = str(metadata.get("requester_open_id", "") or "").strip()
+        tool_name = str(metadata.get("tool_name", "") or "").strip()
+        tool_action = str(metadata.get("action", "") or "").strip().lower() or "default"
 
         for state in self._pending_oauth_requests.values():
             if state.chat_id != chat_id:
@@ -1683,6 +1687,10 @@ class FeishuAdapter(BasePlatformAdapter):
             state.scopes = merged_scopes
             state.reason = merged_reason
             state.title = state.title or title
+            if tool_name:
+                state.tool_name = state.tool_name or tool_name
+            if tool_action:
+                state.tool_action = state.tool_action or tool_action
             return SendResult(
                 success=True,
                 message_id=state.message_id,
@@ -1735,6 +1743,8 @@ class FeishuAdapter(BasePlatformAdapter):
                     title=title,
                     thread_id=thread_id,
                     requester_open_id=requester_open_id,
+                    tool_name=tool_name,
+                    tool_action=tool_action,
                 )
                 result.raw_response = {
                     **(result.raw_response if isinstance(result.raw_response, dict) else {}),
@@ -2350,7 +2360,9 @@ class FeishuAdapter(BasePlatformAdapter):
                     text=(
                         "Feishu authorization completed by the user. "
                         f"Authorized user: {authorized_open_id}. "
-                        f"Confirmed scopes: {', '.join(state.scopes)}"
+                        f"Confirmed scopes: {', '.join(state.scopes)}. "
+                        f"Retry tool: {state.tool_name or 'unknown'}. "
+                        f"Retry action: {state.tool_action or 'default'}."
                     ),
                     message_type=MessageType.TEXT,
                     source=source,

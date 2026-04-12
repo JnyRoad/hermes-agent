@@ -3315,6 +3315,8 @@ def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
         title="Auth",
         thread_id="omt_1",
         requester_open_id="ou_user_1",
+        tool_name="feishu_get_user",
+        tool_action="default",
     )
     adapter._update_interactive_card = AsyncMock()
 
@@ -3326,7 +3328,12 @@ def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
             scopes=["contact:user.base:readonly", "calendar:calendar.readonly"],
             reason="Need calendar too.",
             title="Auth",
-            metadata={"thread_id": "omt_1", "requester_open_id": "ou_user_1"},
+            metadata={
+                "thread_id": "omt_1",
+                "requester_open_id": "ou_user_1",
+                "tool_name": "feishu_calendar_event",
+                "action": "get",
+            },
         )
     )
 
@@ -3335,6 +3342,8 @@ def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
     assert result.raw_response["merged"] is True
     state = adapter._pending_oauth_requests["fo_existing"]
     assert state.scopes == ["contact:user.base:readonly", "calendar:calendar.readonly"]
+    assert state.tool_name == "feishu_get_user"
+    assert state.tool_action == "default"
     adapter._update_interactive_card.assert_awaited_once()
 
 
@@ -3354,6 +3363,8 @@ def test_feishu_adapter_records_oauth_completion(monkeypatch):
         reason="Need basic profile.",
         title="Auth",
         requester_open_id="ou_requester",
+        tool_name="feishu_drive_file",
+        tool_action="delete",
     )
     adapter._resolve_sender_profile = AsyncMock(
         return_value={"user_id": "ou_operator", "user_name": "Alice", "user_id_alt": "ou_operator"}
@@ -3376,6 +3387,9 @@ def test_feishu_adapter_records_oauth_completion(monkeypatch):
     assert status["missing_scopes"] == []
     adapter._update_interactive_card.assert_awaited_once()
     adapter._handle_message_with_guards.assert_awaited_once()
+    routed_event = adapter._handle_message_with_guards.await_args.args[0]
+    assert "Retry tool: feishu_drive_file" in routed_event.text
+    assert "Retry action: delete" in routed_event.text
 
 
 def test_feishu_adapter_rejects_oauth_completion_from_other_user(monkeypatch):
