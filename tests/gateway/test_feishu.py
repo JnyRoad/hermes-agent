@@ -886,6 +886,83 @@ class TestAdapterBehavior(unittest.TestCase):
         run_threadsafe.assert_not_called()
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_handle_reaction_event_uses_secondary_account_client_for_lookup(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                        }
+                    },
+                }
+            )
+        )
+        captured = {"primary": 0, "secondary": 0}
+
+        class _PrimaryMessageAPI:
+            def get(self, request):
+                captured["primary"] += 1
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(items=[]))
+
+        class _SecondaryMessageAPI:
+            def get(self, request):
+                captured["secondary"] += 1
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(
+                        items=[
+                            SimpleNamespace(
+                                sender=SimpleNamespace(sender_type="app"),
+                                chat_id="oc_secondary",
+                                chat_type="group",
+                            )
+                        ]
+                    ),
+                )
+
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_PrimaryMessageAPI())))
+        adapter._clients_by_account = {
+            "default": adapter._client,
+            "feishu-cn": SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_SecondaryMessageAPI()))),
+        }
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter.get_chat_info = AsyncMock(return_value={"chat_id": "oc_secondary", "name": "Secondary Chat", "type": "group"})
+        adapter._handle_message_with_guards = AsyncMock()
+
+        event = SimpleNamespace(
+            message_id="om_reaction",
+            user_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+            reaction_type=SimpleNamespace(emoji_type="THUMBSUP"),
+        )
+        data = SimpleNamespace(
+            header=SimpleNamespace(app_id="cli_secondary"),
+            event=event,
+        )
+        setattr(data, "_hermes_feishu_account_id", "feishu-cn")
+        setattr(event, "_hermes_feishu_account_id", "feishu-cn")
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            asyncio.run(adapter._handle_reaction_event("im.message.reaction.created_v1", data))
+
+        self.assertEqual(captured["primary"], 0)
+        self.assertEqual(captured["secondary"], 1)
+        adapter._handle_message_with_guards.assert_awaited_once()
+        routed = adapter._handle_message_with_guards.await_args.args[0]
+        self.assertEqual(routed.source.account_id, "feishu-cn")
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_normalize_inbound_text_strips_feishu_mentions(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -1477,12 +1554,14 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter._download_feishu_image.assert_awaited_once_with(
             message_id="om_post_media",
             image_key="img_123",
+            account_id=None,
         )
         adapter._download_feishu_message_resource.assert_awaited_once_with(
             message_id="om_post_media",
             file_key="file_123",
             resource_type="file",
             fallback_filename="spec.pdf",
+            account_id=None,
         )
 
     @patch.dict(os.environ, {}, clear=True)
@@ -1590,6 +1669,7 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter._download_feishu_image.assert_awaited_once_with(
             message_id="om_image",
             image_key="img_123",
+            account_id=None,
         )
 
     @patch.dict(os.environ, {}, clear=True)
@@ -2131,6 +2211,63 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(event.reply_to_text, "父消息内容")
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_message_passes_secondary_account_id_to_extract_and_reply_lookup(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                        }
+                    },
+                }
+            )
+        )
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(return_value={"chat_id": "oc_chat", "name": "Secondary DM", "type": "dm"})
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter._extract_message_content = AsyncMock(return_value=("reply", MessageType.TEXT, [], []))
+        adapter._fetch_message_text = AsyncMock(return_value="父消息内容")
+        message = SimpleNamespace(
+            chat_id="oc_chat",
+            thread_id=None,
+            parent_id="om_parent",
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"reply"}',
+            message_id="om_reply",
+        )
+
+        data = SimpleNamespace(
+            header=SimpleNamespace(app_id="cli_secondary"),
+            event=SimpleNamespace(message=message),
+        )
+        setattr(data, "_hermes_feishu_account_id", "feishu-cn")
+        setattr(data.event, "_hermes_feishu_account_id", "feishu-cn")
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=data,
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                chat_type="p2p",
+                message_id="om_reply",
+            )
+        )
+
+        self.assertEqual(adapter._extract_message_content.await_args.kwargs["account_id"], "feishu-cn")
+        self.assertEqual(adapter._fetch_message_text.await_args.kwargs["account_id"], "feishu-cn")
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_replies_in_thread_when_thread_metadata_present(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -2528,6 +2665,79 @@ class TestAdapterBehavior(unittest.TestCase):
             captured["message_request"].request_body.content,
             '{"image_key": "img_123"}',
         )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_image_file_routes_upload_to_secondary_account_client(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                        }
+                    },
+                }
+            )
+        )
+        captured = {"primary_uploads": 0, "secondary_uploads": 0}
+
+        class _PrimaryImageAPI:
+            def create(self, request):
+                captured["primary_uploads"] += 1
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(image_key="img_primary"))
+
+        class _SecondaryImageAPI:
+            def create(self, request):
+                captured["secondary_uploads"] += 1
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(image_key="img_secondary"))
+
+        class _PrimaryMessageAPI:
+            def create(self, request):
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_primary"))
+
+        class _SecondaryMessageAPI:
+            def create(self, request):
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_secondary"))
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(image=_PrimaryImageAPI(), message=_PrimaryMessageAPI()))
+        )
+        adapter._clients_by_account = {
+            "default": adapter._client,
+            "feishu-cn": SimpleNamespace(
+                im=SimpleNamespace(v1=SimpleNamespace(image=_SecondaryImageAPI(), message=_SecondaryMessageAPI()))
+            ),
+        }
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with tempfile.NamedTemporaryFile("wb", suffix=".png", delete=False) as tmp:
+            tmp.write(b"\x89PNG\r\n\x1a\n")
+            image_path = tmp.name
+
+        try:
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                result = asyncio.run(
+                    adapter.send_image_file(
+                        chat_id="oc_chat",
+                        image_path=image_path,
+                        metadata={"account_id": "feishu-cn"},
+                    )
+                )
+        finally:
+            os.unlink(image_path)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_secondary")
+        self.assertEqual(captured["primary_uploads"], 0)
+        self.assertEqual(captured["secondary_uploads"], 1)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_image_file_with_caption_uses_single_post_message(self):
@@ -3379,6 +3589,77 @@ class TestAdapterBehavior(unittest.TestCase):
 
         self.assertEqual(primary["name"], "Primary Chat")
         self.assertEqual(secondary["name"], "Secondary Chat")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_fetch_message_text_cache_is_scoped_by_account(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                        }
+                    },
+                }
+            )
+        )
+        captured = {"primary": 0, "secondary": 0}
+
+        class _PrimaryMessageAPI:
+            def get(self, request):
+                captured["primary"] += 1
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(
+                        items=[
+                            SimpleNamespace(
+                                body=SimpleNamespace(content='{"text":"Primary parent"}'),
+                                msg_type="text",
+                            )
+                        ]
+                    ),
+                )
+
+        class _SecondaryMessageAPI:
+            def get(self, request):
+                captured["secondary"] += 1
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(
+                        items=[
+                            SimpleNamespace(
+                                body=SimpleNamespace(content='{"text":"Secondary parent"}'),
+                                msg_type="text",
+                            )
+                        ]
+                    ),
+                )
+
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_PrimaryMessageAPI())))
+        adapter._clients_by_account = {
+            "default": adapter._client,
+            "feishu-cn": SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_SecondaryMessageAPI()))),
+        }
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            primary = asyncio.run(adapter._fetch_message_text("om_parent", account_id="default"))
+            secondary = asyncio.run(adapter._fetch_message_text("om_parent", account_id="feishu-cn"))
+            primary_cached = asyncio.run(adapter._fetch_message_text("om_parent", account_id="default"))
+
+        self.assertEqual(primary, "Primary parent")
+        self.assertEqual(secondary, "Secondary parent")
+        self.assertEqual(primary_cached, "Primary parent")
+        self.assertEqual(captured["primary"], 1)
+        self.assertEqual(captured["secondary"], 1)
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")

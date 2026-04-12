@@ -2175,7 +2175,9 @@ class FeishuAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a local image file to Feishu."""
-        if not self._client:
+        account_id = str((metadata or {}).get("account_id") or "").strip() or None
+        client = self._resolve_client(account_id=account_id, metadata=metadata)
+        if not client:
             return SendResult(success=False, error="Not connected")
         if not os.path.exists(image_path):
             return SendResult(success=False, error=f"Image file not found: {image_path}")
@@ -2192,7 +2194,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 image=image_file,
             )
             request = self._build_image_upload_request(body)
-            upload_response = await asyncio.to_thread(self._client.im.v1.image.create, request)
+            upload_response = await asyncio.to_thread(client.im.v1.image.create, request)
             image_key = self._extract_response_field(upload_response, "image_key")
             if not image_key:
                 return self._response_error_result(
@@ -2610,17 +2612,19 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def _handle_reaction_event(self, event_type: str, data: Any) -> None:
         """Fetch the reacted-to message; if it was sent by this bot, emit a synthetic text event."""
-        if not self._client:
-            return
         event = getattr(data, "event", None)
         message_id = str(getattr(event, "message_id", "") or "")
         if not message_id:
+            return
+        account_id = self._extract_event_account_id(data)
+        client = self._resolve_client(account_id=account_id)
+        if not client:
             return
 
         # Fetch the target message to verify it was sent by us and to obtain chat context.
         try:
             request = self._build_get_message_request(message_id)
-            response = await asyncio.to_thread(self._client.im.v1.message.get, request)
+            response = await asyncio.to_thread(client.im.v1.message.get, request)
             if not response or not getattr(response, "success", lambda: False)():
                 return
             items = getattr(getattr(response, "data", None), "items", None) or []
@@ -2644,8 +2648,6 @@ class FeishuAdapter(BasePlatformAdapter):
         emoji_type = str(getattr(reaction_type_obj, "emoji_type", "") or "UNKNOWN")
         action = "added" if "created" in event_type else "removed"
         synthetic_text = f"reaction:{action}:{emoji_type}"
-
-        account_id = self._extract_event_account_id(data)
         sender_profile = await self._resolve_sender_profile(user_id_obj, account_id=account_id)
         chat_info = await self.get_chat_info(chat_id, account_id=account_id)
         source = self.build_source(
@@ -3168,7 +3170,11 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_type: str,
         message_id: str,
     ) -> None:
-        text, inbound_type, media_urls, media_types = await self._extract_message_content(message)
+        account_id = self._extract_event_account_id(data)
+        text, inbound_type, media_urls, media_types = await self._extract_message_content(
+            message,
+            account_id=account_id,
+        )
         if inbound_type == MessageType.TEXT and not text and not media_urls:
             logger.debug("[Feishu] Ignoring unsupported or empty message type: %s", getattr(message, "message_type", ""))
             return
@@ -3181,7 +3187,11 @@ class FeishuAdapter(BasePlatformAdapter):
             or getattr(message, "upper_message_id", None)
             or None
         )
-        reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
+        reply_to_text = (
+            await self._fetch_message_text(reply_to_message_id, account_id=account_id)
+            if reply_to_message_id
+            else None
+        )
 
         logger.info(
             "[Feishu] Inbound %s message received: id=%s type=%s chat_id=%s text=%r media=%d",
@@ -3193,7 +3203,6 @@ class FeishuAdapter(BasePlatformAdapter):
             len(media_urls),
         )
 
-        account_id = self._extract_event_account_id(data)
         chat_id = getattr(message, "chat_id", "") or ""
         chat_info = await self.get_chat_info(chat_id, account_id=account_id)
         sender_profile = await self._resolve_sender_profile(sender_id, account_id=account_id)
@@ -3684,7 +3693,9 @@ class FeishuAdapter(BasePlatformAdapter):
     # Message content extraction and resource download
     # =========================================================================
 
-    async def _extract_message_content(self, message: Any) -> tuple[str, MessageType, List[str], List[str]]:
+    async def _extract_message_content(
+        self, message: Any, *, account_id: Optional[str] = None
+    ) -> tuple[str, MessageType, List[str], List[str]]:
         """Extract text and cached media from a normalized Feishu message."""
         raw_content = getattr(message, "content", "") or ""
         raw_type = getattr(message, "message_type", "") or ""
@@ -3695,6 +3706,7 @@ class FeishuAdapter(BasePlatformAdapter):
         media_urls, media_types = await self._download_feishu_message_resources(
             message_id=message_id,
             normalized=normalized,
+            account_id=account_id,
         )
         inbound_type = self._resolve_normalized_message_type(normalized, media_types)
         text = normalized.text_content
@@ -3715,6 +3727,7 @@ class FeishuAdapter(BasePlatformAdapter):
         *,
         message_id: str,
         normalized: FeishuNormalizedMessage,
+        account_id: Optional[str] = None,
     ) -> tuple[List[str], List[str]]:
         media_urls: List[str] = []
         media_types: List[str] = []
@@ -3723,6 +3736,7 @@ class FeishuAdapter(BasePlatformAdapter):
             cached_path, media_type = await self._download_feishu_image(
                 message_id=message_id,
                 image_key=image_key,
+                account_id=account_id,
             )
             if cached_path:
                 media_urls.append(cached_path)
@@ -3734,6 +3748,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 file_key=media_ref.file_key,
                 resource_type=media_ref.resource_type,
                 fallback_filename=media_ref.file_name,
+                account_id=account_id,
             )
             if cached_path:
                 media_urls.append(cached_path)
@@ -3788,8 +3803,11 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Failed to inject text document content from %s", cached_path, exc_info=True)
             return ""
 
-    async def _download_feishu_image(self, *, message_id: str, image_key: str) -> tuple[str, str]:
-        if not self._client or not message_id:
+    async def _download_feishu_image(
+        self, *, message_id: str, image_key: str, account_id: Optional[str] = None
+    ) -> tuple[str, str]:
+        client = self._resolve_client(account_id=account_id)
+        if not client or not message_id:
             return "", ""
         try:
             request = self._build_message_resource_request(
@@ -3797,7 +3815,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 file_key=image_key,
                 resource_type="image",
             )
-            response = await asyncio.to_thread(self._client.im.v1.message_resource.get, request)
+            response = await asyncio.to_thread(client.im.v1.message_resource.get, request)
             if not response or not response.success():
                 logger.warning(
                     "[Feishu] Failed to download image %s: %s %s",
@@ -3826,8 +3844,10 @@ class FeishuAdapter(BasePlatformAdapter):
         file_key: str,
         resource_type: str,
         fallback_filename: str,
+        account_id: Optional[str] = None,
     ) -> tuple[str, str]:
-        if not self._client or not message_id:
+        client = self._resolve_client(account_id=account_id)
+        if not client or not message_id:
             return "", ""
 
         request_types = [resource_type]
@@ -3841,7 +3861,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     file_key=file_key,
                     resource_type=request_type,
                 )
-                response = await asyncio.to_thread(self._client.im.v1.message_resource.get, request)
+                response = await asyncio.to_thread(client.im.v1.message_resource.get, request)
                 if not response or not response.success():
                     logger.debug(
                         "[Feishu] Resource download failed for %s/%s via type=%s: %s %s",
@@ -4035,14 +4055,16 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Failed to resolve sender name for %s", sender_id, exc_info=True)
         return None
 
-    async def _fetch_message_text(self, message_id: str) -> Optional[str]:
-        if not self._client or not message_id:
+    async def _fetch_message_text(self, message_id: str, *, account_id: Optional[str] = None) -> Optional[str]:
+        client = self._resolve_client(account_id=account_id)
+        if not client or not message_id:
             return None
-        if message_id in self._message_text_cache:
-            return self._message_text_cache[message_id]
+        cache_key = f"{account_id or 'default'}:{message_id}"
+        if cache_key in self._message_text_cache:
+            return self._message_text_cache[cache_key]
         try:
             request = self._build_get_message_request(message_id)
-            response = await asyncio.to_thread(self._client.im.v1.message.get, request)
+            response = await asyncio.to_thread(client.im.v1.message.get, request)
             if not response or getattr(response, "success", lambda: False)() is False:
                 code = getattr(response, "code", "unknown")
                 msg = getattr(response, "msg", "message lookup failed")
@@ -4054,7 +4076,7 @@ class FeishuAdapter(BasePlatformAdapter):
             msg_type = getattr(parent, "msg_type", "") or ""
             raw_content = getattr(body, "content", "") or ""
             text = self._extract_text_from_raw_content(msg_type=msg_type, raw_content=raw_content)
-            self._message_text_cache[message_id] = text
+            self._message_text_cache[cache_key] = text
             return text
         except Exception:
             logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
