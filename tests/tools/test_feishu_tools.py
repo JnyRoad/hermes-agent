@@ -332,6 +332,13 @@ def test_feishu_doc_comments_patch_requires_is_solved_value(monkeypatch):
     assert "is_solved_value" in payload["error"]
 
 
+def test_feishu_doc_comments_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.doc_comments import _handle_doc_comments
+
+    payload = json.loads(_handle_doc_comments({"action": "noop", "file_token": "dox_1", "file_type": "docx"}))
+    assert "Unsupported action" in payload["error"]
+
+
 def test_feishu_doc_comments_list_replies_handler(monkeypatch):
     from tools.feishu.doc_comments import _handle_doc_comments
 
@@ -545,6 +552,13 @@ def test_feishu_bitable_app_copy_requires_name(monkeypatch):
     assert "name" in payload["error"]
 
 
+def test_feishu_bitable_app_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.bitable_app import _handle_bitable_app
+
+    payload = json.loads(_handle_bitable_app({"action": "noop"}))
+    assert "Unsupported action" in payload["error"]
+
+
 def test_feishu_bitable_app_table_list_handler(monkeypatch):
     from tools.feishu.bitable_app_table import _handle_bitable_app_table
 
@@ -636,6 +650,13 @@ def test_feishu_bitable_app_table_batch_create_rejects_non_object_item(monkeypat
         _handle_bitable_app_table({"action": "batch_create", "app_token": "app_1", "tables": ["bad"]})
     )
     assert "tables[0] must be an object" in payload["error"]
+
+
+def test_feishu_bitable_app_table_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.bitable_app_table import _handle_bitable_app_table
+
+    payload = json.loads(_handle_bitable_app_table({"action": "noop", "app_token": "app_1"}))
+    assert "Unsupported action" in payload["error"]
 
 
 def test_feishu_bitable_app_table_patch_handler(monkeypatch):
@@ -902,6 +923,15 @@ def test_feishu_bitable_app_table_field_delete_requires_field_id(monkeypatch):
     assert "field_id" in payload["error"]
 
 
+def test_feishu_bitable_app_table_field_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.bitable_app_table_field import _handle_bitable_app_table_field
+
+    payload = json.loads(
+        _handle_bitable_app_table_field({"action": "noop", "app_token": "app_1", "table_id": "tbl_1"})
+    )
+    assert "Unsupported action" in payload["error"]
+
+
 def test_feishu_bitable_app_table_view_list_handler(monkeypatch):
     from tools.feishu.bitable_app_table_view import _handle_bitable_app_table_view
 
@@ -987,6 +1017,15 @@ def test_feishu_bitable_app_table_view_patch_requires_view_name(monkeypatch):
     )
     assert "view_id" in payload["error"]
     assert "view_name" in payload["error"]
+
+
+def test_feishu_bitable_app_table_view_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.bitable_app_table_view import _handle_bitable_app_table_view
+
+    payload = json.loads(
+        _handle_bitable_app_table_view({"action": "noop", "app_token": "app_1", "table_id": "tbl_1"})
+    )
+    assert "Unsupported action" in payload["error"]
 
 
 def test_feishu_drive_file_list_handler(monkeypatch):
@@ -1252,6 +1291,13 @@ def test_feishu_wiki_space_get_requires_space_id(monkeypatch):
     assert "space_id" in payload["error"]
 
 
+def test_feishu_wiki_space_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.wiki import _handle_wiki_space
+
+    payload = json.loads(_handle_wiki_space({"action": "noop"}))
+    assert "Unsupported action" in payload["error"]
+
+
 def test_feishu_wiki_space_node_handler(monkeypatch):
     from tools.feishu.wiki import _handle_wiki_space_node
 
@@ -1348,6 +1394,13 @@ def test_feishu_wiki_space_node_copy_requires_node_token(monkeypatch):
     payload = json.loads(_handle_wiki_space_node({"action": "copy", "space_id": "sp1"}))
     assert "space_id" in payload["error"]
     assert "node_token" in payload["error"]
+
+
+def test_feishu_wiki_space_node_rejects_unsupported_action(monkeypatch):
+    from tools.feishu.wiki import _handle_wiki_space_node
+
+    payload = json.loads(_handle_wiki_space_node({"action": "noop"}))
+    assert "Unsupported action" in payload["error"]
 
 
 def test_feishu_calendar_calendar_list_handler(monkeypatch):
@@ -2465,6 +2518,13 @@ def test_feishu_create_doc_rejects_conflicting_targets(monkeypatch):
     assert "mutually exclusive" in payload["error"]
 
 
+def test_feishu_create_doc_rejects_task_id_polling(monkeypatch):
+    from tools.feishu.docs import _handle_create_doc
+
+    payload = json.loads(_handle_create_doc({"title": "Hello", "task_id": "task_1"}))
+    assert "task_id polling is not implemented" in payload["error"]
+
+
 def test_feishu_update_doc_handler_replace_range(monkeypatch):
     from tools.feishu.docs import _handle_update_doc
 
@@ -2492,6 +2552,38 @@ def test_feishu_update_doc_handler_replace_range(monkeypatch):
     assert payload["updated"] is True
     assert any(item[0] == "DELETE" for item in calls)
     assert any(item[0] == "POST" and item[1].endswith("/children") for item in calls)
+
+
+def test_feishu_update_doc_reports_title_update_note(monkeypatch):
+    from tools.feishu.docs import _handle_update_doc
+
+    def _fake_request(method, path, **kwargs):
+        if method == "GET" and path.endswith("/raw_content"):
+            return {"data": {"content": "Intro"}}
+        if method == "GET" and path.endswith("/children"):
+            return {"data": {"items": [{"block_id": "blk_1"}], "has_more": False}}
+        return {"data": {}}
+
+    monkeypatch.setattr("tools.feishu.docs.feishu_api_request", _fake_request)
+    payload = json.loads(
+        _handle_update_doc(
+            {
+                "doc_id": "doxcn1234567890",
+                "mode": "overwrite",
+                "markdown": "Body",
+                "new_title": "Renamed",
+            }
+        )
+    )
+    assert payload["updated"] is True
+    assert "title_update_note" in payload
+
+
+def test_feishu_update_doc_rejects_task_id_polling(monkeypatch):
+    from tools.feishu.docs import _handle_update_doc
+
+    payload = json.loads(_handle_update_doc({"doc_id": "doxcn1234567890", "mode": "overwrite", "task_id": "task_1"}))
+    assert "task_id polling is not implemented" in payload["error"]
 
 
 def test_feishu_update_doc_requires_mode(monkeypatch):
