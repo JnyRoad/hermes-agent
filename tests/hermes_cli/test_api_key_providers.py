@@ -28,6 +28,37 @@ from hermes_cli.auth import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_provider_env(monkeypatch, tmp_path):
+    """每个用例都使用独立 HERMES_HOME，并清理宿主机残留的 provider 凭据。"""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    for key in (
+        "GLM_API_KEY",
+        "ZAI_API_KEY",
+        "Z_AI_API_KEY",
+        "GLM_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "KIMI_API_KEY",
+        "KIMI_BASE_URL",
+        "MINIMAX_API_KEY",
+        "MINIMAX_BASE_URL",
+        "MINIMAX_CN_API_KEY",
+        "MINIMAX_CN_BASE_URL",
+        "AI_GATEWAY_API_KEY",
+        "AI_GATEWAY_BASE_URL",
+        "KILOCODE_API_KEY",
+        "KILOCODE_BASE_URL",
+        "HF_TOKEN",
+        "HF_BASE_URL",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "COPILOT_GITHUB_TOKEN",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
 # =============================================================================
 # Provider Registry tests
 # =============================================================================

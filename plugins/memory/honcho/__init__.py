@@ -217,10 +217,10 @@ class HonchoMemoryProvider(MemoryProvider):
                 logger.debug("Honcho not configured — plugin inactive")
                 return
 
-            # Gateway 会把真实平台用户标识传到这里。为了避免不同聊天用户
-            # 共享同一个静态 peer_name，网关场景必须优先使用 user_id 做隔离。
+            # Gateway 会把真实平台用户标识传到这里。只有在用户没有显式配置
+            # peer_name 时，才使用 user_id 作为隔离标识；显式配置必须保持优先级。
             _gw_user_id = kwargs.get("user_id")
-            if _gw_user_id:
+            if _gw_user_id and not cfg.peer_name:
                 cfg.peer_name = _gw_user_id
 
             self._config = cfg

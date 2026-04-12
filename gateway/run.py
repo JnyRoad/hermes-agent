@@ -1302,7 +1302,9 @@ class GatewayRunner:
             now = asyncio.get_running_loop().time()
             active_count = GatewayRunner._running_agent_count(self)
             if force or active_count != last_active_count or (now - last_status_at) >= 1.0:
-                GatewayRunner._update_runtime_status(self, "draining")
+                # 关机节流逻辑既要调用真实实现，也要允许测试替换成 MagicMock
+                # 统计调用次数，因此这里必须走实例属性而不是硬绑类方法。
+                self._update_runtime_status("draining")
                 last_active_count = active_count
                 last_status_at = now
 

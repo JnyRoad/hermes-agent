@@ -5,6 +5,14 @@ import os
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _clear_anthropic_env(monkeypatch, tmp_path):
+    """隔离宿主机凭据，避免本地环境把 provider gate 测试污染为已配置。"""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+
+
 def _write_config(tmp_path, config: dict) -> None:
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)

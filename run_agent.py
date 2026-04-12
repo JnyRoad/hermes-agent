@@ -5737,7 +5737,10 @@ class AIAgent:
                 preserve_dots=self._anthropic_preserve_dots(),
                 context_length=ctx_len,
                 base_url=getattr(self, "_anthropic_base_url", None),
-                fast_mode=(self.request_overrides or {}).get("speed") == "fast",
+                # 某些单元测试会通过 __new__ 构造最小 agent，再直接调用
+                # _build_api_kwargs()。这里必须对 request_overrides 缺失保持健壮，
+                # 否则 API 参数构建会在进入真实逻辑前提前崩溃。
+                fast_mode=(getattr(self, "request_overrides", None) or {}).get("speed") == "fast",
             )
 
         if self.api_mode == "codex_responses":
