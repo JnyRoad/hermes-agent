@@ -2802,20 +2802,43 @@ def test_feishu_create_doc_renders_list_quote_and_code_blocks(monkeypatch):
         _handle_create_doc(
             {
                 "title": "Hello",
-                "markdown": "# Title\n- Alpha\n> Quote\n```python\nprint('hi')\n```",
+                "markdown": "# **Title**\n- *Alpha*\n> ~~Quote~~\n```python\nprint('hi')\n```",
             }
         )
     )
 
     children = create_children_payloads[0]["children"]
-    rendered = [item["text"]["elements"][0]["text_run"]["content"] for item in children]
-    assert rendered == [
-        "# Title",
-        "• Alpha",
-        "> Quote",
-        "```\n[python]\nprint('hi')\n```",
-    ]
+    assert children[0]["block_type"] == 3
+    assert children[0]["heading1"]["elements"][0]["text_run"]["content"] == "Title"
+    assert children[0]["heading1"]["elements"][0]["text_run"]["text_element_style"] == {"bold": True}
+    assert children[1]["block_type"] == 12
+    assert children[1]["bullet"]["elements"][0]["text_run"]["content"] == "Alpha"
+    assert children[1]["bullet"]["elements"][0]["text_run"]["text_element_style"] == {"italic": True}
+    assert children[2]["block_type"] == 15
+    assert children[2]["quote"]["elements"][0]["text_run"]["content"] == "Quote"
+    assert children[2]["quote"]["elements"][0]["text_run"]["text_element_style"] == {"strikethrough": True}
+    assert children[3]["block_type"] == 14
+    assert children[3]["code"]["elements"][0]["text_run"]["content"] == "print('hi')"
+    assert children[3]["code"]["style"]["language"] == "python"
+    assert children[3]["code"]["style"]["wrap"] is True
     assert payload["write_result"]["block_kinds"] == ["heading", "list", "quote", "code"]
+
+
+def test_feishu_doc_build_native_blocks_supports_ordered_and_inline_code():
+    from tools.feishu.docs import _build_native_doc_block
+
+    ordered_block = _build_native_doc_block(
+        {
+            "kind": "list",
+            "ordered": True,
+            "marker": "1.",
+            "source_text": "`one`",
+            "text": "one",
+        }
+    )
+    assert ordered_block["block_type"] == 13
+    assert ordered_block["ordered"]["elements"][0]["text_run"]["content"] == "one"
+    assert ordered_block["ordered"]["elements"][0]["text_run"]["text_element_style"] == {"inline_code": True}
 
 
 def test_feishu_update_doc_reports_title_update_note(monkeypatch):

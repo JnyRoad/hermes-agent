@@ -32,6 +32,7 @@ _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MD_EMPHASIS_RE = re.compile(r"(\*\*|__|\*|_|~~|`)")
 _MD_BLOCKQUOTE_RE = re.compile(r"^\s*>\s?")
 _MD_FENCE_RE = re.compile(r"^\s*(```+|~~~+)\s*([A-Za-z0-9_+-]*)\s*$")
+_MD_INLINE_TOKEN_RE = re.compile(r"(\*\*[^*\n]+\*\*|__[^_\n]+__|~~[^~\n]+~~|`[^`\n]+`|\*[^*\n]+\*|_[^_\n]+_)")
 _DOC_TASK_ID_RE = re.compile(r"^doc_task_[a-f0-9]{12}$")
 
 _ASYNC_DOC_MARKDOWN_THRESHOLD = 12000
@@ -177,6 +178,55 @@ def _strip_inline_markdown(text: str) -> str:
     return cleaned.strip()
 
 
+def _normalize_inline_markdown_source(text: str) -> str:
+    """Normalize Markdown source while preserving inline emphasis markers for text runs."""
+    return _MD_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2)})", str(text or "")).strip()
+
+
+def _parse_text_run_style(token: str) -> tuple[str, Dict[str, Any]]:
+    """Translate a minimal subset of Markdown emphasis into Feishu text element styles."""
+    if token.startswith("**") and token.endswith("**"):
+        return token[2:-2], {"bold": True}
+    if token.startswith("__") and token.endswith("__"):
+        return token[2:-2], {"bold": True}
+    if token.startswith("~~") and token.endswith("~~"):
+        return token[2:-2], {"strikethrough": True}
+    if token.startswith("`") and token.endswith("`"):
+        return token[1:-1], {"inline_code": True}
+    if token.startswith("*") and token.endswith("*"):
+        return token[1:-1], {"italic": True}
+    if token.startswith("_") and token.endswith("_"):
+        return token[1:-1], {"italic": True}
+    return token, {}
+
+
+def _build_text_elements(text: str) -> List[Dict[str, Any]]:
+    """Build Feishu text elements while preserving basic inline Markdown styles."""
+    normalized = _normalize_inline_markdown_source(text)
+    if not normalized:
+        return [{"text_run": {"content": " "}}]
+
+    elements: List[Dict[str, Any]] = []
+    cursor = 0
+    for match in _MD_INLINE_TOKEN_RE.finditer(normalized):
+        if match.start() > cursor:
+            plain = normalized[cursor:match.start()]
+            if plain:
+                elements.append({"text_run": {"content": plain}})
+        content, style = _parse_text_run_style(match.group(0))
+        if content:
+            text_run: Dict[str, Any] = {"content": content}
+            if style:
+                text_run["text_element_style"] = style
+            elements.append({"text_run": text_run})
+        cursor = match.end()
+    if cursor < len(normalized):
+        tail = normalized[cursor:]
+        if tail:
+            elements.append({"text_run": {"content": tail}})
+    return elements or [{"text_run": {"content": " "}}]
+
+
 def _normalize_markdown_to_blocks(markdown: str) -> List[Dict[str, Any]]:
     """Parse Markdown into stable doc text blocks with preserved structural cues."""
     text = str(markdown or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -195,15 +245,20 @@ def _normalize_markdown_to_blocks(markdown: str) -> List[Dict[str, Any]]:
         paragraph_buffer = []
         if not merged:
             return
-        blocks.append({"kind": "paragraph", "text": _strip_inline_markdown(merged)})
+        blocks.append(
+            {
+                "kind": "paragraph",
+                "source_text": _normalize_inline_markdown_source(merged),
+                "text": _strip_inline_markdown(merged),
+            }
+        )
 
     def flush_code_block() -> None:
         nonlocal code_lines, code_fence, code_language
         if code_fence is None:
             return
         body = "\n".join(code_lines).rstrip("\n")
-        prefix = f"[{code_language}]\n" if code_language else ""
-        blocks.append({"kind": "code", "text": f"{prefix}{body}".strip()})
+        blocks.append({"kind": "code", "text": body, "language": code_language})
         code_lines = []
         code_fence = None
         code_language = ""
@@ -235,6 +290,7 @@ def _normalize_markdown_to_blocks(markdown: str) -> List[Dict[str, Any]]:
                 {
                     "kind": "heading",
                     "level": len(heading_match.group(1)),
+                    "source_text": _normalize_inline_markdown_source(heading_match.group(2)),
                     "text": _strip_inline_markdown(heading_match.group(2)),
                 }
             )
@@ -243,7 +299,14 @@ def _normalize_markdown_to_blocks(markdown: str) -> List[Dict[str, Any]]:
         quote_match = _MD_BLOCKQUOTE_RE.match(line)
         if quote_match:
             flush_paragraph()
-            blocks.append({"kind": "quote", "text": _strip_inline_markdown(line[quote_match.end():])})
+            quote_text = line[quote_match.end():]
+            blocks.append(
+                {
+                    "kind": "quote",
+                    "source_text": _normalize_inline_markdown_source(quote_text),
+                    "text": _strip_inline_markdown(quote_text),
+                }
+            )
             continue
 
         list_match = re.match(r"^(\s*)([-*+]|\d+\.)\s+(.*)$", line)
@@ -257,6 +320,7 @@ def _normalize_markdown_to_blocks(markdown: str) -> List[Dict[str, Any]]:
                     "ordered": marker.endswith(".") and marker[:-1].isdigit(),
                     "marker": marker,
                     "indent": max(indent_level, 0),
+                    "source_text": _normalize_inline_markdown_source(list_match.group(3)),
                     "text": _strip_inline_markdown(list_match.group(3)),
                 }
             )
@@ -286,25 +350,44 @@ def _render_doc_block_text(block: Dict[str, Any]) -> str:
     if kind == "quote":
         return f"> {text}".rstrip()
     if kind == "code":
-        return f"```\n{text}\n```".strip()
+        language = str(block.get("language") or "").strip()
+        prefix = f"[{language}]\n" if language else ""
+        return f"```\n{prefix}{text}\n```".strip()
     return text
 
 
-def _build_text_block(text: str) -> Dict[str, Any]:
-    content = text if text else " "
-    return {
-        "block_type": 2,
-        "text": {
-            "elements": [
-                {
-                    "text_run": {
-                        "content": content,
-                    }
-                }
-            ],
-            "style": {},
-        },
+def _build_native_doc_block(block: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a native Feishu docx block payload from parsed Markdown structure."""
+    kind = str(block.get("kind") or "paragraph")
+    source_text = str(block.get("source_text") or block.get("text") or "")
+    text_payload = {
+        "elements": _build_text_elements(source_text),
+        "style": {},
     }
+    if kind == "heading":
+        level = min(max(int(block.get("level") or 1), 1), 9)
+        key = f"heading{level}"
+        return {"block_type": 2 + level, key: text_payload}
+    if kind == "list":
+        key = "ordered" if block.get("ordered") else "bullet"
+        return {"block_type": 13 if block.get("ordered") else 12, key: text_payload}
+    if kind == "quote":
+        return {"block_type": 15, "quote": text_payload}
+    if kind == "code":
+        code_style: Dict[str, Any] = {"wrap": True}
+        language = str(block.get("language") or "").strip()
+        if language:
+            # The API accepts a code-language enum here. We pass the lower-case language name
+            # directly because Feishu's docx block schema uses textual enum values.
+            code_style["language"] = language.lower()
+        return {
+            "block_type": 14,
+            "code": {
+                "elements": [{"text_run": {"content": str(block.get("text") or "") or " "}}],
+                "style": code_style,
+            },
+        }
+    return {"block_type": 2, "text": text_payload}
 
 
 def _get_doc_meta(document_id: str) -> Dict[str, Any]:
@@ -353,10 +436,10 @@ def _delete_root_children(document_id: str, child_ids: List[str]) -> None:
         )
 
 
-def _append_blocks(document_id: str, paragraphs: List[str], *, start_index: int) -> None:
-    blocks = [_build_text_block(item) for item in paragraphs]
-    for index in range(0, len(blocks), 50):
-        chunk = blocks[index:index + 50]
+def _append_blocks(document_id: str, blocks: List[Dict[str, Any]], *, start_index: int) -> None:
+    native_blocks = [_build_native_doc_block(item) for item in blocks]
+    for index in range(0, len(native_blocks), 50):
+        chunk = native_blocks[index:index + 50]
         feishu_api_request(
             "POST",
             f"/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}/children",
@@ -379,10 +462,9 @@ def _rewrite_document_content(document_id: str, content: str) -> Dict[str, Any]:
     child_ids = [str(item.get("block_id", "")).strip() for item in children if str(item.get("block_id", "")).strip()]
     _delete_root_children(document_id, child_ids)
     markdown_blocks = _normalize_markdown_to_blocks(content)
-    paragraphs = [_render_doc_block_text(item) for item in markdown_blocks]
-    _append_blocks(document_id, paragraphs, start_index=0)
+    _append_blocks(document_id, markdown_blocks, start_index=0)
     return {
-        "paragraph_count": len(paragraphs),
+        "paragraph_count": len(markdown_blocks),
         "block_count": len(markdown_blocks),
         "block_kinds": [str(item.get("kind") or "paragraph") for item in markdown_blocks],
     }
