@@ -2781,6 +2781,17 @@ def test_feishu_doc_markdown_blocks_preserve_structural_cues():
     ]
 
 
+def test_feishu_doc_markdown_blocks_extract_tables():
+    from tools.feishu.docs import _normalize_markdown_to_blocks, _render_doc_block_text
+
+    blocks = _normalize_markdown_to_blocks(
+        "Intro\n\n| name | value |\n| --- | --- |\n| a | 1 |\n| b | 2 |\n\nTail"
+    )
+
+    assert [block["kind"] for block in blocks] == ["paragraph", "table", "paragraph"]
+    assert _render_doc_block_text(blocks[1]) == "```md\n| name | value |\n| --- | --- |\n| a | 1 |\n| b | 2 |\n```"
+
+
 def test_feishu_create_doc_renders_list_quote_and_code_blocks(monkeypatch):
     from tools.feishu.docs import _handle_create_doc
 
@@ -2839,6 +2850,38 @@ def test_feishu_doc_build_native_blocks_supports_ordered_and_inline_code():
     assert ordered_block["block_type"] == 13
     assert ordered_block["ordered"]["elements"][0]["text_run"]["content"] == "one"
     assert ordered_block["ordered"]["elements"][0]["text_run"]["text_element_style"] == {"inline_code": True}
+
+
+def test_feishu_doc_build_native_blocks_downgrades_table_to_markdown_code():
+    from tools.feishu.docs import _build_native_doc_block
+
+    table_block = _build_native_doc_block(
+        {
+            "kind": "table",
+            "text": "| name | value |\n| --- | --- |\n| a | 1 |",
+        }
+    )
+
+    assert table_block["block_type"] == 14
+    assert table_block["code"]["style"]["language"] == "markdown"
+    assert table_block["code"]["elements"][0]["text_run"]["content"].startswith("| name | value |")
+
+
+def test_feishu_doc_build_native_blocks_omits_unknown_code_language():
+    from tools.feishu.docs import _build_native_doc_block
+
+    code_block = _build_native_doc_block({"kind": "code", "text": "echo ok", "language": "foobar"})
+
+    assert code_block["block_type"] == 14
+    assert "language" not in code_block["code"]["style"]
+
+
+def test_feishu_doc_build_native_blocks_normalizes_code_language_alias():
+    from tools.feishu.docs import _build_native_doc_block
+
+    code_block = _build_native_doc_block({"kind": "code", "text": "print('hi')", "language": "py"})
+
+    assert code_block["code"]["style"]["language"] == "python"
 
 
 def test_feishu_update_doc_reports_title_update_note(monkeypatch):

@@ -33,9 +33,53 @@ _MD_EMPHASIS_RE = re.compile(r"(\*\*|__|\*|_|~~|`)")
 _MD_BLOCKQUOTE_RE = re.compile(r"^\s*>\s?")
 _MD_FENCE_RE = re.compile(r"^\s*(```+|~~~+)\s*([A-Za-z0-9_+-]*)\s*$")
 _MD_INLINE_TOKEN_RE = re.compile(r"(\*\*[^*\n]+\*\*|__[^_\n]+__|~~[^~\n]+~~|`[^`\n]+`|\*[^*\n]+\*|_[^_\n]+_)")
+_MD_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+_MD_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
 _DOC_TASK_ID_RE = re.compile(r"^doc_task_[a-f0-9]{12}$")
 
 _ASYNC_DOC_MARKDOWN_THRESHOLD = 12000
+_DOC_CODE_LANGUAGE_ALIASES = {
+    "py": "python",
+    "python3": "python",
+    "js": "javascript",
+    "node": "javascript",
+    "ts": "typescript",
+    "tsx": "typescript",
+    "jsx": "javascript",
+    "shell": "bash",
+    "sh": "bash",
+    "zsh": "bash",
+    "console": "bash",
+    "yml": "yaml",
+    "md": "markdown",
+    "plaintext": "text",
+    "plain_text": "text",
+}
+_DOC_CODE_LANGUAGE_ALLOWLIST = {
+    "text",
+    "markdown",
+    "python",
+    "javascript",
+    "typescript",
+    "bash",
+    "json",
+    "yaml",
+    "sql",
+    "html",
+    "xml",
+    "css",
+    "java",
+    "go",
+    "rust",
+    "c",
+    "cpp",
+    "csharp",
+    "kotlin",
+    "swift",
+    "php",
+    "ruby",
+    "scala",
+}
 _DOC_TASK_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="feishu-doc-task")
 _DOC_TASKS: Dict[str, Dict[str, Any]] = {}
 _DOC_TASKS_LOCK = Lock()
@@ -227,6 +271,24 @@ def _build_text_elements(text: str) -> List[Dict[str, Any]]:
     return elements or [{"text_run": {"content": " "}}]
 
 
+def _is_markdown_table_row(line: str) -> bool:
+    return bool(_MD_TABLE_ROW_RE.match(line or ""))
+
+
+def _is_markdown_table_separator(line: str) -> bool:
+    return bool(_MD_TABLE_SEPARATOR_RE.match(line or ""))
+
+
+def _normalize_code_language(language: str) -> Optional[str]:
+    normalized = str(language or "").strip().lower()
+    if not normalized:
+        return None
+    normalized = _DOC_CODE_LANGUAGE_ALIASES.get(normalized, normalized)
+    if normalized in _DOC_CODE_LANGUAGE_ALLOWLIST:
+        return normalized
+    return None
+
+
 def _normalize_markdown_to_blocks(markdown: str) -> List[Dict[str, Any]]:
     """Parse Markdown into stable doc text blocks with preserved structural cues."""
     text = str(markdown or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -263,24 +325,47 @@ def _normalize_markdown_to_blocks(markdown: str) -> List[Dict[str, Any]]:
         code_fence = None
         code_language = ""
 
-    for raw_line in lines:
+    index = 0
+    while index < len(lines):
+        raw_line = lines[index]
         fence_match = _MD_FENCE_RE.match(raw_line)
         if code_fence is not None:
             if fence_match and fence_match.group(1) == code_fence:
                 flush_code_block()
+                index += 1
                 continue
             code_lines.append(raw_line)
+            index += 1
             continue
         if fence_match:
             flush_paragraph()
             code_fence = fence_match.group(1)
             code_language = str(fence_match.group(2) or "").strip()
             code_lines = []
+            index += 1
             continue
 
         line = raw_line.rstrip()
         if not line.strip():
             flush_paragraph()
+            index += 1
+            continue
+
+        if (
+            _is_markdown_table_row(line)
+            and index + 1 < len(lines)
+            and _is_markdown_table_separator(lines[index + 1].rstrip())
+        ):
+            flush_paragraph()
+            table_lines = [line, lines[index + 1].rstrip()]
+            index += 2
+            while index < len(lines):
+                later_line = lines[index].rstrip()
+                if not _is_markdown_table_row(later_line):
+                    break
+                table_lines.append(later_line)
+                index += 1
+            blocks.append({"kind": "table", "text": "\n".join(table_lines)})
             continue
 
         heading_match = re.match(r"^\s{0,3}(#{1,6})\s+(.*)$", line)
@@ -294,6 +379,7 @@ def _normalize_markdown_to_blocks(markdown: str) -> List[Dict[str, Any]]:
                     "text": _strip_inline_markdown(heading_match.group(2)),
                 }
             )
+            index += 1
             continue
 
         quote_match = _MD_BLOCKQUOTE_RE.match(line)
@@ -307,6 +393,7 @@ def _normalize_markdown_to_blocks(markdown: str) -> List[Dict[str, Any]]:
                     "text": _strip_inline_markdown(quote_text),
                 }
             )
+            index += 1
             continue
 
         list_match = re.match(r"^(\s*)([-*+]|\d+\.)\s+(.*)$", line)
@@ -324,9 +411,11 @@ def _normalize_markdown_to_blocks(markdown: str) -> List[Dict[str, Any]]:
                     "text": _strip_inline_markdown(list_match.group(3)),
                 }
             )
+            index += 1
             continue
 
         paragraph_buffer.append(line)
+        index += 1
 
     flush_paragraph()
     flush_code_block()
@@ -353,6 +442,8 @@ def _render_doc_block_text(block: Dict[str, Any]) -> str:
         language = str(block.get("language") or "").strip()
         prefix = f"[{language}]\n" if language else ""
         return f"```\n{prefix}{text}\n```".strip()
+    if kind == "table":
+        return f"```md\n{text}\n```".strip()
     return text
 
 
@@ -375,16 +466,22 @@ def _build_native_doc_block(block: Dict[str, Any]) -> Dict[str, Any]:
         return {"block_type": 15, "quote": text_payload}
     if kind == "code":
         code_style: Dict[str, Any] = {"wrap": True}
-        language = str(block.get("language") or "").strip()
+        language = _normalize_code_language(str(block.get("language") or "").strip())
         if language:
-            # The API accepts a code-language enum here. We pass the lower-case language name
-            # directly because Feishu's docx block schema uses textual enum values.
             code_style["language"] = language.lower()
         return {
             "block_type": 14,
             "code": {
                 "elements": [{"text_run": {"content": str(block.get("text") or "") or " "}}],
                 "style": code_style,
+            },
+        }
+    if kind == "table":
+        return {
+            "block_type": 14,
+            "code": {
+                "elements": [{"text_run": {"content": str(block.get("text") or "") or " "}}],
+                "style": {"wrap": True, "language": "markdown"},
             },
         }
     return {"block_type": 2, "text": text_payload}
