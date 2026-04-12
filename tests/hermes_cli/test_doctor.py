@@ -165,6 +165,136 @@ class TestFeishuDoctorChecks:
         assert "FEISHU_ENCRYPT_KEY missing" in out
         assert any("FEISHU_VERIFICATION_TOKEN" in item for item in issues)
 
+    def test_warns_when_feishu_platform_disabled(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=False,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Feishu platform disabled" in out
+        assert "FEISHU_APP_ID configured" in out
+        assert issues == []
+
+    def test_warns_when_connection_mode_is_unknown(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "long_polling",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Unknown connection mode: long_polling" in out
+        assert any("connection_mode" in item for item in issues)
+
+    def test_warns_when_feishu_domain_is_unknown(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "example",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Unknown Feishu domain: example" in out
+        assert issues == []
+
+    def test_websocket_mode_reports_webhook_checks_skipped(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Webhook-only checks skipped in websocket mode" in out
+        assert issues == []
+
+    def test_warns_when_lark_oapi_sdk_missing(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.delitem(sys.modules, "lark_oapi", raising=False)
+
+        real_import = __import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "lark_oapi":
+                raise ImportError("missing lark_oapi")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.__import__", fake_import)
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "lark-oapi SDK not installed" in out
+        assert any("lark-oapi" in item for item in issues)
+
 
 def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):
     """Doctor should present CLI-gated tools as available in CLI context."""
