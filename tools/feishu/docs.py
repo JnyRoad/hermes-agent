@@ -14,8 +14,11 @@ import json
 import logging
 import re
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
+from hermes_constants import get_hermes_home
 from tools.feishu.client import feishu_api_request
 from tools.registry import registry, tool_error
 
@@ -27,6 +30,12 @@ _MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*")
 _MD_LIST_RE = re.compile(r"^\s*([-*+]|\d+\.)\s+")
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MD_EMPHASIS_RE = re.compile(r"(\*\*|__|\*|_|~~|`)")
+_DOC_TASK_ID_RE = re.compile(r"^doc_task_[a-f0-9]{12}$")
+
+_ASYNC_DOC_MARKDOWN_THRESHOLD = 12000
+_DOC_TASK_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="feishu-doc-task")
+_DOC_TASKS: Dict[str, Dict[str, Any]] = {}
+_DOC_TASKS_LOCK = Lock()
 
 
 def _check_feishu_available() -> bool:
@@ -37,6 +46,114 @@ def _check_feishu_available() -> bool:
         return True
     except Exception:
         return False
+
+
+def _doc_task_state_path() -> Any:
+    return get_hermes_home() / "feishu_doc_tasks.json"
+
+
+def _save_doc_tasks_snapshot() -> None:
+    """Persist lightweight task snapshots so later polls can inspect finished tasks."""
+    with _DOC_TASKS_LOCK:
+        snapshot: Dict[str, Dict[str, Any]] = {}
+        for task_id, item in _DOC_TASKS.items():
+            snapshot[task_id] = {
+                "status": item.get("status", "running"),
+                "result": item.get("result"),
+                "error": item.get("error"),
+            }
+    path = _doc_task_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_doc_tasks_snapshot() -> Dict[str, Dict[str, Any]]:
+    path = _doc_task_state_path()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Failed to load Feishu doc task snapshot from %s", path, exc_info=True)
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _queue_async_doc_task(operation: str, payload: Dict[str, Any], fn: Any) -> str:
+    """Run large document rewrites in the background and expose a pollable task_id."""
+    task_id = f"doc_task_{uuid.uuid4().hex[:12]}"
+    with _DOC_TASKS_LOCK:
+        _DOC_TASKS[task_id] = {
+            "status": "running",
+            "operation": operation,
+            "payload": dict(payload),
+            "result": None,
+            "error": None,
+            "future": None,
+        }
+
+    def _runner() -> Dict[str, Any]:
+        try:
+            result = fn()
+            with _DOC_TASKS_LOCK:
+                entry = _DOC_TASKS.setdefault(task_id, {})
+                entry["status"] = "success"
+                entry["result"] = result
+                entry["error"] = None
+            _save_doc_tasks_snapshot()
+            return result
+        except Exception as exc:
+            with _DOC_TASKS_LOCK:
+                entry = _DOC_TASKS.setdefault(task_id, {})
+                entry["status"] = "failed"
+                entry["result"] = None
+                entry["error"] = str(exc)
+            _save_doc_tasks_snapshot()
+            raise
+
+    future = _DOC_TASK_EXECUTOR.submit(_runner)
+    with _DOC_TASKS_LOCK:
+        _DOC_TASKS[task_id]["future"] = future
+    _save_doc_tasks_snapshot()
+    return task_id
+
+
+def _get_async_doc_task_status(task_id: str) -> Dict[str, Any]:
+    normalized_task_id = str(task_id or "").strip()
+    if not _DOC_TASK_ID_RE.match(normalized_task_id):
+        raise ValueError("Invalid task_id format.")
+
+    with _DOC_TASKS_LOCK:
+        entry = _DOC_TASKS.get(normalized_task_id)
+
+    if entry is not None:
+        future = entry.get("future")
+        if isinstance(future, Future) and future.done():
+            try:
+                future.result()
+            except Exception:
+                # Result/error state is already captured by the runner.
+                pass
+        return {
+            "task_id": normalized_task_id,
+            "status": entry.get("status", "running"),
+            "result": entry.get("result"),
+            "error": entry.get("error"),
+        }
+
+    snapshot = _load_doc_tasks_snapshot().get(normalized_task_id)
+    if snapshot is not None:
+        return {
+            "task_id": normalized_task_id,
+            "status": snapshot.get("status", "unknown"),
+            "result": snapshot.get("result"),
+            "error": snapshot.get("error"),
+        }
+    return {
+        "task_id": normalized_task_id,
+        "status": "not_found",
+        "error": "Unknown task_id.",
+    }
 
 
 def _extract_doc_id(value: str) -> str:
@@ -274,12 +391,13 @@ def _handle_fetch_doc(args: dict, **_kw) -> str:
 
 def _handle_create_doc(args: dict, **_kw) -> str:
     try:
+        task_id = str(args.get("task_id", "") or "").strip()
+        if task_id:
+            return json.dumps(_get_async_doc_task_status(task_id), ensure_ascii=False)
         title = str(args.get("title", "")).strip()
         markdown = str(args.get("markdown", "") or "")
         if not title:
             return tool_error("Missing required parameter: title")
-        if args.get("task_id"):
-            return tool_error("task_id polling is not implemented in Hermes yet.")
         target_flags = [args.get("folder_token"), args.get("wiki_node"), args.get("wiki_space")]
         if len([item for item in target_flags if item]) > 1:
             return tool_error("folder_token, wiki_node, and wiki_space are mutually exclusive.")
@@ -300,6 +418,21 @@ def _handle_create_doc(args: dict, **_kw) -> str:
 
         write_result = None
         if markdown.strip():
+            if len(markdown) >= _ASYNC_DOC_MARKDOWN_THRESHOLD:
+                async_task_id = _queue_async_doc_task(
+                    "create_doc",
+                    {"document_id": document_id, "title": title},
+                    lambda: _rewrite_document_content(document_id, markdown),
+                )
+                return json.dumps(
+                    {
+                        "task_id": async_task_id,
+                        "document_id": document_id,
+                        "title": title,
+                        "message": "Document creation content has been scheduled for async processing.",
+                    },
+                    ensure_ascii=False,
+                )
             write_result = _rewrite_document_content(document_id, markdown)
 
         return json.dumps(
@@ -317,13 +450,13 @@ def _handle_create_doc(args: dict, **_kw) -> str:
 
 
 def _handle_update_doc(args: dict, **_kw) -> str:
-    mode = str(args.get("mode", "")).strip().lower()
-    if not mode:
-        return tool_error("Missing required parameter: mode")
-    if args.get("task_id"):
-        return tool_error("task_id polling is not implemented in Hermes yet.")
-
     try:
+        task_id = str(args.get("task_id", "") or "").strip()
+        if task_id:
+            return json.dumps(_get_async_doc_task_status(task_id), ensure_ascii=False)
+        mode = str(args.get("mode", "")).strip().lower()
+        if not mode:
+            return tool_error("Missing required parameter: mode")
         document_id = _extract_doc_id(args.get("doc_id", ""))
         markdown = str(args.get("markdown", "") or "")
         selection_with_ellipsis = str(args.get("selection_with_ellipsis", "") or "")
@@ -337,6 +470,21 @@ def _handle_update_doc(args: dict, **_kw) -> str:
             selection_with_ellipsis=selection_with_ellipsis,
             selection_by_title=selection_by_title,
         )
+        if len(markdown) >= _ASYNC_DOC_MARKDOWN_THRESHOLD:
+            async_task_id = _queue_async_doc_task(
+                "update_doc",
+                {"document_id": document_id, "mode": mode},
+                lambda: _rewrite_document_content(document_id, next_content),
+            )
+            return json.dumps(
+                {
+                    "task_id": async_task_id,
+                    "document_id": document_id,
+                    "mode": mode,
+                    "message": "Document update has been scheduled for async processing.",
+                },
+                ensure_ascii=False,
+            )
         write_result = _rewrite_document_content(document_id, next_content)
         result = {
             "document_id": document_id,

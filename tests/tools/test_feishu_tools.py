@@ -2697,11 +2697,32 @@ def test_feishu_create_doc_rejects_conflicting_targets(monkeypatch):
     assert "mutually exclusive" in payload["error"]
 
 
-def test_feishu_create_doc_rejects_task_id_polling(monkeypatch):
+def test_feishu_create_doc_returns_async_task_for_large_markdown(monkeypatch):
     from tools.feishu.docs import _handle_create_doc
 
-    payload = json.loads(_handle_create_doc({"title": "Hello", "task_id": "task_1"}))
-    assert "task_id polling is not implemented" in payload["error"]
+    monkeypatch.setattr("tools.feishu.docs._ASYNC_DOC_MARKDOWN_THRESHOLD", 1)
+    monkeypatch.setattr(
+        "tools.feishu.docs.feishu_api_request",
+        lambda method, path, **kwargs: {"data": {"document": {"document_id": "doxcn_async"}}},
+    )
+    monkeypatch.setattr("tools.feishu.docs._queue_async_doc_task", lambda *a, **kw: "doc_task_123456abcdef")
+
+    payload = json.loads(_handle_create_doc({"title": "Hello", "markdown": "Large body"}))
+    assert payload["task_id"] == "doc_task_123456abcdef"
+    assert payload["document_id"] == "doxcn_async"
+
+
+def test_feishu_create_doc_polls_task_id(monkeypatch):
+    from tools.feishu.docs import _handle_create_doc
+
+    monkeypatch.setattr(
+        "tools.feishu.docs._get_async_doc_task_status",
+        lambda task_id: {"task_id": task_id, "status": "success", "result": {"paragraph_count": 3}},
+    )
+
+    payload = json.loads(_handle_create_doc({"task_id": "doc_task_123456abcdef"}))
+    assert payload["task_id"] == "doc_task_123456abcdef"
+    assert payload["status"] == "success"
 
 
 def test_feishu_update_doc_handler_replace_range(monkeypatch):
@@ -2758,11 +2779,37 @@ def test_feishu_update_doc_reports_title_update_note(monkeypatch):
     assert "title_update_note" in payload
 
 
-def test_feishu_update_doc_rejects_task_id_polling(monkeypatch):
+def test_feishu_update_doc_returns_async_task_for_large_markdown(monkeypatch):
     from tools.feishu.docs import _handle_update_doc
 
-    payload = json.loads(_handle_update_doc({"doc_id": "doxcn1234567890", "mode": "overwrite", "task_id": "task_1"}))
-    assert "task_id polling is not implemented" in payload["error"]
+    def _fake_request(method, path, **kwargs):
+        if method == "GET" and path.endswith("/raw_content"):
+            return {"data": {"content": "Intro"}}
+        return {"data": {}}
+
+    monkeypatch.setattr("tools.feishu.docs._ASYNC_DOC_MARKDOWN_THRESHOLD", 1)
+    monkeypatch.setattr("tools.feishu.docs.feishu_api_request", _fake_request)
+    monkeypatch.setattr("tools.feishu.docs._queue_async_doc_task", lambda *a, **kw: "doc_task_fedcba654321")
+
+    payload = json.loads(
+        _handle_update_doc({"doc_id": "doxcn1234567890", "mode": "overwrite", "markdown": "Large body"})
+    )
+    assert payload["task_id"] == "doc_task_fedcba654321"
+    assert payload["document_id"] == "doxcn1234567890"
+    assert payload["mode"] == "overwrite"
+
+
+def test_feishu_update_doc_polls_task_id(monkeypatch):
+    from tools.feishu.docs import _handle_update_doc
+
+    monkeypatch.setattr(
+        "tools.feishu.docs._get_async_doc_task_status",
+        lambda task_id: {"task_id": task_id, "status": "running"},
+    )
+
+    payload = json.loads(_handle_update_doc({"task_id": "doc_task_fedcba654321"}))
+    assert payload["task_id"] == "doc_task_fedcba654321"
+    assert payload["status"] == "running"
 
 
 def test_feishu_update_doc_requires_mode(monkeypatch):
