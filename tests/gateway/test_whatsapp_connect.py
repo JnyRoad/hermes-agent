@@ -13,6 +13,7 @@ Regression tests for two bugs in WhatsAppAdapter.connect():
 """
 
 import asyncio
+import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -47,7 +48,9 @@ def _make_adapter():
     adapter.config = MagicMock()
     adapter._bridge_port = 19876
     adapter._bridge_script = "/tmp/test-bridge.js"
-    adapter._session_path = Path("/tmp/test-wa-session")
+    # xdist 并行执行时不能共用固定 session_path，否则会命中真实的
+    # whatsapp-session 作用域锁，导致连接流程在进入桥接健康检查前就提前失败。
+    adapter._session_path = Path("/tmp") / f"test-wa-session-{uuid.uuid4().hex}"
     adapter._bridge_log_fh = None
     adapter._bridge_log = None
     adapter._bridge_process = None
