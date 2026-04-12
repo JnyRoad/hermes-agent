@@ -12,6 +12,7 @@ import hermes_cli.doctor as doctor
 import hermes_cli.gateway as gateway_cli
 from hermes_cli import doctor as doctor_mod
 from hermes_cli.doctor import _has_provider_env_config
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 
 
 class TestDoctorPlatformHints:
@@ -90,6 +91,79 @@ class TestHonchoDoctorConfigDetection:
         )
 
         assert not doctor._honcho_is_configured_for_doctor()
+
+
+class TestFeishuDoctorChecks:
+    def test_warns_when_feishu_not_configured(self, monkeypatch, capsys):
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: GatewayConfig())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Feishu Integration" in out
+        assert "Feishu integration not configured" in out
+        assert issues == []
+
+    def test_reports_websocket_configuration(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                        "unauthorized_dm_behavior": "pair",
+                    },
+                )
+            }
+        )
+        cfg.platforms[Platform.FEISHU].home_channel = HomeChannel(
+            platform=Platform.FEISHU,
+            chat_id="oc_home",
+            name="Home",
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Feishu platform enabled" in out
+        assert "FEISHU_APP_ID configured" in out
+        assert "Connection mode: websocket" in out
+        assert "Feishu home channel configured" in out
+        assert "lark-oapi SDK" in out
+        assert issues == []
+
+    def test_webhook_mode_warns_when_tokens_missing(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "lark",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Connection mode: webhook" in out
+        assert "FEISHU_VERIFICATION_TOKEN missing" in out
+        assert "FEISHU_ENCRYPT_KEY missing" in out
+        assert any("FEISHU_VERIFICATION_TOKEN" in item for item in issues)
 
 
 def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):

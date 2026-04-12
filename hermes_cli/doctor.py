@@ -158,6 +158,102 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
         check_warn("Could not verify systemd linger", f"({linger_detail})")
 
 
+def _check_feishu_integration(issues: list[str]) -> None:
+    """检查飞书集成的关键配置是否完整。"""
+    print()
+    print(color("◆ Feishu Integration", Colors.CYAN, Colors.BOLD))
+
+    try:
+        from gateway.config import Platform, load_gateway_config
+    except Exception as exc:
+        check_warn("Feishu doctor checks unavailable", f"(could not import gateway config: {exc})")
+        return
+
+    try:
+        gateway_config = load_gateway_config()
+    except Exception as exc:
+        check_warn("Failed to load gateway config", f"({exc})")
+        issues.append("Fix gateway config loading before validating Feishu integration")
+        return
+
+    feishu_config = gateway_config.platforms.get(Platform.FEISHU)
+    env_has_feishu = bool(os.getenv("FEISHU_APP_ID") or os.getenv("FEISHU_APP_SECRET"))
+    if not feishu_config and not env_has_feishu:
+        check_warn("Feishu integration not configured", "(optional)")
+        return
+
+    if not feishu_config:
+        check_fail("Feishu platform config missing", "(env hints exist but platform was not initialized)")
+        issues.append("Ensure FEISHU_APP_ID and FEISHU_APP_SECRET are configured correctly")
+        return
+
+    if feishu_config.enabled:
+        check_ok("Feishu platform enabled")
+    else:
+        check_warn("Feishu platform disabled", "(config present but not enabled)")
+
+    app_id = str(feishu_config.extra.get("app_id", "")).strip()
+    app_secret = str(feishu_config.extra.get("app_secret", "")).strip()
+    connection_mode = str(feishu_config.extra.get("connection_mode", "websocket")).strip().lower() or "websocket"
+    domain = str(feishu_config.extra.get("domain", "feishu")).strip().lower() or "feishu"
+
+    if app_id:
+        check_ok("FEISHU_APP_ID configured")
+    else:
+        check_fail("FEISHU_APP_ID missing")
+        issues.append("Set FEISHU_APP_ID for Feishu integration")
+
+    if app_secret:
+        check_ok("FEISHU_APP_SECRET configured")
+    else:
+        check_fail("FEISHU_APP_SECRET missing")
+        issues.append("Set FEISHU_APP_SECRET for Feishu integration")
+
+    if connection_mode in {"websocket", "webhook"}:
+        check_ok(f"Connection mode: {connection_mode}")
+    else:
+        check_warn(f"Unknown connection mode: {connection_mode}", "(expected websocket or webhook)")
+        issues.append("Set gateway.feishu.extra.connection_mode to websocket or webhook")
+
+    if domain in {"feishu", "lark"}:
+        check_ok(f"Feishu domain: {domain}")
+    else:
+        check_warn(f"Unknown Feishu domain: {domain}", "(expected feishu or lark)")
+
+    if connection_mode == "webhook":
+        verification_token = str(feishu_config.extra.get("verification_token", "")).strip()
+        encrypt_key = str(feishu_config.extra.get("encrypt_key", "")).strip()
+        if verification_token:
+            check_ok("FEISHU_VERIFICATION_TOKEN configured")
+        else:
+            check_warn("FEISHU_VERIFICATION_TOKEN missing", "(recommended for webhook verification)")
+            issues.append("Set FEISHU_VERIFICATION_TOKEN when using Feishu webhook mode")
+        if encrypt_key:
+            check_ok("FEISHU_ENCRYPT_KEY configured")
+        else:
+            check_warn("FEISHU_ENCRYPT_KEY missing", "(recommended when event encryption is enabled)")
+    else:
+        check_info("Webhook-only checks skipped in websocket mode")
+
+    if feishu_config.home_channel and feishu_config.home_channel.chat_id:
+        check_ok("Feishu home channel configured")
+    else:
+        check_info("Feishu home channel not set")
+
+    if gateway_config.get_unauthorized_dm_behavior(Platform.FEISHU) == "pair":
+        check_ok("Unauthorized DM behavior: pair")
+    else:
+        check_warn("Unauthorized DM behavior: ignore", "(users must be allowed elsewhere)")
+
+    try:
+        import lark_oapi  # noqa: F401
+
+        check_ok("lark-oapi SDK")
+    except ImportError:
+        check_warn("lark-oapi SDK not installed", "(Feishu runtime adapter will be unavailable)")
+        issues.append(f"Install lark-oapi: {_python_install_cmd()} lark-oapi")
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
@@ -511,6 +607,7 @@ def run_doctor(args):
             pass
 
     _check_gateway_service_linger(issues)
+    _check_feishu_integration(issues)
     
     # =========================================================================
     # Check: External tools
