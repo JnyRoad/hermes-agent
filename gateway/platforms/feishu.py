@@ -258,6 +258,8 @@ class FeishuAdapterSettings:
     encrypt_key: str
     verification_token: str
     group_policy: str
+    allow_from: frozenset[str]
+    group_allow_from: frozenset[str]
     allowed_group_users: frozenset[str]
     bot_open_id: str
     bot_user_id: str
@@ -1127,9 +1129,12 @@ class FeishuAdapter(BasePlatformAdapter):
             for chat_id, rule_cfg in raw_group_rules.items():
                 if not isinstance(rule_cfg, dict):
                     continue
+                raw_allowlist = rule_cfg.get("allowlist")
+                if raw_allowlist is None:
+                    raw_allowlist = rule_cfg.get("allow_from", [])
                 group_rules[str(chat_id)] = FeishuGroupRule(
                     policy=str(rule_cfg.get("policy", "open")).strip().lower(),
-                    allowlist=set(str(u).strip() for u in rule_cfg.get("allowlist", []) if str(u).strip()),
+                    allowlist=set(str(u).strip() for u in raw_allowlist if str(u).strip()),
                     blacklist=set(str(u).strip() for u in rule_cfg.get("blacklist", []) if str(u).strip()),
                 )
 
@@ -1139,6 +1144,10 @@ class FeishuAdapter(BasePlatformAdapter):
 
         # Default group policy (for groups not in group_rules)
         default_group_policy = str(extra.get("default_group_policy", "")).strip().lower()
+        raw_allow_from = extra.get("allow_from", [])
+        allow_from = frozenset(str(u).strip() for u in raw_allow_from if str(u).strip())
+        raw_group_allow_from = extra.get("group_allow_from", [])
+        group_allow_from = frozenset(str(u).strip() for u in raw_group_allow_from if str(u).strip())
 
         return FeishuAdapterSettings(
             app_id=str(extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")).strip(),
@@ -1149,7 +1158,9 @@ class FeishuAdapter(BasePlatformAdapter):
             ).strip().lower(),
             encrypt_key=os.getenv("FEISHU_ENCRYPT_KEY", "").strip(),
             verification_token=os.getenv("FEISHU_VERIFICATION_TOKEN", "").strip(),
-            group_policy=os.getenv("FEISHU_GROUP_POLICY", "allowlist").strip().lower(),
+            group_policy=str(extra.get("group_policy") or os.getenv("FEISHU_GROUP_POLICY", "allowlist")).strip().lower(),
+            allow_from=allow_from,
+            group_allow_from=group_allow_from,
             allowed_group_users=frozenset(
                 item.strip()
                 for item in os.getenv("FEISHU_ALLOWED_USERS", "").split(",")
@@ -1217,6 +1228,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._encrypt_key = settings.encrypt_key
         self._verification_token = settings.verification_token
         self._group_policy = settings.group_policy
+        self._allow_from = set(settings.allow_from)
+        self._group_allow_from = set(settings.group_allow_from)
         self._allowed_group_users = set(settings.allowed_group_users)
         self._admins = set(settings.admins)
         self._default_group_policy = settings.default_group_policy or settings.group_policy
@@ -2096,6 +2109,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
         chat_type = getattr(message, "chat_type", "p2p")
         chat_id = getattr(message, "chat_id", "") or ""
+        if chat_type == "p2p" and not self._allow_dm_message(sender_id):
+            logger.debug("[Feishu] Dropping DM that failed dm_policy gate: %s", message_id)
+            return
         if chat_type != "p2p" and not self._should_accept_group_message(message, sender_id, chat_id):
             logger.debug("[Feishu] Dropping group message that failed mention/policy gate: %s", message_id)
             return
@@ -3527,11 +3543,35 @@ class FeishuAdapter(BasePlatformAdapter):
     # Group policy and mention gating
     # =========================================================================
 
-    def _allow_group_message(self, sender_id: Any, chat_id: str = "") -> bool:
-        """Per-group policy gate for non-DM traffic."""
+    @staticmethod
+    def _sender_ids(sender_id: Any) -> set[str]:
+        """统一抽取 sender 的 open_id / user_id，便于策略判断。"""
         sender_open_id = getattr(sender_id, "open_id", None)
         sender_user_id = getattr(sender_id, "user_id", None)
-        sender_ids = {sender_open_id, sender_user_id} - {None}
+        return {str(item).strip() for item in (sender_open_id, sender_user_id) if str(item or "").strip()}
+
+    def _allow_dm_message(self, sender_id: Any) -> bool:
+        """私聊策略入口。
+
+        open/pairing:
+            先允许进入网关，是否需要进一步配对由 gateway 层统一处理。
+        allowlist:
+            仅允许 allow_from 中声明的用户进入。
+        disabled:
+            完全拒绝私聊消息。
+        """
+        sender_ids = self._sender_ids(sender_id)
+        if sender_ids and self._admins and (sender_ids & self._admins):
+            return True
+        if self._dm_policy == "disabled":
+            return False
+        if self._dm_policy == "allowlist":
+            return bool(sender_ids and (sender_ids & self._allow_from))
+        return True
+
+    def _allow_group_message(self, sender_id: Any, chat_id: str = "") -> bool:
+        """Per-group policy gate for non-DM traffic."""
+        sender_ids = self._sender_ids(sender_id)
 
         if sender_ids and self._admins and (sender_ids & self._admins):
             return True
@@ -3543,7 +3583,7 @@ class FeishuAdapter(BasePlatformAdapter):
             blacklist = rule.blacklist
         else:
             policy = self._default_group_policy or self._group_policy
-            allowlist = self._allowed_group_users
+            allowlist = self._group_allow_from or self._allowed_group_users
             blacklist = set()
 
         if policy == "disabled":

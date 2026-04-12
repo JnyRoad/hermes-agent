@@ -879,6 +879,71 @@ class TestAdapterBehavior(unittest.TestCase):
             )
         )
 
+    def test_dm_policy_allowlist_uses_allow_from(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "dm_policy": "allowlist",
+                    "allow_from": ["ou_alice"],
+                }
+            )
+        )
+
+        self.assertTrue(adapter._allow_dm_message(SimpleNamespace(open_id="ou_alice", user_id=None)))
+        self.assertFalse(adapter._allow_dm_message(SimpleNamespace(open_id="ou_bob", user_id=None)))
+
+    def test_dm_policy_disabled_blocks_all_non_admin_users(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "dm_policy": "disabled",
+                    "admins": ["ou_admin"],
+                }
+            )
+        )
+
+        self.assertFalse(adapter._allow_dm_message(SimpleNamespace(open_id="ou_regular", user_id=None)))
+        self.assertTrue(adapter._allow_dm_message(SimpleNamespace(open_id="ou_admin", user_id=None)))
+
+    def test_group_policy_reads_extra_group_allow_from(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "group_policy": "allowlist",
+                    "group_allow_from": ["ou_alice"],
+                }
+            )
+        )
+        adapter._bot_open_id = "ou_bot"
+
+        message = SimpleNamespace(
+            mentions=[SimpleNamespace(name="Bot", id=SimpleNamespace(open_id="ou_bot", user_id=None))]
+        )
+
+        self.assertTrue(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_alice", user_id=None),
+                "oc_chat_group",
+            )
+        )
+        self.assertFalse(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_bob", user_id=None),
+                "oc_chat_group",
+            )
+        )
+
     def test_per_group_allowlist_policy_gates_by_sender(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -888,7 +953,7 @@ class TestAdapterBehavior(unittest.TestCase):
                 "group_rules": {
                     "oc_chat_a": {
                         "policy": "allowlist",
-                        "allowlist": ["ou_alice", "ou_bob"],
+                        "allow_from": ["ou_alice", "ou_bob"],
                     }
                 }
             }
