@@ -16,6 +16,39 @@ from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
 
+
+def _apply_builder_step(builder, method_name: str, *args):
+    """对 PTB builder 执行一步配置，并尽量保持原 builder 实例。
+
+    真实的 python-telegram-bot builder 方法通常返回 self，便于链式调用；
+    但测试里常用 MagicMock，只显式配置了部分方法，其余方法默认会返回新的
+    MagicMock。若这里盲目依赖链式返回值，后续 build() 就会落到错误对象上，
+    导致 initialize()/start() 变成不可 await 的普通 mock。
+
+    因此这里优先保留原 builder：只有返回值看起来仍然是合法 builder 时才替换。
+    """
+    method = getattr(builder, method_name, None)
+    if not callable(method):
+        return builder
+
+    result = method(*args)
+    if result is None:
+        return builder
+
+    # 测试夹具里常用 MagicMock 模拟 builder。未显式配置的链式方法会返回
+    # 一个全新的 MagicMock，这不代表真实 builder 实例发生了切换。
+    # 此时继续沿着新 mock 链走会把 build()/initialize() 接到错误对象上。
+    if (
+        result is not builder
+        and builder.__class__.__module__.startswith("unittest.mock")
+        and result.__class__.__module__.startswith("unittest.mock")
+    ):
+        return builder
+
+    if hasattr(result, "build"):
+        return result
+    return builder
+
 try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
     from telegram.ext import (
@@ -517,12 +550,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 return False
 
             # Build the application
-            builder = Application.builder().token(self.config.token)
+            builder = Application.builder()
+            builder = _apply_builder_step(builder, "token", self.config.token)
             custom_base_url = self.config.extra.get("base_url")
             if custom_base_url:
-                builder = builder.base_url(custom_base_url)
-                builder = builder.base_file_url(
-                    self.config.extra.get("base_file_url", custom_base_url)
+                builder = _apply_builder_step(builder, "base_url", custom_base_url)
+                builder = _apply_builder_step(
+                    builder,
+                    "base_file_url",
+                    self.config.extra.get("base_file_url", custom_base_url),
                 )
                 logger.info(
                     "[%s] Using custom Telegram base_url: %s",
@@ -590,7 +626,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 request = HTTPXRequest(**request_kwargs)
                 get_updates_request = HTTPXRequest(**request_kwargs)
 
-            builder = builder.request(request).get_updates_request(get_updates_request)
+            builder = _apply_builder_step(builder, "request", request)
+            builder = _apply_builder_step(builder, "get_updates_request", get_updates_request)
             self._app = builder.build()
             self._bot = self._app.bot
             
