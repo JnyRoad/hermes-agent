@@ -409,6 +409,46 @@ def test_feishu_bitable_app_get_handler(monkeypatch):
     assert payload["app"]["name"] == "CRM"
 
 
+def test_feishu_bitable_app_create_handler(monkeypatch):
+    from tools.feishu.bitable_app import _handle_bitable_app
+
+    captured = {}
+
+    def _fake_request(method, path, **kwargs):
+        captured["method"] = method
+        captured["path"] = path
+        captured["json_body"] = kwargs.get("json_body")
+        return {"data": {"app": {"app_token": "app_new", "name": "CRM"}}}
+
+    monkeypatch.setattr("tools.feishu.bitable_app.feishu_api_request", _fake_request)
+    payload = json.loads(_handle_bitable_app({"action": "create", "name": "CRM", "folder_token": "fld_root"}))
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/open-apis/bitable/v1/apps"
+    assert captured["json_body"] == {"name": "CRM", "folder_token": "fld_root"}
+    assert payload["app"]["app_token"] == "app_new"
+
+
+def test_feishu_bitable_app_patch_handler(monkeypatch):
+    from tools.feishu.bitable_app import _handle_bitable_app
+
+    captured = {}
+
+    def _fake_request(method, path, **kwargs):
+        captured["method"] = method
+        captured["path"] = path
+        captured["json_body"] = kwargs.get("json_body")
+        return {"data": {"app": {"app_token": "app_1", "name": "CRM Pro", "is_advanced": True}}}
+
+    monkeypatch.setattr("tools.feishu.bitable_app.feishu_api_request", _fake_request)
+    payload = json.loads(
+        _handle_bitable_app({"action": "patch", "app_token": "app_1", "name": "CRM Pro", "is_advanced": True})
+    )
+    assert captured["method"] == "PATCH"
+    assert captured["path"].endswith("/apps/app_1")
+    assert captured["json_body"] == {"name": "CRM Pro", "is_advanced": True}
+    assert payload["app"]["name"] == "CRM Pro"
+
+
 def test_feishu_bitable_app_copy_handler(monkeypatch):
     from tools.feishu.bitable_app import _handle_bitable_app
 
@@ -489,6 +529,27 @@ def test_feishu_bitable_app_table_batch_create_handler(monkeypatch):
     assert payload["tables"][1]["table_id"] == "tbl_2"
 
 
+def test_feishu_bitable_app_table_patch_handler(monkeypatch):
+    from tools.feishu.bitable_app_table import _handle_bitable_app_table
+
+    captured = {}
+
+    def _fake_request(method, path, **kwargs):
+        captured["method"] = method
+        captured["path"] = path
+        captured["json_body"] = kwargs.get("json_body")
+        return {"data": {"table": {"table_id": "tbl_1", "name": "Customers"}}}
+
+    monkeypatch.setattr("tools.feishu.bitable_app_table.feishu_api_request", _fake_request)
+    payload = json.loads(
+        _handle_bitable_app_table({"action": "patch", "app_token": "app_1", "table_id": "tbl_1", "name": "Customers"})
+    )
+    assert captured["method"] == "PATCH"
+    assert captured["path"].endswith("/apps/app_1/tables/tbl_1")
+    assert captured["json_body"] == {"name": "Customers"}
+    assert payload["table"]["name"] == "Customers"
+
+
 def test_feishu_bitable_app_table_record_list_handler(monkeypatch):
     from tools.feishu.bitable_app_table_record import _handle_bitable_app_table_record
 
@@ -517,6 +578,35 @@ def test_feishu_bitable_app_table_record_create_handler(monkeypatch):
         )
     )
     assert payload["record"]["record_id"] == "rec_1"
+
+
+def test_feishu_bitable_app_table_record_update_handler(monkeypatch):
+    from tools.feishu.bitable_app_table_record import _handle_bitable_app_table_record
+
+    captured = {}
+
+    def _fake_request(method, path, **kwargs):
+        captured["method"] = method
+        captured["path"] = path
+        captured["json_body"] = kwargs.get("json_body")
+        return {"data": {"record": {"record_id": "rec_1", "fields": {"Name": "Alice 2"}}}}
+
+    monkeypatch.setattr("tools.feishu.bitable_app_table_record.feishu_api_request", _fake_request)
+    payload = json.loads(
+        _handle_bitable_app_table_record(
+            {
+                "action": "update",
+                "app_token": "app_1",
+                "table_id": "tbl_1",
+                "record_id": "rec_1",
+                "fields": {"Name": "Alice 2"},
+            }
+        )
+    )
+    assert captured["method"] == "PUT"
+    assert captured["path"].endswith("/apps/app_1/tables/tbl_1/records/rec_1")
+    assert captured["json_body"] == {"fields": {"Name": "Alice 2"}}
+    assert payload["record"]["fields"]["Name"] == "Alice 2"
 
 
 def test_feishu_bitable_app_table_record_delete_handler(monkeypatch):
@@ -856,6 +946,28 @@ def test_feishu_drive_file_upload_handler(monkeypatch, tmp_path):
     )
     assert payload["file_token"] == "file_1"
     assert payload["file_name"] == "demo.txt"
+
+
+def test_feishu_drive_file_upload_handler_base64(monkeypatch):
+    from tools.feishu.drive import _handle_drive_file
+
+    captured = {}
+
+    def _fake_upload(**kwargs):
+        captured.update(kwargs)
+        return {"data": {"file_token": "file_1"}}
+
+    monkeypatch.setattr("tools.feishu.drive._upload_drive_file", _fake_upload)
+    payload = json.loads(
+        _handle_drive_file(
+            {"action": "upload", "file_content_base64": "aGVsbG8=", "file_name": "demo.txt", "parent_node": "fld_root"}
+        )
+    )
+    assert captured["file_name"] == "demo.txt"
+    assert captured["content"] == b"hello"
+    assert captured["parent_node"] == "fld_root"
+    assert payload["upload_method"] == "upload_all"
+    assert payload["size"] == 5
 
 
 def test_feishu_drive_file_upload_handler_chunked(monkeypatch, tmp_path):
