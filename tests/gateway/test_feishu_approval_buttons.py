@@ -335,6 +335,34 @@ class TestFeishuApprovalCallback:
         mock_resolve.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_duplicate_card_action_token_is_dropped(self):
+        adapter = _make_adapter()
+        adapter._approval_state[5] = {
+            "session_key": "sess-5",
+            "message_id": "msg_005",
+            "chat_id": "oc_12345",
+        }
+
+        data = _make_card_action_data(
+            action_value={"hermes_action": "approve_once", "approval_id": 5},
+            token="tok_dup",
+        )
+
+        with (
+            patch.object(
+                adapter, "_resolve_sender_profile", new_callable=AsyncMock,
+                return_value={"user_id": "ou_user1", "user_name": "Norbert", "user_id_alt": None},
+            ),
+            patch.object(adapter, "_update_approval_card", new_callable=AsyncMock) as mock_update,
+            patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve,
+        ):
+            await adapter._handle_card_action_event(data)
+            await adapter._handle_card_action_event(data)
+
+        mock_resolve.assert_called_once_with("sess-5", "once")
+        mock_update.assert_called_once_with("msg_005", "Approved once", "Norbert", "once")
+
+    @pytest.mark.asyncio
     async def test_non_approval_actions_route_normally(self):
         """Non-approval card actions should still become synthetic commands."""
         adapter = _make_adapter()

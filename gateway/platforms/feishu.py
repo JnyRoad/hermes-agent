@@ -2769,9 +2769,22 @@ class FeishuAdapter(BasePlatformAdapter):
         if payload.get("type") == "url_verification":
             return self._web_json_response({"challenge": payload.get("challenge", "")})
 
+        # 应用归属校验：如果事件头里带了 app_id，则必须与当前 adapter 配置一致，
+        # 避免同机多应用或错误回调地址把别的应用事件投递进来。
+        header = payload.get("header") or {}
+        incoming_app_id = str(header.get("app_id") or payload.get("app_id") or "").strip()
+        if incoming_app_id and incoming_app_id != self._app_id:
+            logger.warning(
+                "[Feishu] Webhook rejected: event app_id %s does not match configured app_id %s from %s",
+                incoming_app_id,
+                self._app_id,
+                remote_ip,
+            )
+            self._record_webhook_anomaly(remote_ip, "403-app")
+            return self._web_response(status=403, text="Event app_id does not match configured app")
+
         # Verification token check — second layer of defence beyond signature (matches openclaw).
         if self._verification_token:
-            header = payload.get("header") or {}
             incoming_token = str(header.get("token") or payload.get("token") or "")
             if not incoming_token or not hmac.compare_digest(incoming_token, self._verification_token):
                 logger.warning("[Feishu] Webhook rejected: invalid verification token from %s", remote_ip)

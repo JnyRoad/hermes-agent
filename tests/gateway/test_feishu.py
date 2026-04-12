@@ -2710,6 +2710,73 @@ class TestWebhookSecurity(unittest.TestCase):
         response = asyncio.run(adapter._handle_webhook_request(request))
         self.assertEqual(response.status, 401)
 
+    @patch.dict(os.environ, {"FEISHU_VERIFICATION_TOKEN": "verify_me"}, clear=True)
+    def test_webhook_request_rejects_invalid_verification_token(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        body = json.dumps(
+            {
+                "header": {
+                    "event_type": "im.message.receive_v1",
+                    "token": "wrong_token",
+                }
+            }
+        ).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+        response = asyncio.run(adapter._handle_webhook_request(request))
+        self.assertEqual(response.status, 401)
+
+    @patch.dict(os.environ, {"FEISHU_APP_ID": "cli", "FEISHU_APP_SECRET": "sec"}, clear=True)
+    def test_webhook_request_rejects_mismatched_event_app_id(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        body = json.dumps(
+            {
+                "header": {
+                    "event_type": "im.message.receive_v1",
+                    "app_id": "other_app",
+                }
+            }
+        ).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+        response = asyncio.run(adapter._handle_webhook_request(request))
+        self.assertEqual(response.status, 403)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_request_rejects_encrypted_payload(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        body = json.dumps(
+            {
+                "header": {"event_type": "im.message.receive_v1"},
+                "encrypt": "ciphertext",
+            }
+        ).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+        response = asyncio.run(adapter._handle_webhook_request(request))
+        self.assertEqual(response.status, 400)
+
     @patch.dict(os.environ, {}, clear=True)
     def test_webhook_url_verification_challenge_passes_without_signature(self):
         """Challenge requests must succeed even when no encrypt_key is set."""
