@@ -569,6 +569,29 @@ def test_feishu_bitable_app_table_field_list_handler(monkeypatch):
     assert payload["fields"][0]["field_id"] == "fld_1"
 
 
+def test_feishu_bitable_app_table_field_create_handler(monkeypatch):
+    from tools.feishu.bitable_app_table_field import _handle_bitable_app_table_field
+
+    captured = {}
+
+    def _fake_request(method, path, **kwargs):
+        captured["method"] = method
+        captured["path"] = path
+        captured["json_body"] = kwargs.get("json_body")
+        return {"data": {"field": {"field_id": "fld_1", "field_name": "Name", "type": 1}}}
+
+    monkeypatch.setattr("tools.feishu.bitable_app_table_field.feishu_api_request", _fake_request)
+    payload = json.loads(
+        _handle_bitable_app_table_field(
+            {"action": "create", "app_token": "app_1", "table_id": "tbl_1", "field_name": "Name", "type": 1}
+        )
+    )
+    assert captured["method"] == "POST"
+    assert captured["path"].endswith("/apps/app_1/tables/tbl_1/fields")
+    assert captured["json_body"]["field_name"] == "Name"
+    assert payload["field"]["field_id"] == "fld_1"
+
+
 def test_feishu_bitable_app_table_field_update_autofills_missing_properties(monkeypatch):
     from tools.feishu.bitable_app_table_field import _handle_bitable_app_table_field
 
@@ -598,6 +621,28 @@ def test_feishu_bitable_app_table_field_update_autofills_missing_properties(monk
     assert payload["field"]["field_name"] == "Full Name"
 
 
+def test_feishu_bitable_app_table_field_delete_handler(monkeypatch):
+    from tools.feishu.bitable_app_table_field import _handle_bitable_app_table_field
+
+    captured = {}
+
+    def _fake_request(method, path, **kwargs):
+        captured["method"] = method
+        captured["path"] = path
+        return {"data": {}}
+
+    monkeypatch.setattr("tools.feishu.bitable_app_table_field.feishu_api_request", _fake_request)
+    payload = json.loads(
+        _handle_bitable_app_table_field(
+            {"action": "delete", "app_token": "app_1", "table_id": "tbl_1", "field_id": "fld_1"}
+        )
+    )
+    assert captured["method"] == "DELETE"
+    assert captured["path"].endswith("/apps/app_1/tables/tbl_1/fields/fld_1")
+    assert payload["deleted"] is True
+    assert payload["field_id"] == "fld_1"
+
+
 def test_feishu_bitable_app_table_view_list_handler(monkeypatch):
     from tools.feishu.bitable_app_table_view import _handle_bitable_app_table_view
 
@@ -609,6 +654,21 @@ def test_feishu_bitable_app_table_view_list_handler(monkeypatch):
         _handle_bitable_app_table_view({"action": "list", "app_token": "app_1", "table_id": "tbl_1"})
     )
     assert payload["views"][0]["view_id"] == "viw_1"
+
+
+def test_feishu_bitable_app_table_view_get_handler(monkeypatch):
+    from tools.feishu.bitable_app_table_view import _handle_bitable_app_table_view
+
+    monkeypatch.setattr(
+        "tools.feishu.bitable_app_table_view.feishu_api_request",
+        lambda *a, **kw: {"data": {"view": {"view_id": "viw_1", "view_name": "Grid"}}},
+    )
+    payload = json.loads(
+        _handle_bitable_app_table_view(
+            {"action": "get", "app_token": "app_1", "table_id": "tbl_1", "view_id": "viw_1"}
+        )
+    )
+    assert payload["view"]["view_name"] == "Grid"
 
 
 def test_feishu_bitable_app_table_view_create_handler(monkeypatch):
@@ -624,6 +684,29 @@ def test_feishu_bitable_app_table_view_create_handler(monkeypatch):
         )
     )
     assert payload["view"]["view_name"] == "Board"
+
+
+def test_feishu_bitable_app_table_view_patch_handler(monkeypatch):
+    from tools.feishu.bitable_app_table_view import _handle_bitable_app_table_view
+
+    captured = {}
+
+    def _fake_request(method, path, **kwargs):
+        captured["method"] = method
+        captured["path"] = path
+        captured["json_body"] = kwargs.get("json_body")
+        return {"data": {"view": {"view_id": "viw_1", "view_name": "Board v2"}}}
+
+    monkeypatch.setattr("tools.feishu.bitable_app_table_view.feishu_api_request", _fake_request)
+    payload = json.loads(
+        _handle_bitable_app_table_view(
+            {"action": "patch", "app_token": "app_1", "table_id": "tbl_1", "view_id": "viw_1", "view_name": "Board v2"}
+        )
+    )
+    assert captured["method"] == "PATCH"
+    assert captured["path"].endswith("/apps/app_1/tables/tbl_1/views/viw_1")
+    assert captured["json_body"] == {"view_name": "Board v2"}
+    assert payload["view"]["view_name"] == "Board v2"
 
 
 def test_feishu_drive_file_list_handler(monkeypatch):
@@ -877,6 +960,17 @@ def test_feishu_calendar_calendar_primary_handler(monkeypatch):
     assert payload["calendars"][0]["calendar_id"] == "cal_primary"
 
 
+def test_feishu_calendar_calendar_get_handler(monkeypatch):
+    from tools.feishu.calendar import _handle_calendar
+
+    monkeypatch.setattr(
+        "tools.feishu.calendar.feishu_api_request",
+        lambda *a, **kw: {"data": {"calendar": {"calendar_id": "cal_1", "summary": "团队日历"}}},
+    )
+    payload = json.loads(_handle_calendar({"action": "get", "calendar_id": "cal_1"}))
+    assert payload["calendar"]["summary"] == "团队日历"
+
+
 def test_feishu_calendar_event_list_handler(monkeypatch):
     from tools.feishu.calendar_event import _handle_calendar_event
 
@@ -1109,6 +1203,17 @@ def test_feishu_task_task_list_handler(monkeypatch):
     assert payload["tasks"][0]["guid"] == "task_1"
 
 
+def test_feishu_task_task_get_handler(monkeypatch):
+    from tools.feishu.task import _handle_task
+
+    monkeypatch.setattr(
+        "tools.feishu.task.feishu_api_request",
+        lambda *a, **kw: {"data": {"task": {"guid": "task_1", "summary": "Ship"}}},
+    )
+    payload = json.loads(_handle_task({"action": "get", "task_guid": "task_1"}))
+    assert payload["task"]["summary"] == "Ship"
+
+
 def test_feishu_task_task_patch_handler(monkeypatch):
     from tools.feishu.task import _handle_task
 
@@ -1131,6 +1236,17 @@ def test_feishu_task_tasklist_create_handler(monkeypatch):
     assert payload["tasklist"]["guid"] == "tl_1"
 
 
+def test_feishu_task_tasklist_get_handler(monkeypatch):
+    from tools.feishu.tasklist import _handle_tasklist
+
+    monkeypatch.setattr(
+        "tools.feishu.tasklist.feishu_api_request",
+        lambda *a, **kw: {"data": {"tasklist": {"guid": "tl_1", "name": "Inbox"}}},
+    )
+    payload = json.loads(_handle_tasklist({"action": "get", "tasklist_guid": "tl_1"}))
+    assert payload["tasklist"]["name"] == "Inbox"
+
+
 def test_feishu_task_tasklist_tasks_handler(monkeypatch):
     from tools.feishu.tasklist import _handle_tasklist
 
@@ -1140,6 +1256,25 @@ def test_feishu_task_tasklist_tasks_handler(monkeypatch):
     )
     payload = json.loads(_handle_tasklist({"action": "tasks", "tasklist_guid": "tl_1"}))
     assert payload["tasks"][0]["guid"] == "task_1"
+
+
+def test_feishu_task_tasklist_patch_handler(monkeypatch):
+    from tools.feishu.tasklist import _handle_tasklist
+
+    captured = {}
+
+    def _fake_request(method, path, **kwargs):
+        captured["method"] = method
+        captured["path"] = path
+        captured["json_body"] = kwargs.get("json_body")
+        return {"data": {"tasklist": {"guid": "tl_1", "name": "Inbox 2"}}}
+
+    monkeypatch.setattr("tools.feishu.tasklist.feishu_api_request", _fake_request)
+    payload = json.loads(_handle_tasklist({"action": "patch", "tasklist_guid": "tl_1", "name": "Inbox 2"}))
+    assert captured["method"] == "PATCH"
+    assert captured["path"].endswith("/tasklists/tl_1")
+    assert captured["json_body"]["update_fields"] == ["name"]
+    assert payload["tasklist"]["name"] == "Inbox 2"
 
 
 def test_feishu_task_tasklist_add_members_handler(monkeypatch):
@@ -1183,6 +1318,17 @@ def test_feishu_task_comment_list_handler(monkeypatch):
     assert payload["comments"][0]["id"] == "c_1"
 
 
+def test_feishu_task_comment_get_handler(monkeypatch):
+    from tools.feishu.task_comment import _handle_task_comment
+
+    monkeypatch.setattr(
+        "tools.feishu.task_comment.feishu_api_request",
+        lambda *a, **kw: {"data": {"comment": {"id": "c_1", "content": "ok"}}},
+    )
+    payload = json.loads(_handle_task_comment({"action": "get", "comment_id": "c_1"}))
+    assert payload["comment"]["content"] == "ok"
+
+
 def test_feishu_task_subtask_create_handler(monkeypatch):
     from tools.feishu.task_subtask import _handle_task_subtask
 
@@ -1218,6 +1364,36 @@ def test_feishu_task_section_create_handler(monkeypatch):
         _handle_task_section({"action": "create", "name": "Doing", "resource_type": "tasklist", "resource_id": "tl_1"})
     )
     assert payload["section"]["guid"] == "sec_1"
+
+
+def test_feishu_task_section_get_handler(monkeypatch):
+    from tools.feishu.task_section import _handle_task_section
+
+    monkeypatch.setattr(
+        "tools.feishu.task_section.feishu_api_request",
+        lambda *a, **kw: {"data": {"section": {"guid": "sec_1", "name": "Doing"}}},
+    )
+    payload = json.loads(_handle_task_section({"action": "get", "section_guid": "sec_1"}))
+    assert payload["section"]["name"] == "Doing"
+
+
+def test_feishu_task_section_patch_handler(monkeypatch):
+    from tools.feishu.task_section import _handle_task_section
+
+    captured = {}
+
+    def _fake_request(method, path, **kwargs):
+        captured["method"] = method
+        captured["path"] = path
+        captured["json_body"] = kwargs.get("json_body")
+        return {"data": {"section": {"guid": "sec_1", "name": "Done"}}}
+
+    monkeypatch.setattr("tools.feishu.task_section.feishu_api_request", _fake_request)
+    payload = json.loads(_handle_task_section({"action": "patch", "section_guid": "sec_1", "name": "Done"}))
+    assert captured["method"] == "PATCH"
+    assert captured["path"].endswith("/sections/sec_1")
+    assert captured["json_body"]["update_fields"] == ["name"]
+    assert payload["section"]["name"] == "Done"
 
 
 def test_feishu_task_section_list_handler(monkeypatch):
