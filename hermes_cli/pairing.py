@@ -8,6 +8,34 @@ Usage:
     hermes pairing clear-pending     # Clear all expired/pending codes
 """
 
+import json
+import logging
+
+
+logger = logging.getLogger(__name__)
+
+
+def _notify_feishu_pairing_approval(user_open_id: str) -> None:
+    """向飞书用户发送配对通过通知，减少用户等待下一条消息才能感知授权成功的情况。"""
+    from tools.feishu.client import feishu_api_request
+
+    content = (
+        "Your Hermes access has been approved.\n\n"
+        "You can message the bot again now.\n"
+        "If a tool later needs extra Feishu permissions, use /feishu-auth in chat."
+    )
+    feishu_api_request(
+        "POST",
+        "/open-apis/im/v1/messages",
+        params={"receive_id_type": "open_id"},
+        json_body={
+            "receive_id": user_open_id,
+            "msg_type": "text",
+            "content": json.dumps({"text": content}, ensure_ascii=False),
+        },
+    )
+
+
 def pairing_command(args):
     """Handle hermes pairing subcommands."""
     from gateway.pairing import PairingStore
@@ -73,6 +101,12 @@ def _cmd_approve(store, platform: str, code: str):
         display = f"{name} ({uid})" if name else uid
         print(f"\n  Approved! User {display} on {platform} can now use the bot~")
         print("  They'll be recognized automatically on their next message.\n")
+        if platform == "feishu" and uid:
+            try:
+                _notify_feishu_pairing_approval(uid)
+            except Exception as exc:
+                logger.warning("Failed to notify Feishu pairing approval for %s: %s", uid, exc)
+                print("  Warning: pairing succeeded, but the Feishu approval notice could not be delivered.\n")
     else:
         print(f"\n  Code '{code}' not found or expired for platform '{platform}'.")
         print("  Run 'hermes pairing list' to see pending codes.\n")
