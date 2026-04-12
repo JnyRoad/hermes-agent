@@ -1084,14 +1084,18 @@ def _unique_lines(lines: List[str]) -> List[str]:
     return unique
 
 
-def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
+def _run_official_feishu_ws_client(ws_client: Any, adapter: Any, account_id: str = "default") -> None:
     """Run the official Lark WS client in its own thread-local event loop."""
     import lark_oapi.ws.client as ws_client_module
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     ws_client_module.loop = loop
-    adapter._ws_thread_loop = loop
+    ws_thread_loops = getattr(adapter, "_ws_thread_loops_by_account", None)
+    if isinstance(ws_thread_loops, dict):
+        ws_thread_loops[account_id] = loop
+    if account_id == "default" or getattr(adapter, "_ws_thread_loop", None) is None:
+        adapter._ws_thread_loop = loop
 
     original_connect = ws_client_module.websockets.connect
     original_configure = getattr(ws_client, "_configure", None)
@@ -1144,7 +1148,11 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
             loop.close()
         except Exception:
             pass
-        adapter._ws_thread_loop = None
+        ws_thread_loops = getattr(adapter, "_ws_thread_loops_by_account", None)
+        if isinstance(ws_thread_loops, dict):
+            ws_thread_loops.pop(account_id, None)
+        if getattr(adapter, "_ws_thread_loop", None) is loop:
+            adapter._ws_thread_loop = None
 
 
 def check_feishu_requirements() -> bool:
@@ -1175,10 +1183,14 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_client: Optional[Any] = None
         self._ws_future: Optional[asyncio.Future] = None
         self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ws_clients_by_account: Dict[str, Any] = {}
+        self._ws_futures_by_account: Dict[str, asyncio.Future] = {}
+        self._ws_thread_loops_by_account: Dict[str, asyncio.AbstractEventLoop] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._webhook_runner: Optional[Any] = None
         self._webhook_site: Optional[Any] = None
         self._event_handler: Optional[Any] = None
+        self._event_handlers_by_account: Dict[str, Any] = {}
         self._seen_message_ids: Dict[str, float] = {}  # message_id → seen_at (time.time())
         self._seen_message_order: List[str] = []
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
@@ -1194,6 +1206,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
         self._message_text_cache: Dict[str, Optional[str]] = {}
         self._app_lock_identity: Optional[str] = None
+        self._app_lock_identities: List[str] = []
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
         self._pending_text_batch_tasks = self._text_batch_state.tasks
@@ -1436,12 +1449,16 @@ class FeishuAdapter(BasePlatformAdapter):
             account.bot_name for account in self._accounts.values() if account.bot_name
         }
 
-    def _build_event_handler(self) -> Any:
+    def _build_event_handler(self, account: Optional[FeishuAccountSettings] = None) -> Any:
         if EventDispatcherHandler is None:
             return None
+        encrypt_key = (account.encrypt_key if account and account.encrypt_key else self._encrypt_key)
+        verification_token = (
+            account.verification_token if account and account.verification_token else self._verification_token
+        )
         builder = EventDispatcherHandler.builder(
-            self._encrypt_key,
-            self._verification_token,
+            encrypt_key,
+            verification_token,
         )
         builder = builder.register_p2_im_message_message_read_v1(self._on_message_read_event)
         builder = builder.register_p2_im_message_receive_v1(self._on_message_event)
@@ -1525,30 +1542,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._connection_mode,
             )
             return False
-        if self._connection_mode == "websocket" and len(self._accounts) > 1:
-            logger.warning(
-                "[Feishu] Multiple accounts configured, but websocket mode currently uses only the primary account %s",
-                self._app_id or "unknown",
-            )
-
         try:
-            self._app_lock_identity = self._app_id
-            acquired, existing = acquire_scoped_lock(
-                _FEISHU_APP_LOCK_SCOPE,
-                self._app_lock_identity,
-                metadata={"platform": self.platform.value},
-            )
+            acquired = await self._acquire_app_locks()
             if not acquired:
-                owner_pid = existing.get("pid") if isinstance(existing, dict) else None
-                message = (
-                    "Another local Hermes gateway is already using this Feishu app_id"
-                    + (f" (PID {owner_pid})." if owner_pid else ".")
-                    + " Stop the other gateway before starting a second Feishu websocket client."
-                )
-                logger.error("[Feishu] %s", message)
-                self._set_fatal_error("feishu_app_lock", message, retryable=False)
                 return False
-
             self._loop = asyncio.get_running_loop()
             await self._connect_with_retry()
             self._mark_connected()
@@ -1570,36 +1567,49 @@ class FeishuAdapter(BasePlatformAdapter):
         self._disable_websocket_auto_reconnect()
         await self._stop_webhook_server()
 
-        ws_thread_loop = self._ws_thread_loop
-        if ws_thread_loop is not None and not ws_thread_loop.is_closed():
-            logger.debug("[Feishu] Cancelling websocket thread tasks and stopping loop")
+        for account_id, ws_thread_loop in list(self._ws_thread_loops_by_account.items()):
+            if ws_thread_loop is None or ws_thread_loop.is_closed():
+                continue
+            logger.debug("[Feishu] Cancelling websocket thread tasks and stopping loop for account %s", account_id)
 
-            def cancel_all_tasks() -> None:
-                tasks = [t for t in asyncio.all_tasks(ws_thread_loop) if not t.done()]
-                logger.debug("[Feishu] Found %d pending tasks in websocket thread", len(tasks))
+            def cancel_all_tasks(target_loop: asyncio.AbstractEventLoop = ws_thread_loop) -> None:
+                tasks = [t for t in asyncio.all_tasks(target_loop) if not t.done()]
+                logger.debug("[Feishu] Found %d pending websocket tasks", len(tasks))
                 for task in tasks:
                     task.cancel()
-                ws_thread_loop.call_later(0.1, ws_thread_loop.stop)
+                stop_fn = getattr(target_loop, "stop", None)
+                if callable(stop_fn):
+                    target_loop.call_later(0.1, stop_fn)
 
             ws_thread_loop.call_soon_threadsafe(cancel_all_tasks)
 
-        ws_future = self._ws_future
-        if ws_future is not None:
+        for account_id, ws_future in list(self._ws_futures_by_account.items()):
+            if ws_future is None:
+                continue
             try:
-                logger.debug("[Feishu] Waiting for websocket thread to exit (timeout=10s)")
+                logger.debug("[Feishu] Waiting for websocket thread to exit (timeout=10s) for account %s", account_id)
                 await asyncio.wait_for(asyncio.shield(ws_future), timeout=10.0)
-                logger.debug("[Feishu] Websocket thread exited cleanly")
+                logger.debug("[Feishu] Websocket thread exited cleanly for account %s", account_id)
             except asyncio.TimeoutError:
-                logger.warning("[Feishu] Websocket thread did not exit within 10s - may be stuck")
+                logger.warning("[Feishu] Websocket thread did not exit within 10s for account %s", account_id)
             except asyncio.CancelledError:
-                logger.debug("[Feishu] Websocket thread cancelled during disconnect")
+                logger.debug("[Feishu] Websocket thread cancelled during disconnect for account %s", account_id)
             except Exception as exc:
-                logger.debug("[Feishu] Websocket thread exited with error: %s", exc, exc_info=True)
+                logger.debug(
+                    "[Feishu] Websocket thread exited with error for account %s: %s",
+                    account_id,
+                    exc,
+                    exc_info=True,
+                )
 
         self._ws_future = None
         self._ws_thread_loop = None
+        self._ws_clients_by_account.clear()
+        self._ws_futures_by_account.clear()
+        self._ws_thread_loops_by_account.clear()
         self._loop = None
         self._event_handler = None
+        self._event_handlers_by_account.clear()
         self._clients_by_account.clear()
         self._persist_seen_message_ids()
         await self._release_app_lock()
@@ -1621,14 +1631,15 @@ class FeishuAdapter(BasePlatformAdapter):
         self._pending_media_batches.clear()
 
     def _disable_websocket_auto_reconnect(self) -> None:
-        if self._ws_client is None:
-            return
-        try:
-            setattr(self._ws_client, "_auto_reconnect", False)
-        except Exception:
-            pass
-        finally:
-            self._ws_client = None
+        for ws_client in list(self._ws_clients_by_account.values()) or ([self._ws_client] if self._ws_client else []):
+            if ws_client is None:
+                continue
+            try:
+                setattr(ws_client, "_auto_reconnect", False)
+            except Exception:
+                pass
+        self._ws_client = None
+        self._ws_clients_by_account.clear()
 
     async def _stop_webhook_server(self) -> None:
         if self._webhook_runner is None:
@@ -4804,6 +4815,12 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._running = False
                 self._disable_websocket_auto_reconnect()
                 self._ws_future = None
+                self._ws_futures_by_account.clear()
+                self._ws_thread_loop = None
+                self._ws_thread_loops_by_account.clear()
+                self._event_handler = None
+                self._event_handlers_by_account.clear()
+                self._clients_by_account.clear()
                 await self._stop_webhook_server()
                 if attempt >= _FEISHU_CONNECT_ATTEMPTS - 1:
                     raise
@@ -4820,29 +4837,60 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _connect_websocket(self) -> None:
         if not FEISHU_WEBSOCKET_AVAILABLE:
             raise RuntimeError("websockets not installed; websocket mode unavailable")
-        domain = FEISHU_DOMAIN if self._domain_name != "lark" else LARK_DOMAIN
-        self._client = self._build_lark_client(domain)
-        self._event_handler = self._build_event_handler()
-        if self._event_handler is None:
-            raise RuntimeError("failed to build Feishu event handler")
         loop = self._loop
         if loop is None or loop.is_closed():
             raise RuntimeError("adapter loop is not ready")
-        await self._hydrate_bot_identity()
-        self._clients_by_account = {"default": self._client}
-        self._ws_client = FeishuWSClient(
-            app_id=self._app_id,
-            app_secret=self._app_secret,
-            log_level=lark.LogLevel.INFO,
-            event_handler=self._event_handler,
-            domain=domain,
-        )
-        self._ws_future = loop.run_in_executor(
-            None,
-            _run_official_feishu_ws_client,
-            self._ws_client,
-            self,
-        )
+        self._clients_by_account = {}
+        self._ws_clients_by_account = {}
+        self._ws_futures_by_account = {}
+        self._event_handlers_by_account = {}
+        websocket_accounts = [
+            account for account in self._accounts.values() if account.enabled and account.connection_mode == "websocket"
+        ]
+        websocket_accounts.sort(key=lambda account: (account.account_id != "default", account.account_id))
+        if not websocket_accounts:
+            raise RuntimeError("no enabled Feishu websocket accounts configured")
+        for account in websocket_accounts:
+            account_domain = FEISHU_DOMAIN if account.domain_name != "lark" else LARK_DOMAIN
+            client = (
+                self._build_lark_client(account_domain)
+                if account.account_id == "default"
+                else self._build_lark_client_for_account(account, account_domain)
+            )
+            event_handler = self._build_event_handler(account)
+            if event_handler is None:
+                raise RuntimeError(f"failed to build Feishu event handler for account {account.account_id}")
+            self._clients_by_account[account.account_id] = client
+            self._event_handlers_by_account[account.account_id] = event_handler
+            if account.account_id == "default":
+                self._client = client
+                self._event_handler = event_handler
+            await self._hydrate_bot_identity(account_id=account.account_id)
+            ws_client = FeishuWSClient(
+                app_id=account.app_id,
+                app_secret=account.app_secret,
+                log_level=lark.LogLevel.INFO,
+                event_handler=event_handler,
+                domain=account_domain,
+            )
+            self._ws_clients_by_account[account.account_id] = ws_client
+            ws_future = loop.run_in_executor(
+                None,
+                _run_official_feishu_ws_client,
+                ws_client,
+                self,
+                account.account_id,
+            )
+            self._ws_futures_by_account[account.account_id] = ws_future
+            if account.account_id == "default":
+                self._ws_client = ws_client
+                self._ws_future = ws_future
+        if self._client is None and websocket_accounts:
+            primary_account = websocket_accounts[0]
+            self._client = self._clients_by_account.get(primary_account.account_id)
+            self._event_handler = self._event_handlers_by_account.get(primary_account.account_id)
+            self._ws_client = self._ws_clients_by_account.get(primary_account.account_id)
+            self._ws_future = self._ws_futures_by_account.get(primary_account.account_id)
 
     async def _connect_webhook(self) -> None:
         if not FEISHU_WEBHOOK_AVAILABLE:
@@ -4956,15 +5004,67 @@ class FeishuAdapter(BasePlatformAdapter):
                 await asyncio.sleep(wait_seconds)
         raise last_error or RuntimeError("Feishu send failed")
 
+    async def _acquire_app_locks(self) -> bool:
+        """Acquire one scoped lock per active Feishu app to prevent duplicate gateways."""
+        if self._connection_mode == "websocket":
+            active_accounts = [
+                account for account in self._accounts.values() if account.enabled and account.connection_mode == "websocket"
+            ]
+            active_accounts.sort(key=lambda account: (account.account_id != "default", account.account_id))
+        else:
+            primary_account = self._accounts.get("default")
+            active_accounts = [primary_account] if primary_account is not None else []
+        app_ids = [account.app_id for account in active_accounts if account and account.app_id]
+        if not app_ids and self._app_id:
+            app_ids = [self._app_id]
+        acquired_ids: List[str] = []
+        for app_id in list(dict.fromkeys(app_ids)):
+            acquired, existing = acquire_scoped_lock(
+                _FEISHU_APP_LOCK_SCOPE,
+                app_id,
+                metadata={"platform": self.platform.value},
+            )
+            if not acquired:
+                owner_pid = existing.get("pid") if isinstance(existing, dict) else None
+                message = (
+                    "Another local Hermes gateway is already using this Feishu app_id"
+                    + (f" {app_id}" if len(app_ids) > 1 else "")
+                    + (f" (PID {owner_pid})." if owner_pid else ".")
+                    + " Stop the other gateway before starting a second Feishu websocket client."
+                )
+                logger.error("[Feishu] %s", message)
+                self._set_fatal_error("feishu_app_lock", message, retryable=False)
+                for acquired_id in reversed(acquired_ids):
+                    try:
+                        release_scoped_lock(_FEISHU_APP_LOCK_SCOPE, acquired_id)
+                    except Exception:
+                        logger.warning(
+                            "[Feishu] Failed to roll back app lock %s after acquisition failure",
+                            acquired_id,
+                            exc_info=True,
+                        )
+                self._app_lock_identity = None
+                self._app_lock_identities = []
+                return False
+            acquired_ids.append(app_id)
+        self._app_lock_identity = acquired_ids[0] if acquired_ids else None
+        self._app_lock_identities = acquired_ids
+        return True
+
     async def _release_app_lock(self) -> None:
-        if not self._app_lock_identity:
+        if self._app_lock_identities:
+            identities = list(dict.fromkeys(self._app_lock_identities))
+        elif self._app_lock_identity:
+            identities = [self._app_lock_identity]
+        else:
             return
-        try:
-            release_scoped_lock(_FEISHU_APP_LOCK_SCOPE, self._app_lock_identity)
-        except Exception as exc:
-            logger.warning("[Feishu] Failed to release app lock: %s", exc, exc_info=True)
-        finally:
-            self._app_lock_identity = None
+        for app_id in identities:
+            try:
+                release_scoped_lock(_FEISHU_APP_LOCK_SCOPE, app_id)
+            except Exception as exc:
+                logger.warning("[Feishu] Failed to release app lock %s: %s", app_id, exc, exc_info=True)
+        self._app_lock_identity = None
+        self._app_lock_identities = []
 
     # =========================================================================
     # Lark API request builders
