@@ -2681,6 +2681,20 @@ class TestWebhookSecurity(unittest.TestCase):
         self.assertEqual(response.status, 413)
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_request_rejects_unexpected_content_type(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=2,
+            headers={"Content-Type": "text/plain"},
+        )
+        response = asyncio.run(adapter._handle_webhook_request(request))
+        self.assertEqual(response.status, 415)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_webhook_request_rejects_invalid_json(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -2693,6 +2707,39 @@ class TestWebhookSecurity(unittest.TestCase):
         )
         response = asyncio.run(adapter._handle_webhook_request(request))
         self.assertEqual(response.status, 400)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_request_returns_400_when_body_read_fails(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(side_effect=RuntimeError("socket error")),
+        )
+        response = asyncio.run(adapter._handle_webhook_request(request))
+        self.assertEqual(response.status, 400)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_request_returns_408_when_body_read_times_out(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        async def _timeout():
+            raise asyncio.TimeoutError()
+
+        adapter = FeishuAdapter(PlatformConfig())
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=_timeout,
+        )
+        response = asyncio.run(adapter._handle_webhook_request(request))
+        self.assertEqual(response.status, 408)
 
     @patch.dict(os.environ, {"FEISHU_ENCRYPT_KEY": "secret"}, clear=True)
     def test_webhook_request_rejects_bad_signature(self):
@@ -2793,6 +2840,23 @@ class TestWebhookSecurity(unittest.TestCase):
         response = asyncio.run(adapter._handle_webhook_request(request))
         self.assertEqual(response.status, 200)
         self.assertIn(b"test_challenge_token", response.body)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_unknown_event_type_returns_ok(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        body = json.dumps({"header": {"event_type": "unknown.event"}}).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+        response = asyncio.run(adapter._handle_webhook_request(request))
+        self.assertEqual(response.status, 200)
+        self.assertIn(b'"code": 0', response.body)
 
 
 class TestDedupTTL(unittest.TestCase):
