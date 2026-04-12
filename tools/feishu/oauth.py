@@ -1,19 +1,21 @@
-"""飞书授权提示工具。
+"""飞书授权工具。
 
-这里先落一层 Hermes 原生的人机闭环：
-- 工具声明所需 scopes
-- 飞书适配器发送说明卡片
-- 用户完成后台授权后点击“已完成授权”
-- 网关注入 synthetic message，驱动模型重试
+当前这层实现的目标不是直接复刻官方 Device Flow，而是先把 Hermes 的
+授权生命周期补齐为稳定可追踪的运行态：
 
-真正的自动换取 user token / scope 自动补齐可在此结构上继续扩展。
+- `authorize`：在当前飞书会话发送授权卡片，并记录待确认请求
+- `status`：查看当前用户在本应用上的本地授权状态
+- `revoke`：撤销当前用户的全部或部分本地授权状态
+
+后续自动授权与失败重放会继续基于这套状态模型扩展。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import asyncio
+from typing import Any, Dict, List
 
 from tools.feishu.runtime import get_active_feishu_adapter, require_feishu_session
 from tools.registry import registry, tool_error
@@ -46,10 +48,12 @@ def _check_feishu_runtime() -> bool:
         return False
 
 
-def _normalize_scopes(raw_scopes) -> list[str]:
+def _normalize_scopes(raw_scopes: Any) -> List[str]:
+    if raw_scopes is None:
+        return []
     if not isinstance(raw_scopes, list):
         return []
-    result: list[str] = []
+    result: List[str] = []
     seen: set[str] = set()
     for item in raw_scopes:
         scope = str(item).strip()
@@ -60,20 +64,52 @@ def _normalize_scopes(raw_scopes) -> list[str]:
     return result
 
 
-def _handle_feishu_oauth(args: dict, **_kw) -> str:
+def _resolve_target_open_id(args: Dict[str, Any], session: Dict[str, str]) -> str:
+    """优先使用显式 user_open_id，否则回退到当前会话发送者。"""
+    explicit = str(args.get("user_open_id", "") or "").strip()
+    if explicit:
+        return explicit
+    current = str(session.get("user_id", "") or "").strip()
+    if current:
+        return current
+    raise RuntimeError("Missing Feishu user identity. Provide user_open_id or call from a Feishu gateway session.")
+
+
+def _handle_authorize(args: Dict[str, Any]) -> str:
     scopes = _normalize_scopes(args.get("scopes"))
     if not scopes:
         return tool_error("Parameter 'scopes' must be a non-empty array.")
     reason = str(args.get("reason", "")).strip() or "This action requires additional Feishu permissions."
+    title = str(args.get("title", "")).strip() or "Feishu Authorization Required"
     try:
         adapter = get_active_feishu_adapter()
         session = require_feishu_session()
+        requester_open_id = _resolve_target_open_id(args, session)
+        status = adapter.get_authorization_status(requester_open_id, scopes)
+        if status["authorized"]:
+            return json.dumps(
+                {
+                    "status": "authorized",
+                    "user_open_id": requester_open_id,
+                    "granted_scopes": status["granted_scopes"],
+                    "requested_scopes": status["requested_scopes"],
+                    "missing_scopes": [],
+                    "updated_at": status["updated_at"],
+                    "updated_by": status["updated_by"],
+                    "source": status["source"],
+                },
+                ensure_ascii=False,
+            )
         result = _run_async(
             adapter.send_oauth_request_card(
                 chat_id=session["chat_id"],
                 scopes=scopes,
                 reason=reason,
-                metadata={"thread_id": session["thread_id"] or None},
+                title=title,
+                metadata={
+                    "thread_id": session["thread_id"] or None,
+                    "requester_open_id": requester_open_id,
+                },
             )
         )
         if not result.success:
@@ -81,33 +117,105 @@ def _handle_feishu_oauth(args: dict, **_kw) -> str:
         return json.dumps(
             {
                 "status": "pending",
+                "user_open_id": requester_open_id,
                 "scopes": scopes,
+                "missing_scopes": status["missing_scopes"],
                 "request_id": ((result.raw_response or {}) if isinstance(result.raw_response, dict) else {}).get("request_id"),
                 "message_id": result.message_id,
             },
             ensure_ascii=False,
         )
     except Exception as exc:
-        logger.error("feishu_oauth error: %s", exc)
+        logger.error("feishu_oauth authorize error: %s", exc)
         return tool_error(f"Failed to request Feishu authorization: {exc}")
 
 
-def _handle_feishu_oauth_batch(args: dict, **_kw) -> str:
+def _handle_status(args: Dict[str, Any]) -> str:
+    try:
+        adapter = get_active_feishu_adapter()
+        session = require_feishu_session()
+        user_open_id = _resolve_target_open_id(args, session)
+        scopes = _normalize_scopes(args.get("scopes"))
+        status = adapter.get_authorization_status(user_open_id, scopes)
+        return json.dumps(
+            {
+                "status": "authorized" if status["authorized"] else "not_authorized",
+                "user_open_id": user_open_id,
+                **status,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        logger.error("feishu_oauth status error: %s", exc)
+        return tool_error(f"Failed to read Feishu authorization status: {exc}")
+
+
+def _handle_revoke(args: Dict[str, Any]) -> str:
+    try:
+        adapter = get_active_feishu_adapter()
+        session = require_feishu_session()
+        user_open_id = _resolve_target_open_id(args, session)
+        scopes = _normalize_scopes(args.get("scopes"))
+        status = adapter.revoke_authorization(user_open_id, scopes or None)
+        return json.dumps(
+            {
+                "status": "revoked",
+                "user_open_id": user_open_id,
+                "revoked_scopes": scopes,
+                "remaining_scopes": status["granted_scopes"],
+                "authorized": status["authorized"],
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        logger.error("feishu_oauth revoke error: %s", exc)
+        return tool_error(f"Failed to revoke Feishu authorization: {exc}")
+
+
+def _handle_feishu_oauth(args: Dict[str, Any], **_kw) -> str:
+    action = str(args.get("action", "authorize") or "authorize").strip().lower()
+    if action == "authorize":
+        return _handle_authorize(args)
+    if action == "status":
+        return _handle_status(args)
+    if action == "revoke":
+        return _handle_revoke(args)
+    return tool_error("Unsupported action. Supported actions: authorize, status, revoke")
+
+
+def _handle_feishu_oauth_batch(args: Dict[str, Any], **_kw) -> str:
     scopes = _normalize_scopes(args.get("scopes"))
     if not scopes:
         return tool_error("Parameter 'scopes' must be a non-empty array.")
-    title = str(args.get("title", "")).strip() or "Feishu Authorization Required"
+    title = str(args.get("title", "")).strip() or "Feishu Batch Authorization Required"
     reason = str(args.get("reason", "")).strip() or "The requested batch of Feishu actions needs extra permissions."
     try:
         adapter = get_active_feishu_adapter()
         session = require_feishu_session()
+        requester_open_id = _resolve_target_open_id(args, session)
+        status = adapter.get_authorization_status(requester_open_id, scopes)
+        missing_scopes = list(status["missing_scopes"])
+        if not missing_scopes:
+            return json.dumps(
+                {
+                    "status": "authorized",
+                    "user_open_id": requester_open_id,
+                    "granted_scopes": status["granted_scopes"],
+                    "requested_scopes": scopes,
+                    "missing_scopes": [],
+                },
+                ensure_ascii=False,
+            )
         result = _run_async(
             adapter.send_oauth_request_card(
                 chat_id=session["chat_id"],
-                scopes=scopes,
+                scopes=missing_scopes,
                 reason=reason,
                 title=title,
-                metadata={"thread_id": session["thread_id"] or None},
+                metadata={
+                    "thread_id": session["thread_id"] or None,
+                    "requester_open_id": requester_open_id,
+                },
             )
         )
         if not result.success:
@@ -115,7 +223,9 @@ def _handle_feishu_oauth_batch(args: dict, **_kw) -> str:
         return json.dumps(
             {
                 "status": "pending",
-                "scopes": scopes,
+                "user_open_id": requester_open_id,
+                "requested_scopes": scopes,
+                "missing_scopes": missing_scopes,
                 "request_id": ((result.raw_response or {}) if isinstance(result.raw_response, dict) else {}).get("request_id"),
                 "message_id": result.message_id,
             },
@@ -128,28 +238,42 @@ def _handle_feishu_oauth_batch(args: dict, **_kw) -> str:
 
 FEISHU_OAUTH_SCHEMA = {
     "name": "feishu_oauth",
-    "description": "Request additional Feishu permissions from the current user by sending an authorization guidance card into the active Feishu chat.",
+    "description": "Manage Feishu authorization for the current user. Actions: authorize, status, revoke.",
     "parameters": {
         "type": "object",
         "properties": {
+            "action": {
+                "type": "string",
+                "description": "authorize to request permissions, status to inspect current grants, revoke to clear grants.",
+                "enum": ["authorize", "status", "revoke"],
+            },
+            "user_open_id": {
+                "type": "string",
+                "description": "Optional target user open_id. Defaults to the current Feishu session sender.",
+            },
+            "title": {"type": "string", "description": "Card title shown to the user during authorize."},
             "scopes": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "List of Feishu scopes required by the action.",
+                "description": "List of Feishu scopes involved in this authorization action.",
             },
             "reason": {"type": "string", "description": "Why these scopes are needed."},
         },
-        "required": ["scopes"],
+        "required": [],
     },
 }
 
 FEISHU_OAUTH_BATCH_SCHEMA = {
     "name": "feishu_oauth_batch_auth",
-    "description": "Request a batch of Feishu scopes in one user-facing authorization card.",
+    "description": "Request a batch of Feishu scopes in one user-facing authorization card. Already granted scopes are skipped automatically.",
     "parameters": {
         "type": "object",
         "properties": {
             "title": {"type": "string", "description": "Card title shown to the user."},
+            "user_open_id": {
+                "type": "string",
+                "description": "Optional target user open_id. Defaults to the current Feishu session sender.",
+            },
             "scopes": {
                 "type": "array",
                 "items": {"type": "string"},

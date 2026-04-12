@@ -6642,6 +6642,7 @@ class GatewayRunner:
             chat_id=context.source.chat_id,
             chat_name=context.source.chat_name or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
+            user_id=context.source.user_id or "",
         )
 
     def _clear_session_env(self, tokens: list) -> None:

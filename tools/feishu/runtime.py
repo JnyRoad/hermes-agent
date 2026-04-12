@@ -16,6 +16,7 @@ def get_current_feishu_session() -> Dict[str, str]:
         "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", "").strip(),
         "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME", "").strip(),
         "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "").strip(),
+        "user_id": get_session_env("HERMES_SESSION_USER_ID", "").strip(),
     }
 
 

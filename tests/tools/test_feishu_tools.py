@@ -1,5 +1,6 @@
 """飞书工具注册与调用测试。"""
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -2768,6 +2769,15 @@ def test_feishu_oauth_uses_active_adapter(monkeypatch):
     from tools.feishu.oauth import _handle_feishu_oauth
 
     adapter = SimpleNamespace(
+        get_authorization_status=lambda user_open_id, scopes=None: {
+            "authorized": False,
+            "granted_scopes": [],
+            "requested_scopes": list(scopes or []),
+            "missing_scopes": list(scopes or []),
+            "updated_at": None,
+            "updated_by": "",
+            "source": "",
+        },
         send_oauth_request_card=AsyncMock(
             return_value=SendResult(
                 success=True,
@@ -2781,9 +2791,10 @@ def test_feishu_oauth_uses_active_adapter(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "oc_chat_1")
     monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_user_1")
 
     try:
-        payload = json.loads(_handle_feishu_oauth({"scopes": ["contact:user.base:readonly"]}))
+        payload = json.loads(_handle_feishu_oauth({"action": "authorize", "scopes": ["contact:user.base:readonly"]}))
         assert payload["status"] == "pending"
         assert payload["request_id"] == "fo_123"
         adapter.send_oauth_request_card.assert_awaited_once()
@@ -2794,8 +2805,66 @@ def test_feishu_oauth_uses_active_adapter(monkeypatch):
 def test_feishu_oauth_requires_scopes(monkeypatch):
     from tools.feishu.oauth import _handle_feishu_oauth
 
-    payload = json.loads(_handle_feishu_oauth({"scopes": []}))
+    payload = json.loads(_handle_feishu_oauth({"action": "authorize", "scopes": []}))
     assert "scopes" in payload["error"]
+
+
+def test_feishu_oauth_status_handler(monkeypatch):
+    from tools.feishu.oauth import _handle_feishu_oauth
+
+    adapter = SimpleNamespace(
+        get_authorization_status=lambda user_open_id, scopes=None: {
+            "authorized": True,
+            "granted_scopes": ["contact:user.base:readonly"],
+            "requested_scopes": list(scopes or []),
+            "missing_scopes": [],
+            "updated_at": 123.0,
+            "updated_by": "ou_user_1",
+            "source": "interactive_confirm",
+        }
+    )
+
+    register_adapter(Platform.FEISHU, adapter)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "oc_chat_1")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_user_1")
+
+    try:
+        payload = json.loads(_handle_feishu_oauth({"action": "status", "scopes": ["contact:user.base:readonly"]}))
+        assert payload["status"] == "authorized"
+        assert payload["authorized"] is True
+        assert payload["granted_scopes"] == ["contact:user.base:readonly"]
+    finally:
+        unregister_adapter(Platform.FEISHU, adapter)
+
+
+def test_feishu_oauth_revoke_handler(monkeypatch):
+    from tools.feishu.oauth import _handle_feishu_oauth
+
+    adapter = SimpleNamespace(
+        revoke_authorization=lambda user_open_id, scopes=None: {
+            "authorized": False,
+            "granted_scopes": [],
+            "requested_scopes": [],
+            "missing_scopes": [],
+            "updated_at": None,
+            "updated_by": "",
+            "source": "",
+        }
+    )
+
+    register_adapter(Platform.FEISHU, adapter)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "oc_chat_1")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_user_1")
+
+    try:
+        payload = json.loads(_handle_feishu_oauth({"action": "revoke", "scopes": ["contact:user.base:readonly"]}))
+        assert payload["status"] == "revoked"
+        assert payload["authorized"] is False
+        assert payload["remaining_scopes"] == []
+    finally:
+        unregister_adapter(Platform.FEISHU, adapter)
 
 
 def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
@@ -2815,6 +2884,7 @@ def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
         reason="Need basic profile.",
         title="Auth",
         thread_id="omt_1",
+        requester_open_id="ou_user_1",
     )
     adapter._update_interactive_card = AsyncMock()
 
@@ -2826,7 +2896,7 @@ def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
             scopes=["contact:user.base:readonly", "calendar:calendar.readonly"],
             reason="Need calendar too.",
             title="Auth",
-            metadata={"thread_id": "omt_1"},
+            metadata={"thread_id": "omt_1", "requester_open_id": "ou_user_1"},
         )
     )
 
@@ -2836,6 +2906,82 @@ def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
     state = adapter._pending_oauth_requests["fo_existing"]
     assert state.scopes == ["contact:user.base:readonly", "calendar:calendar.readonly"]
     adapter._update_interactive_card.assert_awaited_once()
+
+
+def test_feishu_adapter_records_oauth_completion(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingOAuthRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._pending_oauth_requests["fo_1"] = FeishuPendingOAuthRequest(
+        request_id="fo_1",
+        chat_id="oc_chat_1",
+        message_id="msg_auth_1",
+        scopes=["contact:user.base:readonly"],
+        reason="Need basic profile.",
+        title="Auth",
+        requester_open_id="ou_requester",
+    )
+    adapter._resolve_sender_profile = AsyncMock(
+        return_value={"user_id": "ou_operator", "user_name": "Alice", "user_id_alt": "ou_operator"}
+    )
+    adapter.get_chat_info = AsyncMock(return_value={"name": "Backend Chat", "chat_type": "group"})
+    adapter._update_interactive_card = AsyncMock()
+    adapter._handle_message_with_guards = AsyncMock()
+
+    event = SimpleNamespace(
+        token="tok_auth_1",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_requester"),
+        action=SimpleNamespace(tag="button", value={"hermes_action": "complete_oauth", "request_id": "fo_1"}),
+    )
+
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+    status = adapter.get_authorization_status("ou_requester", ["contact:user.base:readonly"])
+    assert status["authorized"] is True
+    assert status["missing_scopes"] == []
+    adapter._update_interactive_card.assert_awaited_once()
+    adapter._handle_message_with_guards.assert_awaited_once()
+
+
+def test_feishu_adapter_rejects_oauth_completion_from_other_user(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingOAuthRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._pending_oauth_requests["fo_1"] = FeishuPendingOAuthRequest(
+        request_id="fo_1",
+        chat_id="oc_chat_1",
+        message_id="msg_auth_1",
+        scopes=["contact:user.base:readonly"],
+        reason="Need basic profile.",
+        title="Auth",
+        requester_open_id="ou_requester",
+    )
+    adapter._update_interactive_card = AsyncMock()
+    adapter._handle_message_with_guards = AsyncMock()
+
+    event = SimpleNamespace(
+        token="tok_auth_1",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_other"),
+        action=SimpleNamespace(tag="button", value={"hermes_action": "complete_oauth", "request_id": "fo_1"}),
+    )
+
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+    status = adapter.get_authorization_status("ou_requester", ["contact:user.base:readonly"])
+    assert status["authorized"] is False
+    assert "fo_1" in adapter._pending_oauth_requests
+    adapter._update_interactive_card.assert_not_awaited()
+    adapter._handle_message_with_guards.assert_not_awaited()
 
 
 def test_feishu_adapter_routes_question_answer(monkeypatch):
