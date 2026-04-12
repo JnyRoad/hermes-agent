@@ -2666,6 +2666,64 @@ class TestWebhookSecurity(unittest.TestCase):
         adapter._webhook_rate_counts[ip] = (count, window_start - _FEISHU_WEBHOOK_RATE_WINDOW_SECONDS - 1)
         self.assertTrue(adapter._check_webhook_rate_limit(ip))
 
+    def test_rate_limit_prunes_stale_keys_when_capacity_is_reached(self):
+        from gateway.platforms.feishu import _FEISHU_WEBHOOK_RATE_MAX_KEYS, _FEISHU_WEBHOOK_RATE_WINDOW_SECONDS
+
+        adapter = self._make_adapter()
+        stale_start = time.time() - _FEISHU_WEBHOOK_RATE_WINDOW_SECONDS - 1
+        adapter._webhook_rate_counts = {
+            f"stale-{index}": (1, stale_start)
+            for index in range(_FEISHU_WEBHOOK_RATE_MAX_KEYS)
+        }
+
+        self.assertTrue(adapter._check_webhook_rate_limit("fresh-key"))
+        self.assertIn("fresh-key", adapter._webhook_rate_counts)
+        self.assertLess(len(adapter._webhook_rate_counts), _FEISHU_WEBHOOK_RATE_MAX_KEYS + 1)
+
+    def test_rate_limit_allows_new_key_without_tracking_when_capacity_remains_full(self):
+        from gateway.platforms.feishu import _FEISHU_WEBHOOK_RATE_MAX_KEYS
+
+        adapter = self._make_adapter()
+        current_start = time.time()
+        adapter._webhook_rate_counts = {
+            f"active-{index}": (1, current_start)
+            for index in range(_FEISHU_WEBHOOK_RATE_MAX_KEYS)
+        }
+
+        self.assertTrue(adapter._check_webhook_rate_limit("overflow-key"))
+        self.assertNotIn("overflow-key", adapter._webhook_rate_counts)
+        self.assertEqual(len(adapter._webhook_rate_counts), _FEISHU_WEBHOOK_RATE_MAX_KEYS)
+
+    def test_webhook_anomaly_logs_when_threshold_is_hit(self):
+        from gateway.platforms.feishu import _FEISHU_WEBHOOK_ANOMALY_THRESHOLD
+
+        adapter = self._make_adapter()
+        with patch("gateway.platforms.feishu.logger.warning") as warning_log:
+            for _ in range(_FEISHU_WEBHOOK_ANOMALY_THRESHOLD):
+                adapter._record_webhook_anomaly("10.0.0.8", "401-token")
+
+        self.assertEqual(adapter._webhook_anomaly_counts["10.0.0.8"][0], _FEISHU_WEBHOOK_ANOMALY_THRESHOLD)
+        warning_log.assert_called_once()
+
+    def test_successful_webhook_request_clears_existing_anomaly_counter(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._webhook_anomaly_counts["127.0.0.1"] = (3, "400", time.time())
+        body = json.dumps({"header": {"event_type": "unknown.event"}}).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+
+        response = asyncio.run(adapter._handle_webhook_request(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertNotIn("127.0.0.1", adapter._webhook_anomaly_counts)
+
     @patch.dict(os.environ, {}, clear=True)
     def test_webhook_request_rejects_oversized_body(self):
         from gateway.config import PlatformConfig
