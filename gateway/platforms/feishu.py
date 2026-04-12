@@ -376,6 +376,17 @@ class FeishuAuthorizationGrant:
     source: str = "manual_confirm"
 
 
+@dataclass(frozen=True)
+class FeishuDirectoryEntry:
+    """Normalized Feishu directory entry used by the channel directory cache."""
+
+    id: str
+    name: str
+    type: str
+    source: str
+    account_id: str = "default"
+
+
 # ---------------------------------------------------------------------------
 # Markdown rendering helpers
 # ---------------------------------------------------------------------------
@@ -2344,6 +2355,164 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception:
             logger.warning("[Feishu] Failed to get chat info for %s", chat_id, exc_info=True)
             return fallback
+
+    def _normalize_directory_entries(self, entries: List[FeishuDirectoryEntry]) -> List[Dict[str, str]]:
+        """Convert raw directory entries into stable cache payloads."""
+        normalized: List[Dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for entry in entries:
+            entry_id = str(entry.id or "").strip()
+            entry_name = str(entry.name or entry_id).strip() or entry_id
+            entry_type = str(entry.type or "").strip() or "dm"
+            entry_source = str(entry.source or "").strip() or "config"
+            account_id = str(entry.account_id or "default").strip() or "default"
+            dedup_key = (account_id, entry_id)
+            if not entry_id or dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            normalized.append(
+                {
+                    "id": entry_id,
+                    "name": entry_name,
+                    "type": entry_type,
+                    "source": entry_source,
+                    "account_id": account_id,
+                }
+            )
+        return normalized
+
+    def _get_account_directory_config(self, account_id: str) -> Dict[str, Any]:
+        """Return merged config for a single Feishu account."""
+        if account_id == "default":
+            extra = dict(getattr(self.config, "extra", {}) or {})
+        else:
+            extra = dict((((getattr(self.config, "extra", {}) or {}).get("accounts") or {}).get(account_id)) or {})
+        return extra
+
+    def _list_config_directory_entries_for_account(self, account_id: str) -> List[FeishuDirectoryEntry]:
+        """Enumerate users and groups from static Feishu config for one account."""
+        cfg = self._get_account_directory_config(account_id)
+        entries: List[FeishuDirectoryEntry] = []
+        user_ids: set[str] = set()
+        for raw_entry in cfg.get("allow_from", []) or []:
+            user_id = str(raw_entry or "").strip()
+            if not user_id or user_id == "*":
+                continue
+            user_ids.add(user_id)
+        for raw_entry in ((cfg.get("dms") or {}) if isinstance(cfg.get("dms"), dict) else {}):
+            user_id = str(raw_entry or "").strip()
+            if user_id:
+                user_ids.add(user_id)
+        for user_id in sorted(user_ids):
+            entries.append(
+                FeishuDirectoryEntry(
+                    id=user_id,
+                    name=user_id,
+                    type="dm",
+                    source="config",
+                    account_id=account_id,
+                )
+            )
+
+        group_ids: set[str] = set()
+        for raw_entry in cfg.get("group_allow_from", []) or []:
+            group_id = str(raw_entry or "").strip()
+            if not group_id or group_id == "*":
+                continue
+            group_ids.add(group_id)
+        raw_groups = cfg.get("groups") or {}
+        if isinstance(raw_groups, dict):
+            for group_id in raw_groups:
+                normalized_group_id = str(group_id or "").strip()
+                if normalized_group_id and normalized_group_id != "*":
+                    group_ids.add(normalized_group_id)
+        for group_id in sorted(group_ids):
+            entries.append(
+                FeishuDirectoryEntry(
+                    id=group_id,
+                    name=group_id,
+                    type="group",
+                    source="config",
+                    account_id=account_id,
+                )
+            )
+        return entries
+
+    def _list_live_directory_entries_for_account(self, account_id: str, limit: int = 50) -> List[FeishuDirectoryEntry]:
+        """Enumerate users and chats from Feishu APIs for one account.
+
+        This is best-effort only. Failures must not break the directory refresh path,
+        so callers always merge these results with static config/session discovery.
+        """
+        from tools.feishu.client import feishu_api_request
+
+        entries: List[FeishuDirectoryEntry] = []
+        if limit <= 0:
+            return entries
+
+        try:
+            user_payload = feishu_api_request(
+                "GET",
+                "/open-apis/contact/v3/users",
+                params={"page_size": min(limit, 50), "user_id_type": "open_id"},
+                account_id=account_id,
+            )
+            for item in ((user_payload.get("data") or {}).get("items") or []):
+                if not isinstance(item, dict):
+                    continue
+                open_id = str(item.get("open_id", "") or "").strip()
+                if not open_id:
+                    continue
+                entries.append(
+                    FeishuDirectoryEntry(
+                        id=open_id,
+                        name=str(item.get("name", "") or open_id).strip() or open_id,
+                        type="dm",
+                        source="live",
+                        account_id=account_id,
+                    )
+                )
+        except Exception:
+            logger.debug("[Feishu] Failed to list live user directory for account %s", account_id, exc_info=True)
+
+        try:
+            chat_payload = feishu_api_request(
+                "GET",
+                "/open-apis/im/v1/chats",
+                params={"page_size": min(limit, 100)},
+                account_id=account_id,
+            )
+            for item in ((chat_payload.get("data") or {}).get("items") or []):
+                if not isinstance(item, dict):
+                    continue
+                chat_id = str(item.get("chat_id", "") or "").strip()
+                if not chat_id:
+                    continue
+                entries.append(
+                    FeishuDirectoryEntry(
+                        id=chat_id,
+                        name=str(item.get("name", "") or chat_id).strip() or chat_id,
+                        type="group",
+                        source="live",
+                        account_id=account_id,
+                    )
+                )
+        except Exception:
+            logger.debug("[Feishu] Failed to list live group directory for account %s", account_id, exc_info=True)
+
+        return entries
+
+    def build_channel_directory_entries(self, *, include_live: bool = True, limit_per_account: int = 50) -> List[Dict[str, str]]:
+        """Build Feishu directory entries for the shared gateway channel directory cache.
+
+        The cache currently stores plain chat IDs, so only the default account is exposed
+        for outbound name resolution. Multi-account routing still relies on session context,
+        and can be extended later without breaking the cached schema introduced here.
+        """
+        entries = self._list_config_directory_entries_for_account("default")
+        if include_live:
+            entries.extend(self._list_live_directory_entries_for_account("default", limit=limit_per_account))
+        return self._normalize_directory_entries(entries)
 
     def format_message(self, content: str) -> str:
         """Feishu text messages are plain text by default."""

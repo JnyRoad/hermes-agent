@@ -87,6 +87,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
+    CommandDef("feishu", "Unified Feishu chat command entrypoint", "Session",
+               gateway_only=True, args_hint="[start|auth|doctor|help]"),
     CommandDef("feishu-auth", "Manage Feishu user authorization status or request scopes", "Session",
                gateway_only=True, aliases=("feishu_auth",), args_hint="[status|revoke|scope|<tool> [action]]"),
     CommandDef("feishu-doctor", "Show Feishu integration diagnostics in chat", "Info",

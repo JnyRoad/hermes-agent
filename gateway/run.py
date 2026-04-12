@@ -2559,6 +2559,9 @@ class GatewayRunner:
         if canonical == "feishu-doctor":
             return await self._handle_feishu_doctor_command(event)
 
+        if canonical == "feishu":
+            return await self._handle_feishu_command(event)
+
         if canonical == "feishu-auth":
             return await self._handle_feishu_auth_command(event)
         
@@ -4131,6 +4134,81 @@ class GatewayRunner:
         else:
             lines.extend(["", "No actionable Feishu issues detected."])
         return "\n".join(lines)
+
+    async def _handle_feishu_command(self, event: MessageEvent) -> str:
+        """Handle `/feishu` unified subcommands inside Feishu chats."""
+        from gateway.config import Platform
+
+        if event.source.platform != Platform.FEISHU:
+            return "This command is only available inside a Feishu chat."
+
+        raw_args = event.get_command_args().strip()
+        try:
+            parts = shlex.split(raw_args) if raw_args else []
+        except ValueError as exc:
+            return f"Invalid command arguments: {exc}"
+
+        subcommand = parts[0].lower() if parts else "help"
+        remaining = " ".join(parts[1:]).strip()
+
+        if subcommand in {"help", ""}:
+            return (
+                "📘 **Feishu Commands**\n"
+                "- `/feishu start` — validate Feishu gateway readiness\n"
+                "- `/feishu doctor` — show Feishu diagnostics in chat\n"
+                "- `/feishu auth ...` — inspect or request Feishu user authorization\n"
+                "- `/feishu help` — show this help"
+            )
+
+        if subcommand == "doctor":
+            return await self._handle_feishu_doctor_command(event)
+
+        if subcommand in {"auth", "onboarding"}:
+            forwarded_event = MessageEvent(
+                text=f"/feishu-auth {remaining}".rstrip(),
+                source=event.source,
+                message_type=event.message_type,
+                raw_message=event.raw_message,
+                message_id=event.message_id,
+                timestamp=event.timestamp,
+            )
+            return await self._handle_feishu_auth_command(forwarded_event)
+
+        if subcommand == "start":
+            adapter = self.adapters.get(Platform.FEISHU)
+            if adapter is None:
+                return (
+                    "❌ **Feishu Start Check Failed**\n"
+                    "- Feishu adapter is not connected.\n"
+                    "- Enable the Feishu gateway platform and restart Hermes gateway."
+                )
+
+            from hermes_cli.doctor import collect_feishu_doctor_report
+
+            report = collect_feishu_doctor_report(
+                user_open_id=str(event.source.user_id or "").strip() or None,
+                adapter=adapter,
+                account_id=getattr(event.source, "account_id", None),
+            )
+            warn_or_fail = [item for item in report["items"] if item.get("status") in {"warn", "fail"}]
+            if warn_or_fail:
+                lines = ["⚠️ **Feishu Start Check Passed With Warnings**", ""]
+                for item in warn_or_fail:
+                    detail = str(item.get("detail", "") or "").strip()
+                    line = f"- {item.get('label', '')}"
+                    if detail:
+                        line += f": {detail}"
+                    lines.append(line)
+                if report["issues"]:
+                    lines.extend(["", "**Actionable Items**"])
+                    lines.extend(f"- {issue}" for issue in report["issues"])
+                return "\n".join(lines)
+            return "✅ **Feishu Start Check Passed**\n- Feishu gateway configuration looks healthy."
+
+        return (
+            "Usage: `/feishu [start|auth|doctor|help]`\n"
+            "Example: `/feishu auth feishu_calendar_event delete`"
+        )
 
     async def _handle_feishu_auth_command(self, event: MessageEvent) -> str:
         """Handle /feishu-auth - inspect or request Feishu user authorization."""

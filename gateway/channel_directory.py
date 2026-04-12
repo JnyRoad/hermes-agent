@@ -87,6 +87,8 @@ def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
                 platforms["discord"] = _build_discord(adapter)
             elif platform == Platform.SLACK:
                 platforms["slack"] = _build_slack(adapter)
+            elif platform == Platform.FEISHU:
+                platforms["feishu"] = _build_feishu(adapter)
         except Exception as e:
             logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
 
@@ -154,6 +156,28 @@ def _build_slack(adapter) -> List[Dict[str, str]]:
 
     # Fallback to session data
     return _build_from_sessions("slack")
+
+
+def _build_feishu(adapter) -> List[Dict[str, str]]:
+    """Use Feishu's native directory when available, then merge session discovery."""
+    entries: List[Dict[str, str]] = []
+    if hasattr(adapter, "build_channel_directory_entries"):
+        try:
+            native_entries = adapter.build_channel_directory_entries(include_live=True)
+            if isinstance(native_entries, list):
+                entries.extend(item for item in native_entries if isinstance(item, dict))
+        except Exception as exc:
+            logger.warning("Channel directory: failed to build native feishu directory: %s", exc)
+
+    session_entries = _build_from_sessions("feishu")
+    seen_ids = {str(item.get("id", "")).strip() for item in entries if str(item.get("id", "")).strip()}
+    for item in session_entries:
+        entry_id = str(item.get("id", "")).strip()
+        if not entry_id or entry_id in seen_ids:
+            continue
+        seen_ids.add(entry_id)
+        entries.append(item)
+    return entries
 
 
 def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:

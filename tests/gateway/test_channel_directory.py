@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
+from gateway.config import Platform
 from gateway.channel_directory import (
     build_channel_directory,
     resolve_channel_name,
@@ -65,6 +66,26 @@ class TestBuildChannelDirectoryWrites:
             result = load_directory()
 
         assert result == previous
+
+    def test_feishu_uses_native_directory_builder(self, tmp_path):
+        class _Adapter:
+            def build_channel_directory_entries(self, include_live=True):
+                assert include_live is True
+                return [
+                    {"id": "ou_live_1", "name": "Alice", "type": "dm", "source": "live"},
+                    {"id": "oc_chat_1", "name": "Hermes Group", "type": "group", "source": "live"},
+                ]
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}), patch(
+            "gateway.channel_directory.DIRECTORY_PATH",
+            tmp_path / "channel_directory.json",
+        ):
+            result = build_channel_directory({Platform.FEISHU: _Adapter()})
+
+        assert result["platforms"]["feishu"] == [
+            {"id": "ou_live_1", "name": "Alice", "type": "dm", "source": "live"},
+            {"id": "oc_chat_1", "name": "Hermes Group", "type": "group", "source": "live"},
+        ]
 
 
 class TestResolveChannelName:

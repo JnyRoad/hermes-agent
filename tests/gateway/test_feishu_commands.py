@@ -51,6 +51,74 @@ async def test_feishu_doctor_requires_feishu_platform():
 
 
 @pytest.mark.asyncio
+async def test_feishu_unified_help_lists_subcommands():
+    runner = _make_runner()
+    result = await runner._handle_feishu_command(_make_event("/feishu"))
+    assert "Feishu Commands" in result
+    assert "/feishu start" in result
+    assert "/feishu auth" in result
+
+
+@pytest.mark.asyncio
+async def test_feishu_unified_doctor_delegates(monkeypatch):
+    runner = _make_runner()
+    delegated = AsyncMock(return_value="doctor-result")
+    runner._handle_feishu_doctor_command = delegated
+
+    result = await runner._handle_feishu_command(_make_event("/feishu doctor"))
+
+    assert result == "doctor-result"
+    delegated.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_feishu_unified_auth_delegates(monkeypatch):
+    runner = _make_runner()
+    delegated = AsyncMock(return_value="auth-result")
+    runner._handle_feishu_auth_command = delegated
+
+    result = await runner._handle_feishu_command(_make_event("/feishu auth status"))
+
+    assert result == "auth-result"
+    delegated.assert_awaited_once()
+    forwarded_event = delegated.await_args.args[0]
+    assert forwarded_event.text == "/feishu-auth status"
+
+
+@pytest.mark.asyncio
+async def test_feishu_unified_start_reports_success(monkeypatch):
+    runner = _make_runner()
+    runner.adapters[Platform.FEISHU] = SimpleNamespace()
+    monkeypatch.setattr(
+        "hermes_cli.doctor.collect_feishu_doctor_report",
+        lambda **kwargs: {"items": [{"status": "ok", "label": "Feishu platform enabled", "detail": ""}], "issues": []},
+    )
+
+    result = await runner._handle_feishu_command(_make_event("/feishu start"))
+
+    assert "Feishu Start Check Passed" in result
+
+
+@pytest.mark.asyncio
+async def test_feishu_unified_start_surfaces_warnings(monkeypatch):
+    runner = _make_runner()
+    runner.adapters[Platform.FEISHU] = SimpleNamespace()
+    monkeypatch.setattr(
+        "hermes_cli.doctor.collect_feishu_doctor_report",
+        lambda **kwargs: {
+            "items": [{"status": "warn", "label": "App self-manage scope missing", "detail": "cannot query app scopes"}],
+            "issues": ["Grant application:application:self_manage"],
+        },
+    )
+
+    result = await runner._handle_feishu_command(_make_event("/feishu start"))
+
+    assert "Passed With Warnings" in result
+    assert "App self-manage scope missing" in result
+    assert "Grant application:application:self_manage" in result
+
+
+@pytest.mark.asyncio
 async def test_feishu_doctor_uses_shared_report(monkeypatch):
     runner = _make_runner()
     runner.adapters[Platform.FEISHU] = SimpleNamespace()
