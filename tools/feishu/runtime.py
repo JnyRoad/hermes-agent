@@ -18,6 +18,7 @@ def get_current_feishu_session() -> Dict[str, str]:
         "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME", "").strip(),
         "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "").strip(),
         "user_id": get_session_env("HERMES_SESSION_USER_ID", "").strip(),
+        "account_id": get_session_env("HERMES_SESSION_ACCOUNT_ID", "").strip(),
     }
 
 
@@ -37,13 +38,42 @@ def get_active_feishu_adapter() -> Any:
     return adapter
 
 
-def get_feishu_platform_extra() -> Dict[str, Any]:
-    """读取飞书平台配置。"""
+def get_current_feishu_account_id() -> str:
+    """读取当前飞书会话绑定的账号标识。"""
+    return get_session_env("HERMES_SESSION_ACCOUNT_ID", "").strip()
+
+
+def get_feishu_platform_extra(account_id: str | None = None) -> Dict[str, Any]:
+    """读取飞书平台配置，并在网关运行态优先返回账号级覆盖。"""
     config = load_gateway_config()
     platform_config = config.platforms.get(Platform.FEISHU)
-    if not platform_config:
-        return {}
-    return dict(platform_config.extra or {})
+    merged_extra = dict((platform_config.extra or {}) if platform_config else {})
+    resolved_account_id = str(account_id or get_current_feishu_account_id() or "").strip()
+    if not resolved_account_id:
+        return merged_extra
+    adapter = get_adapter(Platform.FEISHU)
+    if adapter is None:
+        return merged_extra
+    account = getattr(adapter, "_accounts", {}).get(resolved_account_id)
+    if account is None:
+        return merged_extra
+    merged_extra.update(
+        {
+            "app_id": str(getattr(account, "app_id", "") or "").strip(),
+            "app_secret": str(getattr(account, "app_secret", "") or "").strip(),
+            "domain": str(getattr(account, "domain_name", "") or "").strip(),
+            "connection_mode": str(getattr(account, "connection_mode", "") or "").strip(),
+            "encrypt_key": str(getattr(account, "encrypt_key", "") or "").strip(),
+            "verification_token": str(getattr(account, "verification_token", "") or "").strip(),
+            "bot_open_id": str(getattr(account, "bot_open_id", "") or "").strip(),
+            "bot_user_id": str(getattr(account, "bot_user_id", "") or "").strip(),
+            "bot_name": str(getattr(account, "bot_name", "") or "").strip(),
+            "webhook_path": str(getattr(account, "webhook_path", "") or "").strip(),
+            "webhook_host": str(getattr(account, "webhook_host", "") or "").strip(),
+            "webhook_port": getattr(account, "webhook_port", None),
+        }
+    )
+    return merged_extra
 
 
 def register_pending_feishu_tool_replay(
@@ -70,6 +100,7 @@ def register_pending_feishu_tool_replay(
         "chat_id": str(current_session.get("chat_id", "") or "").strip(),
         "thread_id": str(current_session.get("thread_id", "") or "").strip(),
         "user_id": str(current_session.get("user_id", "") or "").strip(),
+        "account_id": str(current_session.get("account_id", "") or "").strip(),
     }
     return replay_id
 

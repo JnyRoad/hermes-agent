@@ -358,6 +358,7 @@ class FeishuPendingOAuthRequest:
     title: str
     thread_id: str = ""
     requester_open_id: str = ""
+    account_id: str = ""
     tool_name: str = ""
     tool_action: str = "default"
     replay_id: str = ""
@@ -1911,6 +1912,7 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata = dict(metadata or {})
         thread_id = str(metadata.get("thread_id", "") or "").strip()
         requester_open_id = str(metadata.get("requester_open_id", "") or "").strip()
+        account_id = str(metadata.get("account_id", "") or "").strip()
         tool_name = str(metadata.get("tool_name", "") or "").strip()
         tool_action = str(metadata.get("action", "") or "").strip().lower() or "default"
         replay_id = str(metadata.get("replay_id", "") or "").strip()
@@ -1940,6 +1942,8 @@ class FeishuAdapter(BasePlatformAdapter):
             state.scopes = merged_scopes
             state.reason = merged_reason
             state.title = state.title or title
+            if account_id:
+                state.account_id = state.account_id or account_id
             if tool_name:
                 state.tool_name = state.tool_name or tool_name
             if tool_action:
@@ -1998,6 +2002,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     title=title,
                     thread_id=thread_id,
                     requester_open_id=requester_open_id,
+                    account_id=account_id,
                     tool_name=tool_name,
                     tool_action=tool_action,
                     replay_id=replay_id,
@@ -2449,6 +2454,7 @@ class FeishuAdapter(BasePlatformAdapter):
         file_type: str,
         comment_id: str,
         reply_id: Optional[str] = None,
+        account_id: Optional[str] = None,
     ) -> Optional[Dict[str, str]]:
         """读取评论线程上下文，构造更贴近文档评论场景的提示词。"""
         from tools.feishu.client import feishu_api_request
@@ -2459,6 +2465,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 "POST",
                 "/open-apis/drive/v1/metas/batch_query",
                 json_body={"request_docs": [{"doc_token": file_token, "doc_type": file_type}]},
+                account_id=account_id,
             )
             metas = (meta_payload.get("data") or {}).get("metas") or []
             if metas and isinstance(metas[0], dict):
@@ -2476,6 +2483,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 "GET",
                 f"/open-apis/drive/v1/files/{file_token}/comments",
                 params={"file_type": file_type, "page_size": 100},
+                account_id=account_id,
             )
         except Exception:
             logger.debug("[Feishu] Failed to list comments for %s", file_token, exc_info=True)
@@ -2520,6 +2528,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     "GET",
                     f"/open-apis/drive/v1/files/{file_token}/comments/{comment_id}/replies",
                     params={"file_type": file_type, "page_size": 100},
+                    account_id=account_id,
                 )
             except Exception:
                 logger.debug("[Feishu] Failed to list comment replies for %s", comment_id, exc_info=True)
@@ -2681,18 +2690,19 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Dropping duplicate comment event: %s", dedup_key)
             return
 
+        account_id = self._extract_event_account_id(data)
         context = await asyncio.to_thread(
             self._resolve_comment_event_context,
             file_token,
             file_type,
             comment_id,
             reply_id or None,
+            account_id,
         )
         if not context:
             logger.debug("[Feishu] Unable to resolve comment context for %s", comment_id)
             return
 
-        account_id = self._extract_event_account_id(data)
         sender_profile = await self._resolve_sender_profile(
             SimpleNamespace(open_id=sender_open_id, user_id=None),
             account_id=account_id,
@@ -2778,7 +2788,10 @@ class FeishuAdapter(BasePlatformAdapter):
         send_result = await self.send(
             state.chat_id,
             body,
-            metadata={"thread_id": state.thread_id or None},
+            metadata={
+                "thread_id": state.thread_id or None,
+                "account_id": state.account_id or None,
+            },
         )
         return bool(send_result.success)
 
@@ -4562,7 +4575,11 @@ class FeishuAdapter(BasePlatformAdapter):
                     text_payload = json.loads(payload).get("text", "")
                 except Exception:
                     text_payload = payload
-            return await self._send_comment_message(comment_target=comment_target, content=str(text_payload or ""))
+            return await self._send_comment_message(
+                comment_target=comment_target,
+                content=str(text_payload or ""),
+                metadata=metadata,
+            )
         reply_in_thread = bool((metadata or {}).get("thread_id"))
         if reply_to:
             body = self._build_reply_message_body(
@@ -4594,7 +4611,13 @@ class FeishuAdapter(BasePlatformAdapter):
             "comment_id": match.group(3),
         }
 
-    async def _send_comment_message(self, *, comment_target: Dict[str, str], content: str) -> Any:
+    async def _send_comment_message(
+        self,
+        *,
+        comment_target: Dict[str, str],
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
         """把最终回复发回飞书评论线程。
 
         先尝试回复评论线程；如果接口拒绝，再退回创建新的文档评论，保证用户能收到结果。
@@ -4610,6 +4633,7 @@ class FeishuAdapter(BasePlatformAdapter):
         file_token = comment_target["file_token"]
         file_type = comment_target["file_type"]
         comment_id = comment_target["comment_id"]
+        account_id = str((metadata or {}).get("account_id") or "").strip() or None
         plain_text = _strip_markdown_to_plain_text(normalized.replace("NO_REPLY", "").strip())
         if not plain_text:
             return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id=""))
@@ -4621,6 +4645,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 f"/open-apis/drive/v1/files/{file_token}/comments/{comment_id}/replies",
                 params={"file_type": file_type},
                 json_body={"content": {"elements": elements}},
+                account_id=account_id,
             )
         except Exception:
             await asyncio.to_thread(
@@ -4629,6 +4654,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 f"/open-apis/drive/v1/files/{file_token}/comments",
                 params={"file_type": file_type},
                 json_body={"reply_list": {"replies": [{"content": {"elements": elements}}]}},
+                account_id=account_id,
             )
         return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id=f"comment:{comment_id}"))
 

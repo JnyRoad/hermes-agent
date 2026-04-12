@@ -278,6 +278,7 @@ def ensure_authorization(
             title=title_text,
             metadata={
                 "thread_id": session.get("thread_id") or None,
+                "account_id": session.get("account_id") or None,
                 "requester_open_id": user_open_id,
                 "tool_name": tool_name,
                 "action": action_name,

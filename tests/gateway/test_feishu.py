@@ -3021,6 +3021,32 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_send_comment_target_routes_by_account_metadata(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("tools.feishu.client.feishu_api_request", return_value={"data": {}}) as api_request, patch(
+            "gateway.platforms.feishu.asyncio.to_thread",
+            side_effect=_direct,
+        ):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="feishu-comment://docx/doc_token/comment_123",
+                    content="请按评论内容处理",
+                    metadata={"account_id": "feishu-cn"},
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(api_request.call_args.kwargs["account_id"], "feishu-cn")
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_comment_target_respects_no_reply_marker(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -3173,6 +3199,26 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(context["document_title"], "")
         self.assertIn("docx document doc_token", context["prompt"])
         self.assertIn("comment_id: comment_123", context["prompt"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_resolve_comment_event_context_uses_account_aware_requests(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Project Spec"}]}},
+            {"data": {"items": []}},
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses) as api_request:
+            FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+                account_id="feishu-cn",
+            )
+
+        for call in api_request.call_args_list:
+            self.assertEqual(call.kwargs["account_id"], "feishu-cn")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_stream_consumer_config_respects_feishu_block_streaming_settings(self):

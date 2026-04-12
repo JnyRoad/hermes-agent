@@ -11,6 +11,20 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import SendResult
 
 
+def test_feishu_runtime_session_exposes_account_id(monkeypatch):
+    from tools.feishu.runtime import get_current_feishu_session
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "oc_chat")
+    monkeypatch.setenv("HERMES_SESSION_ACCOUNT_ID", "feishu-cn")
+
+    session = get_current_feishu_session()
+
+    assert session["platform"] == "feishu"
+    assert session["chat_id"] == "oc_chat"
+    assert session["account_id"] == "feishu-cn"
+
+
 def test_feishu_toolset_is_included_in_hermes_feishu():
     from toolsets import TOOLSETS, resolve_toolset
 

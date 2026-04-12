@@ -44,21 +44,21 @@ def _extract_scopes_from_message(message: str) -> List[str]:
     return [item.strip() for item in match.group(1).split(",") if item.strip()]
 
 
-def _feishu_domain_name() -> str:
-    extra = get_feishu_platform_extra()
+def _feishu_domain_name(account_id: Optional[str] = None) -> str:
+    extra = get_feishu_platform_extra(account_id=account_id)
     return str(extra.get("domain", "feishu")).strip().lower() or "feishu"
 
 
-def get_feishu_base_url() -> str:
+def get_feishu_base_url(account_id: Optional[str] = None) -> str:
     """根据配置返回飞书开放平台基地址。"""
-    if _feishu_domain_name() == "lark":
+    if _feishu_domain_name(account_id=account_id) == "lark":
         return "https://open.larksuite.com"
     return "https://open.feishu.cn"
 
 
-def get_feishu_credentials() -> tuple[str, str]:
+def get_feishu_credentials(account_id: Optional[str] = None) -> tuple[str, str]:
     """读取 app_id / app_secret。"""
-    extra = get_feishu_platform_extra()
+    extra = get_feishu_platform_extra(account_id=account_id)
     app_id = str(extra.get("app_id", "")).strip()
     app_secret = str(extra.get("app_secret", "")).strip()
     if not app_id or not app_secret:
@@ -66,21 +66,21 @@ def get_feishu_credentials() -> tuple[str, str]:
     return app_id, app_secret
 
 
-def _cache_key() -> str:
-    app_id, _ = get_feishu_credentials()
-    return f"{_feishu_domain_name()}:{app_id}"
+def _cache_key(account_id: Optional[str] = None) -> str:
+    app_id, _ = get_feishu_credentials(account_id=account_id)
+    return f"{_feishu_domain_name(account_id=account_id)}:{app_id}"
 
 
-def get_tenant_access_token(force_refresh: bool = False) -> str:
+def get_tenant_access_token(force_refresh: bool = False, account_id: Optional[str] = None) -> str:
     """获取并缓存 tenant_access_token。"""
-    key = _cache_key()
+    key = _cache_key(account_id=account_id)
     now = time.time()
     cached = _TOKEN_CACHE.get(key)
     if cached and not force_refresh and cached[1] > now + 30:
         return cached[0]
 
-    app_id, app_secret = get_feishu_credentials()
-    url = f"{get_feishu_base_url()}/open-apis/auth/v3/tenant_access_token/internal"
+    app_id, app_secret = get_feishu_credentials(account_id=account_id)
+    url = f"{get_feishu_base_url(account_id=account_id)}/open-apis/auth/v3/tenant_access_token/internal"
     response = httpx.post(
         url,
         json={"app_id": app_id, "app_secret": app_secret},
@@ -105,10 +105,11 @@ def feishu_api_request(
     params: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
     user_access_token: Optional[str] = None,
+    account_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """调用飞书开放平台 API 并返回 JSON。"""
-    token = user_access_token or get_tenant_access_token()
-    url = f"{get_feishu_base_url()}{path}"
+    token = user_access_token or get_tenant_access_token(account_id=account_id)
+    url = f"{get_feishu_base_url(account_id=account_id)}{path}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=utf-8",
@@ -140,10 +141,11 @@ def feishu_api_request_bytes(
     *,
     params: Optional[Dict[str, Any]] = None,
     user_access_token: Optional[str] = None,
+    account_id: Optional[str] = None,
 ) -> Tuple[bytes, Dict[str, str]]:
     """调用返回二进制内容的飞书 API。"""
-    token = user_access_token or get_tenant_access_token()
-    url = f"{get_feishu_base_url()}{path}"
+    token = user_access_token or get_tenant_access_token(account_id=account_id)
+    url = f"{get_feishu_base_url(account_id=account_id)}{path}"
     headers = {
         "Authorization": f"Bearer {token}",
     }
@@ -163,32 +165,34 @@ def feishu_json(result: Dict[str, Any]) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-def get_app_granted_scopes(force_refresh: bool = False) -> List[str]:
+def get_app_granted_scopes(force_refresh: bool = False, account_id: Optional[str] = None) -> List[str]:
     """查询当前飞书应用已开通的权限列表。
 
     依赖 `application:application:self_manage`。如果应用未开通该权限，飞书会返回 99991672。
     """
-    return get_app_granted_scopes_by_token_type(token_type=None, force_refresh=force_refresh)
+    return get_app_granted_scopes_by_token_type(token_type=None, force_refresh=force_refresh, account_id=account_id)
 
 
 def get_app_granted_scopes_by_token_type(
     token_type: Optional[str] = None,
     *,
     force_refresh: bool = False,
+    account_id: Optional[str] = None,
 ) -> List[str]:
     """按 token 类型查询当前飞书应用已开通的权限列表。"""
-    key = _cache_key()
+    key = _cache_key(account_id=account_id)
     now = time.time()
     cached = _APP_SCOPE_CACHE.get(key)
     if cached and not force_refresh and cached[1] > now + 30:
         raw_scopes = list(cached[0].get("scopes") or [])
         return _filter_scopes_by_token_type(raw_scopes, token_type)
 
-    app_id, _ = get_feishu_credentials()
+    app_id, _ = get_feishu_credentials(account_id=account_id)
     data = feishu_api_request(
         "GET",
         f"/open-apis/application/v6/applications/{app_id}",
         params={"lang": "zh_cn"},
+        account_id=account_id,
     )
     app = data.get("data", {}).get("app", {}) if isinstance(data.get("data"), dict) else {}
     raw_scopes = [
@@ -219,13 +223,13 @@ def _filter_scopes_by_token_type(raw_scopes: List[Dict[str, Any]], token_type: O
     return result
 
 
-def get_app_info(force_refresh: bool = False) -> Dict[str, Any]:
+def get_app_info(force_refresh: bool = False, account_id: Optional[str] = None) -> Dict[str, Any]:
     """读取飞书应用信息，并给出统一的 owner 判定结果。"""
-    key = _cache_key()
+    key = _cache_key(account_id=account_id)
     now = time.time()
     cached = _APP_SCOPE_CACHE.get(key)
     if not cached or force_refresh or cached[1] <= now + 30:
-        get_app_granted_scopes_by_token_type(force_refresh=force_refresh)
+        get_app_granted_scopes_by_token_type(force_refresh=force_refresh, account_id=account_id)
         cached = _APP_SCOPE_CACHE.get(key)
     payload = dict((cached or ({}, 0))[0] or {})
     app = dict(payload.get("app") or {})
