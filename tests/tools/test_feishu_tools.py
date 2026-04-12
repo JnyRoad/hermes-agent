@@ -2852,6 +2852,35 @@ def test_feishu_doc_build_native_blocks_supports_ordered_and_inline_code():
     assert ordered_block["ordered"]["elements"][0]["text_run"]["text_element_style"] == {"inline_code": True}
 
 
+def test_feishu_doc_build_text_elements_preserves_links():
+    from tools.feishu.docs import _build_text_elements
+
+    elements = _build_text_elements("See [Spec](https://example.com/spec) now")
+
+    assert elements[0]["text_run"]["content"] == "See "
+    assert elements[1]["text_run"]["content"] == "Spec"
+    assert elements[1]["text_run"]["text_element_style"] == {"link": {"url": "https://example.com/spec"}}
+    assert elements[2]["text_run"]["content"] == " now"
+
+
+def test_feishu_doc_build_native_blocks_preserves_nested_list_indent():
+    from tools.feishu.docs import _build_native_doc_block
+
+    nested_block = _build_native_doc_block(
+        {
+            "kind": "list",
+            "ordered": False,
+            "indent": 2,
+            "source_text": "Nested item",
+            "text": "Nested item",
+        }
+    )
+
+    assert nested_block["block_type"] == 12
+    assert nested_block["bullet"]["elements"][0]["text_run"]["content"] == "    "
+    assert nested_block["bullet"]["elements"][1]["text_run"]["content"] == "Nested item"
+
+
 def test_feishu_doc_build_native_blocks_downgrades_table_to_markdown_code():
     from tools.feishu.docs import _build_native_doc_block
 

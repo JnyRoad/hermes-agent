@@ -223,8 +223,8 @@ def _strip_inline_markdown(text: str) -> str:
 
 
 def _normalize_inline_markdown_source(text: str) -> str:
-    """Normalize Markdown source while preserving inline emphasis markers for text runs."""
-    return _MD_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2)})", str(text or "")).strip()
+    """Normalize Markdown source while preserving inline constructs for text-run conversion."""
+    return str(text or "").strip()
 
 
 def _parse_text_run_style(token: str) -> tuple[str, Dict[str, Any]]:
@@ -252,22 +252,53 @@ def _build_text_elements(text: str) -> List[Dict[str, Any]]:
 
     elements: List[Dict[str, Any]] = []
     cursor = 0
-    for match in _MD_INLINE_TOKEN_RE.finditer(normalized):
+    while cursor < len(normalized):
+        link_match = _MD_LINK_RE.search(normalized, cursor)
+        style_match = _MD_INLINE_TOKEN_RE.search(normalized, cursor)
+        match = None
+        token_kind = ""
+        if link_match and style_match:
+            if link_match.start() <= style_match.start():
+                match = link_match
+                token_kind = "link"
+            else:
+                match = style_match
+                token_kind = "style"
+        elif link_match:
+            match = link_match
+            token_kind = "link"
+        elif style_match:
+            match = style_match
+            token_kind = "style"
+
+        if match is None:
+            tail = normalized[cursor:]
+            if tail:
+                elements.append({"text_run": {"content": tail}})
+            break
+
         if match.start() > cursor:
             plain = normalized[cursor:match.start()]
             if plain:
                 elements.append({"text_run": {"content": plain}})
-        content, style = _parse_text_run_style(match.group(0))
-        if content:
-            text_run: Dict[str, Any] = {"content": content}
-            if style:
-                text_run["text_element_style"] = style
-            elements.append({"text_run": text_run})
+
+        if token_kind == "link":
+            label = str(match.group(1) or "")
+            url = str(match.group(2) or "").strip()
+            if label:
+                link_style: Dict[str, Any] = {"link": {"url": url}} if url else {}
+                text_run: Dict[str, Any] = {"content": label}
+                if link_style:
+                    text_run["text_element_style"] = link_style
+                elements.append({"text_run": text_run})
+        else:
+            content, style = _parse_text_run_style(match.group(0))
+            if content:
+                text_run = {"content": content}
+                if style:
+                    text_run["text_element_style"] = style
+                elements.append({"text_run": text_run})
         cursor = match.end()
-    if cursor < len(normalized):
-        tail = normalized[cursor:]
-        if tail:
-            elements.append({"text_run": {"content": tail}})
     return elements or [{"text_run": {"content": " "}}]
 
 
@@ -461,6 +492,12 @@ def _build_native_doc_block(block: Dict[str, Any]) -> Dict[str, Any]:
         return {"block_type": 2 + level, key: text_payload}
     if kind == "list":
         key = "ordered" if block.get("ordered") else "bullet"
+        indent = max(int(block.get("indent") or 0), 0)
+        if indent > 0:
+            text_payload = {
+                **text_payload,
+                "elements": [{"text_run": {"content": "  " * indent}}] + list(text_payload["elements"]),
+            }
         return {"block_type": 13 if block.get("ordered") else 12, key: text_payload}
     if kind == "quote":
         return {"block_type": 15, "quote": text_payload}
