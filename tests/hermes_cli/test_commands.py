@@ -102,6 +102,9 @@ class TestResolveCommand:
         assert resolve_command("gateway").name == "platforms"
         assert resolve_command("set-home").name == "sethome"
         assert resolve_command("reload_mcp").name == "reload-mcp"
+        assert resolve_command("feishu_auth").name == "feishu-auth"
+        assert resolve_command("feishu_doctor").name == "feishu-doctor"
+        assert resolve_command("feishu_diagnose").name == "feishu-doctor"
 
     def test_leading_slash_stripped(self):
         assert resolve_command("/help").name == "help"
@@ -198,6 +201,12 @@ class TestGatewayHelpLines:
         bg_line = [l for l in lines if "/background" in l]
         assert len(bg_line) == 1
         assert "/bg" in bg_line[0]
+
+    def test_includes_feishu_gateway_commands(self):
+        lines = gateway_help_lines()
+        joined = "\n".join(lines)
+        assert "`/feishu-auth [status|revoke|scope|<tool> [action]]`" in joined
+        assert "`/feishu-doctor`" in joined
 
 
 class TestTelegramBotCommands:

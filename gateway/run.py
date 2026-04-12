@@ -2533,6 +2533,12 @@ class GatewayRunner:
 
         if canonical == "commands":
             return await self._handle_commands_command(event)
+
+        if canonical == "feishu-doctor":
+            return await self._handle_feishu_doctor_command(event)
+
+        if canonical == "feishu-auth":
+            return await self._handle_feishu_auth_command(event)
         
         if canonical == "profile":
             return await self._handle_profile_command(event)
@@ -4068,6 +4074,162 @@ class GatewayRunner:
         if page != requested_page:
             lines.append(f"_(Requested page {requested_page} was out of range, showing page {page}.)_")
         return "\n".join(lines)
+
+    async def _handle_feishu_doctor_command(self, event: MessageEvent) -> str:
+        """Handle /feishu-doctor - show Feishu integration diagnostics in chat."""
+        from gateway.config import Platform
+
+        if event.source.platform != Platform.FEISHU:
+            return "This command is only available inside a Feishu chat."
+
+        adapter = self.adapters.get(Platform.FEISHU)
+        if adapter is None:
+            return "Feishu adapter is not connected."
+
+        from hermes_cli.doctor import collect_feishu_doctor_report
+
+        report = collect_feishu_doctor_report(
+            user_open_id=str(event.source.user_id or "").strip() or None,
+            adapter=adapter,
+        )
+        marker_map = {"ok": "✓", "warn": "⚠", "fail": "✗", "info": "→"}
+        lines = ["🩺 **Feishu Doctor**", ""]
+        for item in report["items"]:
+            marker = marker_map.get(item.get("status", "info"), "•")
+            line = f"{marker} {item.get('label', '')}"
+            detail = str(item.get("detail", "") or "").strip()
+            if detail:
+                line += f" — {detail}"
+            lines.append(line)
+        if report["issues"]:
+            lines.extend(["", "**Actionable Items**"])
+            for issue in report["issues"]:
+                lines.append(f"- {issue}")
+        else:
+            lines.extend(["", "No actionable Feishu issues detected."])
+        return "\n".join(lines)
+
+    async def _handle_feishu_auth_command(self, event: MessageEvent) -> str:
+        """Handle /feishu-auth - inspect or request Feishu user authorization."""
+        from gateway.config import Platform
+        from tools.feishu.scopes import get_required_scopes, split_sensitive_scopes
+
+        if event.source.platform != Platform.FEISHU:
+            return "This command is only available inside a Feishu chat."
+
+        adapter = self.adapters.get(Platform.FEISHU)
+        if adapter is None:
+            return "Feishu adapter is not connected."
+
+        user_open_id = str(event.source.user_id or "").strip()
+        if not user_open_id:
+            return "Current Feishu user ID is unavailable."
+
+        raw_args = event.get_command_args().strip()
+        try:
+            parts = shlex.split(raw_args) if raw_args else []
+        except ValueError as exc:
+            return f"Invalid command arguments: {exc}"
+
+        def _parse_scope_tokens(tokens: list[str]) -> list[str]:
+            scopes: list[str] = []
+            for token in tokens:
+                for item in token.split(","):
+                    scope = str(item or "").strip()
+                    if scope:
+                        scopes.append(scope)
+            return adapter._normalize_scope_list(scopes)
+
+        subcommand = parts[0].lower() if parts else "status"
+        payload_args = parts[1:] if parts else []
+        metadata = getattr(event, "metadata", None)
+        thread_id = str(metadata.get("thread_id", "") if isinstance(metadata, dict) else "").strip()
+
+        if subcommand == "status":
+            scopes = _parse_scope_tokens(payload_args)
+            status = adapter.get_authorization_status(user_open_id, scopes or None)
+            lines = [
+                "🔐 **Feishu Authorization Status**",
+                f"- Authorized: {'yes' if status.get('authorized') else 'no'}",
+                f"- Granted scopes: {len(status.get('granted_scopes') or [])}",
+            ]
+            requested = list(status.get("requested_scopes") or [])
+            missing = list(status.get("missing_scopes") or [])
+            granted = list(status.get("granted_scopes") or [])
+            if requested:
+                lines.append(f"- Requested scopes: {', '.join(requested)}")
+            if missing:
+                lines.append(f"- Missing scopes: {', '.join(missing)}")
+            if granted:
+                lines.append(f"- Granted preview: {', '.join(granted[:8])}")
+            return "\n".join(lines)
+
+        if subcommand == "revoke":
+            scopes = _parse_scope_tokens(payload_args)
+            status = adapter.revoke_authorization(user_open_id, scopes or None)
+            target = ", ".join(scopes) if scopes else "all local Feishu scopes"
+            return (
+                "🗑 **Feishu authorization revoked**\n"
+                f"- Target: {target}\n"
+                f"- Remaining scopes: {len(status.get('granted_scopes') or [])}"
+            )
+
+        if subcommand == "scope":
+            scopes = _parse_scope_tokens(payload_args)
+            if not scopes:
+                return "Usage: `/feishu-auth scope <scope1,scope2,...>`"
+            safe_scopes, sensitive_scopes = split_sensitive_scopes(scopes)
+            result = await adapter.send_oauth_request_card(
+                chat_id=event.source.chat_id,
+                scopes=scopes,
+                reason="Manual Feishu authorization request from chat command.",
+                title="Feishu Authorization Required",
+                metadata={
+                    "thread_id": thread_id,
+                    "requester_open_id": user_open_id,
+                    "tool_name": "feishu_oauth",
+                    "action": "authorize",
+                },
+            )
+            if not result.success:
+                return f"Failed to create Feishu authorization request: {result.error}"
+            return (
+                "🔐 **Feishu authorization requested**\n"
+                f"- Safe scopes: {', '.join(safe_scopes) if safe_scopes else 'none'}\n"
+                f"- Sensitive scopes: {', '.join(sensitive_scopes) if sensitive_scopes else 'none'}"
+            )
+
+        tool_name = subcommand
+        action_name = payload_args[0].lower() if payload_args else "default"
+        scopes = get_required_scopes(tool_name, action_name)
+        if not scopes:
+            return (
+                "Usage: `/feishu-auth [status|revoke|scope|<tool_name> [action]]`\n"
+                "Example: `/feishu-auth feishu_calendar_event delete`"
+            )
+
+        safe_scopes, sensitive_scopes = split_sensitive_scopes(scopes)
+        result = await adapter.send_oauth_request_card(
+            chat_id=event.source.chat_id,
+            scopes=scopes,
+            reason=f"Manual authorization requested for `{tool_name}` action `{action_name}`.",
+            title="Feishu Authorization Required",
+            metadata={
+                "thread_id": thread_id,
+                "requester_open_id": user_open_id,
+                "tool_name": tool_name,
+                "action": action_name,
+            },
+        )
+        if not result.success:
+            return f"Failed to create Feishu authorization request: {result.error}"
+        return (
+            "🔐 **Feishu authorization requested**\n"
+            f"- Tool: `{tool_name}`\n"
+            f"- Action: `{action_name}`\n"
+            f"- Safe scopes: {', '.join(safe_scopes) if safe_scopes else 'none'}\n"
+            f"- Sensitive scopes: {', '.join(sensitive_scopes) if sensitive_scopes else 'none'}"
+        )
     
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.

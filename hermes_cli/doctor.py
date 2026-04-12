@@ -158,39 +158,42 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
         check_warn("Could not verify systemd linger", f"({linger_detail})")
 
 
-def _check_feishu_integration(issues: list[str]) -> None:
-    """检查飞书集成的关键配置是否完整。"""
-    print()
-    print(color("◆ Feishu Integration", Colors.CYAN, Colors.BOLD))
+def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=None) -> dict:
+    """汇总飞书集成诊断结果，供 CLI doctor 与网关命令复用。"""
+    items: list[dict[str, str]] = []
+    issues: list[str] = []
+
+    def _record(status: str, label: str, detail: str = "") -> None:
+        items.append({"status": status, "label": label, "detail": detail})
 
     try:
         from gateway.config import Platform, load_gateway_config
     except Exception as exc:
-        check_warn("Feishu doctor checks unavailable", f"(could not import gateway config: {exc})")
-        return
+        _record("warn", "Feishu doctor checks unavailable", f"could not import gateway config: {exc}")
+        return {"items": items, "issues": issues}
 
     try:
         gateway_config = load_gateway_config()
     except Exception as exc:
-        check_warn("Failed to load gateway config", f"({exc})")
+        _record("warn", "Failed to load gateway config", str(exc))
         issues.append("Fix gateway config loading before validating Feishu integration")
-        return
+        return {"items": items, "issues": issues}
 
     feishu_config = gateway_config.platforms.get(Platform.FEISHU)
     env_has_feishu = bool(os.getenv("FEISHU_APP_ID") or os.getenv("FEISHU_APP_SECRET"))
     if not feishu_config and not env_has_feishu:
-        check_warn("Feishu integration not configured", "(optional)")
-        return
+        _record("warn", "Feishu integration not configured", "optional")
+        return {"items": items, "issues": issues}
 
     if not feishu_config:
-        check_fail("Feishu platform config missing", "(env hints exist but platform was not initialized)")
+        _record("fail", "Feishu platform config missing", "env hints exist but platform was not initialized")
         issues.append("Ensure FEISHU_APP_ID and FEISHU_APP_SECRET are configured correctly")
-        return
+        return {"items": items, "issues": issues}
 
     if feishu_config.enabled:
-        check_ok("Feishu platform enabled")
+        _record("ok", "Feishu platform enabled")
     else:
-        check_warn("Feishu platform disabled", "(config present but not enabled)")
+        _record("warn", "Feishu platform disabled", "config present but not enabled")
 
     app_id = str(feishu_config.extra.get("app_id", "")).strip()
     app_secret = str(feishu_config.extra.get("app_secret", "")).strip()
@@ -198,84 +201,111 @@ def _check_feishu_integration(issues: list[str]) -> None:
     domain = str(feishu_config.extra.get("domain", "feishu")).strip().lower() or "feishu"
 
     if app_id:
-        check_ok("FEISHU_APP_ID configured")
+        _record("ok", "FEISHU_APP_ID configured")
     else:
-        check_fail("FEISHU_APP_ID missing")
+        _record("fail", "FEISHU_APP_ID missing")
         issues.append("Set FEISHU_APP_ID for Feishu integration")
 
     if app_secret:
-        check_ok("FEISHU_APP_SECRET configured")
+        _record("ok", "FEISHU_APP_SECRET configured")
     else:
-        check_fail("FEISHU_APP_SECRET missing")
+        _record("fail", "FEISHU_APP_SECRET missing")
         issues.append("Set FEISHU_APP_SECRET for Feishu integration")
 
     if connection_mode in {"websocket", "webhook"}:
-        check_ok(f"Connection mode: {connection_mode}")
+        _record("ok", f"Connection mode: {connection_mode}")
     else:
-        check_warn(f"Unknown connection mode: {connection_mode}", "(expected websocket or webhook)")
+        _record("warn", f"Unknown connection mode: {connection_mode}", "expected websocket or webhook")
         issues.append("Set gateway.feishu.extra.connection_mode to websocket or webhook")
 
     if domain in {"feishu", "lark"}:
-        check_ok(f"Feishu domain: {domain}")
+        _record("ok", f"Feishu domain: {domain}")
     else:
-        check_warn(f"Unknown Feishu domain: {domain}", "(expected feishu or lark)")
+        _record("warn", f"Unknown Feishu domain: {domain}", "expected feishu or lark")
 
     if connection_mode == "webhook":
         verification_token = str(feishu_config.extra.get("verification_token", "")).strip()
         encrypt_key = str(feishu_config.extra.get("encrypt_key", "")).strip()
         if verification_token:
-            check_ok("FEISHU_VERIFICATION_TOKEN configured")
+            _record("ok", "FEISHU_VERIFICATION_TOKEN configured")
         else:
-            check_warn("FEISHU_VERIFICATION_TOKEN missing", "(recommended for webhook verification)")
+            _record("warn", "FEISHU_VERIFICATION_TOKEN missing", "recommended for webhook verification")
             issues.append("Set FEISHU_VERIFICATION_TOKEN when using Feishu webhook mode")
         if encrypt_key:
-            check_ok("FEISHU_ENCRYPT_KEY configured")
+            _record("ok", "FEISHU_ENCRYPT_KEY configured")
         else:
-            check_warn("FEISHU_ENCRYPT_KEY missing", "(recommended when event encryption is enabled)")
+            _record("warn", "FEISHU_ENCRYPT_KEY missing", "recommended when event encryption is enabled")
     else:
-        check_info("Webhook-only checks skipped in websocket mode")
+        _record("info", "Webhook-only checks skipped in websocket mode")
 
     if feishu_config.home_channel and feishu_config.home_channel.chat_id:
-        check_ok("Feishu home channel configured")
+        _record("ok", "Feishu home channel configured")
     else:
-        check_info("Feishu home channel not set")
+        _record("info", "Feishu home channel not set")
 
     if gateway_config.get_unauthorized_dm_behavior(Platform.FEISHU) == "pair":
-        check_ok("Unauthorized DM behavior: pair")
+        _record("ok", "Unauthorized DM behavior: pair")
     else:
-        check_warn("Unauthorized DM behavior: ignore", "(users must be allowed elsewhere)")
+        _record("warn", "Unauthorized DM behavior: ignore", "users must be allowed elsewhere")
 
     try:
         import lark_oapi  # noqa: F401
 
-        check_ok("lark-oapi SDK")
+        _record("ok", "lark-oapi SDK")
     except ImportError:
-        check_warn("lark-oapi SDK not installed", "(Feishu runtime adapter will be unavailable)")
+        _record("warn", "lark-oapi SDK not installed", "Feishu runtime adapter will be unavailable")
         issues.append(f"Install lark-oapi: {_python_install_cmd()} lark-oapi")
-        return
+        return {"items": items, "issues": issues}
 
     try:
-        from tools.feishu.client import FeishuAPIError, get_app_granted_scopes
+        from tools.feishu.client import get_app_granted_scopes
 
         granted_scopes = get_app_granted_scopes()
-        check_ok(f"Feishu app scopes: {len(granted_scopes)} granted")
+        _record("ok", f"Feishu app scopes: {len(granted_scopes)} granted")
         if "application:application:self_manage" in granted_scopes:
-            check_ok("App self-manage scope available")
+            _record("ok", "App self-manage scope available")
         else:
-            check_warn(
-                "App self-manage scope missing",
-                "(cannot reliably query current Feishu app permissions)",
-            )
+            _record("warn", "App self-manage scope missing", "cannot reliably query current Feishu app permissions")
             issues.append("Grant application:application:self_manage to improve Feishu scope diagnostics")
     except Exception as exc:
         if isinstance(exc, Exception) and exc.__class__.__name__ == "FeishuAPIError" and getattr(exc, "code", None) == 99991672:
-            check_warn(
-                "Unable to query Feishu app scopes",
-                "(application:application:self_manage is missing)",
-            )
+            _record("warn", "Unable to query Feishu app scopes", "application:application:self_manage is missing")
             issues.append("Grant application:application:self_manage so Hermes can inspect Feishu app permissions")
         else:
-            check_warn("Feishu app scope check failed", f"({exc})")
+            _record("warn", "Feishu app scope check failed", str(exc))
+
+    if adapter is not None and user_open_id:
+        try:
+            auth_status = adapter.get_authorization_status(user_open_id)
+            granted_scopes = list(auth_status.get("granted_scopes") or [])
+            if granted_scopes:
+                preview = ", ".join(granted_scopes[:5])
+                _record("ok", f"Current user authorization: {len(granted_scopes)} granted", preview)
+            else:
+                _record("info", "Current user authorization not granted yet")
+        except Exception as exc:
+            _record("warn", "Current user authorization status unavailable", str(exc))
+
+    return {"items": items, "issues": issues}
+
+
+def _check_feishu_integration(issues: list[str]) -> None:
+    """检查飞书集成的关键配置是否完整。"""
+    print()
+    print(color("◆ Feishu Integration", Colors.CYAN, Colors.BOLD))
+    report = collect_feishu_doctor_report()
+    for item in report["items"]:
+        detail = item.get("detail", "")
+        wrapped_detail = f"({detail})" if detail else ""
+        if item.get("status") == "ok":
+            check_ok(item.get("label", ""), wrapped_detail)
+        elif item.get("status") == "fail":
+            check_fail(item.get("label", ""), wrapped_detail)
+        elif item.get("status") == "info":
+            check_info(item.get("label", "") if not wrapped_detail else f"{item.get('label', '')} {wrapped_detail}")
+        else:
+            check_warn(item.get("label", ""), wrapped_detail)
+    issues.extend(report["issues"])
 
 
 def run_doctor(args):
