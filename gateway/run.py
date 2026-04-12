@@ -7437,19 +7437,49 @@ class GatewayRunner:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                     _adapter = self.adapters.get(source.platform)
                     if _adapter:
-                        _consumer_cfg = StreamConsumerConfig(
-                            edit_interval=_scfg.edit_interval,
-                            buffer_threshold=_scfg.buffer_threshold,
-                            cursor=_scfg.cursor,
-                        )
-                        _stream_consumer = GatewayStreamConsumer(
-                            adapter=_adapter,
-                            chat_id=source.chat_id,
-                            config=_consumer_cfg,
-                            metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
-                        )
-                        _stream_delta_cb = _stream_consumer.on_delta
-                        stream_consumer_holder[0] = _stream_consumer
+                        _adapter_stream_cfg = None
+                        if hasattr(_adapter, "get_stream_consumer_config"):
+                            try:
+                                _adapter_stream_cfg = _adapter.get_stream_consumer_config(
+                                    default_edit_interval=_scfg.edit_interval,
+                                    default_buffer_threshold=_scfg.buffer_threshold,
+                                    default_cursor=_scfg.cursor,
+                                )
+                            except Exception as _adapter_cfg_err:
+                                logger.debug("Could not load adapter stream config: %s", _adapter_cfg_err)
+                        if isinstance(_adapter_stream_cfg, dict) and not _adapter_stream_cfg.get("enabled", True):
+                            _adapter_stream_cfg = None
+                            _stream_consumer = None
+                            _stream_delta_cb = None
+                            stream_consumer_holder[0] = None
+                        elif isinstance(_adapter_stream_cfg, dict):
+                            _consumer_cfg = StreamConsumerConfig(
+                                edit_interval=float(_adapter_stream_cfg.get("edit_interval", _scfg.edit_interval)),
+                                buffer_threshold=int(_adapter_stream_cfg.get("buffer_threshold", _scfg.buffer_threshold)),
+                                cursor=str(_adapter_stream_cfg.get("cursor", _scfg.cursor)),
+                            )
+                            _stream_consumer = GatewayStreamConsumer(
+                                adapter=_adapter,
+                                chat_id=source.chat_id,
+                                config=_consumer_cfg,
+                                metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
+                            )
+                            _stream_delta_cb = _stream_consumer.on_delta
+                            stream_consumer_holder[0] = _stream_consumer
+                        else:
+                            _consumer_cfg = StreamConsumerConfig(
+                                edit_interval=_scfg.edit_interval,
+                                buffer_threshold=_scfg.buffer_threshold,
+                                cursor=_scfg.cursor,
+                            )
+                            _stream_consumer = GatewayStreamConsumer(
+                                adapter=_adapter,
+                                chat_id=source.chat_id,
+                                config=_consumer_cfg,
+                                metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
+                            )
+                            _stream_delta_cb = _stream_consumer.on_delta
+                            stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 

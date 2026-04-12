@@ -3858,6 +3858,31 @@ class FeishuAdapter(BasePlatformAdapter):
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
 
+    def get_stream_consumer_config(
+        self,
+        *,
+        default_edit_interval: float,
+        default_buffer_threshold: int,
+        default_cursor: str,
+    ) -> Dict[str, Any]:
+        """返回飞书平台定制的流式消费者配置。
+
+        这里先把已存在但未生效的飞书配置真正接入网关主链路：
+        - streaming=false 时关闭流式消费者
+        - block_streaming=true 时用飞书自己的 coalesce 时间覆盖默认编辑节流
+        - 其余参数沿用网关全局配置，避免改变非飞书平台行为
+        """
+        enabled = bool(self._streaming_cards_enabled)
+        edit_interval = float(default_edit_interval)
+        if self._block_streaming_enabled:
+            edit_interval = max(0.05, self._block_streaming_coalesce_ms / 1000.0)
+        return {
+            "enabled": enabled,
+            "edit_interval": edit_interval,
+            "buffer_threshold": int(default_buffer_threshold),
+            "cursor": default_cursor,
+        }
+
     async def _send_uploaded_file_message(
         self,
         *,

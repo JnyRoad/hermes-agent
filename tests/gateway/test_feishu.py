@@ -2687,6 +2687,56 @@ class TestAdapterBehavior(unittest.TestCase):
             [[{"tag": "md", "text": "纯文本也应该按卡片模式发送"}]],
         )
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_stream_consumer_config_respects_feishu_block_streaming_settings(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "streaming": True,
+                    "block_streaming": True,
+                    "block_streaming_coalesce_ms": 850,
+                }
+            )
+        )
+
+        cfg = adapter.get_stream_consumer_config(
+            default_edit_interval=0.3,
+            default_buffer_threshold=40,
+            default_cursor=" ▉",
+        )
+
+        self.assertTrue(cfg["enabled"])
+        self.assertEqual(cfg["buffer_threshold"], 40)
+        self.assertEqual(cfg["cursor"], " ▉")
+        self.assertEqual(cfg["edit_interval"], 0.85)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_stream_consumer_config_can_disable_feishu_streaming(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "streaming": False,
+                    "block_streaming": True,
+                    "block_streaming_coalesce_ms": 600,
+                }
+            )
+        )
+
+        cfg = adapter.get_stream_consumer_config(
+            default_edit_interval=0.3,
+            default_buffer_threshold=40,
+            default_cursor=" ▉",
+        )
+
+        self.assertFalse(cfg["enabled"])
+        self.assertEqual(cfg["edit_interval"], 0.6)
+
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
 class TestWebhookSecurity(unittest.TestCase):
