@@ -50,6 +50,74 @@ def _upload_drive_file(*, file_name: str, content: bytes, parent_node: str = "")
     return payload
 
 
+def _upload_prepare(*, file_name: str, size: int, parent_node: str = "") -> dict:
+    token = get_tenant_access_token()
+    url = f"{get_feishu_base_url()}/open-apis/drive/v1/files/upload_prepare"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
+    response = httpx.post(
+        url,
+        headers=headers,
+        json={
+            "file_name": file_name,
+            "parent_type": "explorer",
+            "parent_node": parent_node,
+            "size": size,
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Feishu drive upload_prepare returned a non-object response.")
+    if payload.get("code") not in (0, None):
+        raise RuntimeError(
+            f"Feishu drive upload_prepare error: code={payload.get('code')} msg={payload.get('msg') or payload.get('message')}"
+        )
+    return payload
+
+
+def _upload_part(*, upload_id: str, seq: int, content: bytes) -> None:
+    token = get_tenant_access_token()
+    url = f"{get_feishu_base_url()}/open-apis/drive/v1/files/upload_part"
+    headers = {"Authorization": f"Bearer {token}"}
+    data = {
+        "upload_id": upload_id,
+        "seq": str(seq),
+        "size": str(len(content)),
+    }
+    files = {"file": (f"part-{seq}", content)}
+    response = httpx.post(url, headers=headers, data=data, files=files, timeout=120)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Feishu drive upload_part returned a non-object response.")
+    if payload.get("code") not in (0, None):
+        raise RuntimeError(
+            f"Feishu drive upload_part error: code={payload.get('code')} msg={payload.get('msg') or payload.get('message')}"
+        )
+
+
+def _upload_finish(*, upload_id: str, block_num: int) -> dict:
+    token = get_tenant_access_token()
+    url = f"{get_feishu_base_url()}/open-apis/drive/v1/files/upload_finish"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
+    response = httpx.post(
+        url,
+        headers=headers,
+        json={"upload_id": upload_id, "block_num": block_num},
+        timeout=120,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Feishu drive upload_finish returned a non-object response.")
+    if payload.get("code") not in (0, None):
+        raise RuntimeError(
+            f"Feishu drive upload_finish error: code={payload.get('code')} msg={payload.get('msg') or payload.get('message')}"
+        )
+    return payload
+
+
 def _handle_drive_file(args: dict, **_kw) -> str:
     action = str(args.get("action", "")).strip().lower()
     try:
@@ -164,16 +232,39 @@ def _handle_drive_file(args: dict, **_kw) -> str:
             else:
                 return tool_error("Either file_path or file_content_base64 is required for upload.")
 
-            if len(content) > _SMALL_FILE_THRESHOLD:
-                return tool_error("Current Hermes upload supports files up to 15MB.")
+            if len(content) <= _SMALL_FILE_THRESHOLD:
+                data = _upload_drive_file(file_name=resolved_name, content=content, parent_node=parent_node)
+                payload = data.get("data") or data
+                return json.dumps(
+                    {
+                        "file_token": payload.get("file_token"),
+                        "file_name": resolved_name,
+                        "size": len(content),
+                        "upload_method": "upload_all",
+                    },
+                    ensure_ascii=False,
+                )
 
-            data = _upload_drive_file(file_name=resolved_name, content=content, parent_node=parent_node)
-            payload = data.get("data") or data
+            prepare = _upload_prepare(file_name=resolved_name, size=len(content), parent_node=parent_node)
+            prepare_payload = prepare.get("data") or prepare
+            upload_id = str(prepare_payload.get("upload_id", "")).strip()
+            block_size = int(prepare_payload.get("block_size") or 0)
+            block_num = int(prepare_payload.get("block_num") or 0)
+            if not upload_id or block_size <= 0 or block_num <= 0:
+                return tool_error("Invalid upload_prepare response.")
+            for seq in range(block_num):
+                start = seq * block_size
+                end = min(start + block_size, len(content))
+                _upload_part(upload_id=upload_id, seq=seq, content=content[start:end])
+            finish = _upload_finish(upload_id=upload_id, block_num=block_num)
+            finish_payload = finish.get("data") or finish
             return json.dumps(
                 {
-                    "file_token": payload.get("file_token"),
+                    "file_token": finish_payload.get("file_token"),
                     "file_name": resolved_name,
                     "size": len(content),
+                    "upload_method": "chunked",
+                    "chunks_uploaded": block_num,
                 },
                 ensure_ascii=False,
             )

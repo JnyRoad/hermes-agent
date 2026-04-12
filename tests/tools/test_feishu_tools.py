@@ -632,6 +632,35 @@ def test_feishu_drive_file_upload_handler(monkeypatch, tmp_path):
     assert payload["file_name"] == "demo.txt"
 
 
+def test_feishu_drive_file_upload_handler_chunked(monkeypatch, tmp_path):
+    from tools.feishu.drive import _handle_drive_file
+
+    artifact = tmp_path / "big.bin"
+    artifact.write_bytes(b"abcdefgh")
+    part_calls = []
+
+    monkeypatch.setattr("tools.feishu.drive._SMALL_FILE_THRESHOLD", 4)
+    monkeypatch.setattr(
+        "tools.feishu.drive._upload_prepare",
+        lambda **kw: {"data": {"upload_id": "up_1", "block_size": 3, "block_num": 3}},
+    )
+    monkeypatch.setattr(
+        "tools.feishu.drive._upload_part",
+        lambda **kw: part_calls.append((kw["seq"], kw["content"])),
+    )
+    monkeypatch.setattr(
+        "tools.feishu.drive._upload_finish",
+        lambda **kw: {"data": {"file_token": "file_big"}},
+    )
+    payload = json.loads(
+        _handle_drive_file({"action": "upload", "file_path": str(artifact), "parent_node": "fld_root"})
+    )
+    assert payload["file_token"] == "file_big"
+    assert payload["upload_method"] == "chunked"
+    assert payload["chunks_uploaded"] == 3
+    assert part_calls == [(0, b"abc"), (1, b"def"), (2, b"gh")]
+
+
 def test_feishu_wiki_space_handler(monkeypatch):
     from tools.feishu.wiki import _handle_wiki_space
 
