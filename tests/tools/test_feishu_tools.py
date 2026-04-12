@@ -616,6 +616,22 @@ def test_feishu_drive_file_move_handler(monkeypatch):
     assert payload["task_id"] == "task_1"
 
 
+def test_feishu_drive_file_upload_handler(monkeypatch, tmp_path):
+    from tools.feishu.drive import _handle_drive_file
+
+    artifact = tmp_path / "demo.txt"
+    artifact.write_text("hello", encoding="utf-8")
+    monkeypatch.setattr(
+        "tools.feishu.drive._upload_drive_file",
+        lambda **kw: {"data": {"file_token": "file_1"}},
+    )
+    payload = json.loads(
+        _handle_drive_file({"action": "upload", "file_path": str(artifact), "parent_node": "fld_root"})
+    )
+    assert payload["file_token"] == "file_1"
+    assert payload["file_name"] == "demo.txt"
+
+
 def test_feishu_wiki_space_handler(monkeypatch):
     from tools.feishu.wiki import _handle_wiki_space
 

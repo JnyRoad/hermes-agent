@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import os
+from pathlib import Path
 
-from tools.feishu.client import feishu_api_request
+import httpx
+
+from tools.feishu.client import feishu_api_request, get_feishu_base_url, get_tenant_access_token
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
+_SMALL_FILE_THRESHOLD = 15 * 1024 * 1024
 
 
 def _check_feishu_available() -> bool:
@@ -19,6 +25,29 @@ def _check_feishu_available() -> bool:
         return True
     except Exception:
         return False
+
+
+def _upload_drive_file(*, file_name: str, content: bytes, parent_node: str = "") -> dict:
+    token = get_tenant_access_token()
+    url = f"{get_feishu_base_url()}/open-apis/drive/v1/files/upload_all"
+    headers = {"Authorization": f"Bearer {token}"}
+    data = {
+        "file_name": file_name,
+        "parent_type": "explorer",
+        "parent_node": parent_node,
+        "size": str(len(content)),
+    }
+    files = {"file": (file_name, content)}
+    response = httpx.post(url, headers=headers, data=data, files=files, timeout=120)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Feishu drive upload returned a non-object response.")
+    if payload.get("code") not in (0, None):
+        raise RuntimeError(
+            f"Feishu drive upload error: code={payload.get('code')} msg={payload.get('msg') or payload.get('message')}"
+        )
+    return payload
 
 
 def _handle_drive_file(args: dict, **_kw) -> str:
@@ -113,7 +142,43 @@ def _handle_drive_file(args: dict, **_kw) -> str:
                 ensure_ascii=False,
             )
 
-        return tool_error("Unsupported action. Supported actions: list, get_meta, copy, move")
+        if action == "upload":
+            file_path = str(args.get("file_path", "")).strip()
+            file_content_base64 = str(args.get("file_content_base64", "")).strip()
+            file_name = str(args.get("file_name", "")).strip()
+            parent_node = str(args.get("parent_node", "")).strip()
+            if file_path:
+                local_path = Path(file_path)
+                if not local_path.is_file():
+                    return tool_error(f"Local file does not exist: {file_path}")
+                content = local_path.read_bytes()
+                resolved_name = file_name or local_path.name
+            elif file_content_base64:
+                if not file_name:
+                    return tool_error("file_name is required when using file_content_base64.")
+                try:
+                    content = base64.b64decode(file_content_base64)
+                except Exception as exc:
+                    return tool_error(f"Failed to decode file_content_base64: {exc}")
+                resolved_name = file_name
+            else:
+                return tool_error("Either file_path or file_content_base64 is required for upload.")
+
+            if len(content) > _SMALL_FILE_THRESHOLD:
+                return tool_error("Current Hermes upload supports files up to 15MB.")
+
+            data = _upload_drive_file(file_name=resolved_name, content=content, parent_node=parent_node)
+            payload = data.get("data") or data
+            return json.dumps(
+                {
+                    "file_token": payload.get("file_token"),
+                    "file_name": resolved_name,
+                    "size": len(content),
+                },
+                ensure_ascii=False,
+            )
+
+        return tool_error("Unsupported action. Supported actions: list, get_meta, copy, move, upload")
     except Exception as exc:
         logger.error("feishu_drive_file error: %s", exc)
         return tool_error(f"Failed to execute feishu_drive_file: {exc}")
@@ -121,13 +186,13 @@ def _handle_drive_file(args: dict, **_kw) -> str:
 
 FEISHU_DRIVE_FILE_SCHEMA = {
     "name": "feishu_drive_file",
-    "description": "Manage Feishu Drive files. Supported actions in Hermes now: list and get_meta.",
+    "description": "Manage Feishu Drive files. Supported actions in Hermes now: list, get_meta, copy, move, and upload.",
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "get_meta", "copy", "move"],
+                "enum": ["list", "get_meta", "copy", "move", "upload"],
                 "description": "Drive action to execute.",
             },
             "folder_token": {"type": "string", "description": "Folder token for list action."},
@@ -163,6 +228,9 @@ FEISHU_DRIVE_FILE_SCHEMA = {
                 "enum": ["doc", "sheet", "file", "bitable", "docx", "folder", "mindnote", "slides"],
                 "description": "Drive file type for copy or move action.",
             },
+            "file_path": {"type": "string", "description": "Absolute local file path for upload action."},
+            "file_content_base64": {"type": "string", "description": "Base64-encoded file content for upload action."},
+            "file_name": {"type": "string", "description": "Target file name for upload action, or override when using file_path."},
         },
         "required": ["action"],
     },
