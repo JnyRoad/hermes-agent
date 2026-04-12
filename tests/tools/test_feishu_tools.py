@@ -18,6 +18,8 @@ def test_feishu_toolset_is_included_in_hermes_feishu():
     resolved = set(resolve_toolset("hermes-feishu"))
     assert "feishu_get_user" in resolved
     assert "feishu_search_doc_wiki" in resolved
+    assert "feishu_bitable_app" in resolved
+    assert "feishu_bitable_app_table" in resolved
     assert "feishu_sheet" in resolved
     assert "feishu_fetch_doc" in resolved
     assert "feishu_ask_user_question" in resolved
@@ -140,6 +142,79 @@ def test_feishu_sheet_create_handler(monkeypatch):
     )
     assert payload["spreadsheet_token"] == "sht_new"
     assert payload["initial_write"] == "sheet_1!A1:B2"
+
+
+def test_feishu_bitable_app_list_handler(monkeypatch):
+    from tools.feishu.bitable_app import _handle_bitable_app
+
+    monkeypatch.setattr(
+        "tools.feishu.bitable_app.feishu_api_request",
+        lambda *a, **kw: {
+            "data": {
+                "files": [
+                    {"token": "app_1", "type": "bitable", "name": "CRM"},
+                    {"token": "doc_1", "type": "docx", "name": "Spec"},
+                ],
+                "has_more": False,
+            }
+        },
+    )
+    payload = json.loads(_handle_bitable_app({"action": "list"}))
+    assert len(payload["apps"]) == 1
+    assert payload["apps"][0]["token"] == "app_1"
+
+
+def test_feishu_bitable_app_get_handler(monkeypatch):
+    from tools.feishu.bitable_app import _handle_bitable_app
+
+    monkeypatch.setattr(
+        "tools.feishu.bitable_app.feishu_api_request",
+        lambda *a, **kw: {"data": {"app": {"app_token": "app_1", "name": "CRM"}}},
+    )
+    payload = json.loads(_handle_bitable_app({"action": "get", "app_token": "app_1"}))
+    assert payload["app"]["name"] == "CRM"
+
+
+def test_feishu_bitable_app_table_list_handler(monkeypatch):
+    from tools.feishu.bitable_app_table import _handle_bitable_app_table
+
+    monkeypatch.setattr(
+        "tools.feishu.bitable_app_table.feishu_api_request",
+        lambda *a, **kw: {"data": {"items": [{"table_id": "tbl_1", "name": "Leads"}], "has_more": False}},
+    )
+    payload = json.loads(_handle_bitable_app_table({"action": "list", "app_token": "app_1"}))
+    assert payload["items"][0]["table_id"] == "tbl_1"
+
+
+def test_feishu_bitable_app_table_create_sanitizes_field_property(monkeypatch):
+    from tools.feishu.bitable_app_table import _handle_bitable_app_table
+
+    captured = {}
+
+    def _fake_request(method, path, **kwargs):
+        captured["json_body"] = kwargs.get("json_body")
+        return {"data": {"table_id": "tbl_1", "default_view_id": "viw_1", "field_id_list": ["fld_1"]}}
+
+    monkeypatch.setattr("tools.feishu.bitable_app_table.feishu_api_request", _fake_request)
+    payload = json.loads(
+        _handle_bitable_app_table(
+            {
+                "action": "create",
+                "app_token": "app_1",
+                "table": {
+                    "name": "Leads",
+                    "fields": [
+                        {"field_name": "Done", "type": 7, "property": {"formatter": "x"}},
+                        {"field_name": "Link", "type": 15, "property": {"formatter": "y"}},
+                    ],
+                },
+            }
+        )
+    )
+    fields = captured["json_body"]["table"]["fields"]
+    assert "property" not in fields[0]
+    assert "property" not in fields[1]
+    assert payload["table_id"] == "tbl_1"
 
 
 def test_feishu_drive_file_list_handler(monkeypatch):

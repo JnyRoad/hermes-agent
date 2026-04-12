@@ -207,6 +207,8 @@ TOOLSETS = {
             "feishu_get_user",
             "feishu_search_user",
             "feishu_search_doc_wiki",
+            "feishu_bitable_app",
+            "feishu_bitable_app_table",
             "feishu_sheet",
             "feishu_fetch_doc",
             "feishu_create_doc",

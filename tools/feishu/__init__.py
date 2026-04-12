@@ -1,6 +1,8 @@
 """飞书工作区工具注册入口。"""
 
 from . import ask_user_question  # noqa: F401
+from . import bitable_app  # noqa: F401
+from . import bitable_app_table  # noqa: F401
 from . import calendar  # noqa: F401
 from . import calendar_event  # noqa: F401
 from . import calendar_event_attendee  # noqa: F401
