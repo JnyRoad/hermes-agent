@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 from tools.feishu.client import feishu_api_request
+from tools.feishu.scopes import ensure_authorization
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,14 @@ def _handle_task(args: dict, **_kw) -> str:
     action = str(args.get("action", "")).strip().lower()
     user_id_type = str(args.get("user_id_type", "open_id")).strip() or "open_id"
     try:
+        auth_result = ensure_authorization(
+            tool_name="feishu_task_task",
+            action=action,
+            title="Feishu Task Authorization Required",
+        )
+        if auth_result is not None:
+            return auth_result
+
         if action == "create":
             summary = str(args.get("summary", "")).strip()
             if not summary:

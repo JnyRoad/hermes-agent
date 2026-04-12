@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 from gateway.platforms.feishu import normalize_feishu_message
 from tools.feishu.client import feishu_api_request, feishu_api_request_bytes
+from tools.feishu.scopes import ensure_authorization
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -325,6 +326,13 @@ def _handle_get_messages(args: dict, **_kw) -> str:
     if not chat_id and not open_id:
         return tool_error("Missing required parameter: chat_id or open_id")
     try:
+        auth_result = ensure_authorization(
+            tool_name="feishu_im_user_get_messages",
+            action="default",
+            title="Feishu Message Authorization Required",
+        )
+        if auth_result is not None:
+            return auth_result
         if open_id:
             chat_id = _resolve_p2p_chat_id(open_id)
         time_range = _resolve_time_range(args)
@@ -347,6 +355,13 @@ def _handle_get_thread_messages(args: dict, **_kw) -> str:
     if not thread_id:
         return tool_error("Missing required parameter: thread_id")
     try:
+        auth_result = ensure_authorization(
+            tool_name="feishu_im_user_get_thread_messages",
+            action="default",
+            title="Feishu Message Authorization Required",
+        )
+        if auth_result is not None:
+            return auth_result
         time_range = _resolve_time_range(args)
         return _list_messages(
             container_type="thread",
@@ -364,6 +379,13 @@ def _handle_get_thread_messages(args: dict, **_kw) -> str:
 
 def _handle_search_messages(args: dict, **_kw) -> str:
     try:
+        auth_result = ensure_authorization(
+            tool_name="feishu_im_user_search_messages",
+            action="default",
+            title="Feishu Search Authorization Required",
+        )
+        if auth_result is not None:
+            return auth_result
         time_range = _resolve_time_range(args)
         page_size = max(1, min(int(args.get("page_size", 50) or 50), 50))
         page_token = str(args.get("page_token", "")).strip()
@@ -481,6 +503,13 @@ def _handle_im_message(args: dict, **_kw) -> str:
     if not msg_type or not content:
         return tool_error("Parameters msg_type and content are required.")
     try:
+        auth_result = ensure_authorization(
+            tool_name="feishu_im_user_message",
+            action=action,
+            title="Feishu Send Message Authorization Required",
+        )
+        if auth_result is not None:
+            return auth_result
         processed_content = _validate_json_content(content)
         if action == "send":
             receive_id_type = str(args.get("receive_id_type", "")).strip().lower()
@@ -534,6 +563,13 @@ def _handle_fetch_resource(args: dict, **_kw) -> str:
     if not message_id or not file_key or resource_type not in {"image", "file"}:
         return tool_error("Parameters message_id, file_key, and type(image|file) are required.")
     try:
+        auth_result = ensure_authorization(
+            tool_name="feishu_im_user_fetch_resource",
+            action="default",
+            title="Feishu Resource Authorization Required",
+        )
+        if auth_result is not None:
+            return auth_result
         content, headers = feishu_api_request_bytes(
             "GET",
             f"/open-apis/im/v1/messages/{message_id}/resources/{file_key}",

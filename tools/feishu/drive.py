@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 
 from tools.feishu.client import feishu_api_request, feishu_api_request_bytes, get_feishu_base_url, get_tenant_access_token
+from tools.feishu.scopes import ensure_authorization
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -121,6 +122,14 @@ def _upload_finish(*, upload_id: str, block_num: int) -> dict:
 def _handle_drive_file(args: dict, **_kw) -> str:
     action = str(args.get("action", "")).strip().lower()
     try:
+        auth_result = ensure_authorization(
+            tool_name="feishu_drive_file",
+            action=action,
+            title="Feishu Drive Authorization Required",
+        )
+        if auth_result is not None:
+            return auth_result
+
         if action == "list":
             params = {
                 "page_size": max(1, min(int(args.get("page_size", 200) or 200), 200)),

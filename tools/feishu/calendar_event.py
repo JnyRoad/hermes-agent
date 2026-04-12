@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from tools.feishu.client import feishu_api_request
+from tools.feishu.scopes import ensure_authorization
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,14 @@ def _build_attendee_batch(attendees: List[Dict[str, str]]) -> List[Dict[str, Any
 def _handle_calendar_event(args: dict, **_kw) -> str:
     action = str(args.get("action", "")).strip().lower()
     try:
+        auth_result = ensure_authorization(
+            tool_name="feishu_calendar_event",
+            action=action,
+            title="Feishu Calendar Authorization Required",
+        )
+        if auth_result is not None:
+            return auth_result
+
         if action == "create":
             summary = str(args.get("summary", "")).strip()
             start_time = str(args.get("start_time", "")).strip()
