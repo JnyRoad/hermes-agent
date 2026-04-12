@@ -564,6 +564,30 @@ def test_feishu_bitable_app_table_batch_create_handler(monkeypatch):
     assert payload["tables"][1]["table_id"] == "tbl_2"
 
 
+def test_feishu_bitable_app_table_batch_create_requires_table_name(monkeypatch):
+    from tools.feishu.bitable_app_table import _handle_bitable_app_table
+
+    payload = json.loads(
+        _handle_bitable_app_table(
+            {
+                "action": "batch_create",
+                "app_token": "app_1",
+                "tables": [{"default_view_name": "All"}],
+            }
+        )
+    )
+    assert "tables[0].name is required" in payload["error"]
+
+
+def test_feishu_bitable_app_table_batch_create_rejects_non_object_item(monkeypatch):
+    from tools.feishu.bitable_app_table import _handle_bitable_app_table
+
+    payload = json.loads(
+        _handle_bitable_app_table({"action": "batch_create", "app_token": "app_1", "tables": ["bad"]})
+    )
+    assert "tables[0] must be an object" in payload["error"]
+
+
 def test_feishu_bitable_app_table_patch_handler(monkeypatch):
     from tools.feishu.bitable_app_table import _handle_bitable_app_table
 
@@ -1003,6 +1027,24 @@ def test_feishu_drive_file_upload_handler_base64(monkeypatch):
     assert captured["parent_node"] == "fld_root"
     assert payload["upload_method"] == "upload_all"
     assert payload["size"] == 5
+
+
+def test_feishu_drive_file_upload_requires_file_name_for_base64(monkeypatch):
+    from tools.feishu.drive import _handle_drive_file
+
+    payload = json.loads(_handle_drive_file({"action": "upload", "file_content_base64": "aGVsbG8="}))
+    assert "file_name is required" in payload["error"]
+
+
+def test_feishu_drive_file_upload_rejects_invalid_base64(monkeypatch):
+    from tools.feishu.drive import _handle_drive_file
+
+    payload = json.loads(
+        _handle_drive_file(
+            {"action": "upload", "file_content_base64": "not-base64!!", "file_name": "demo.txt"}
+        )
+    )
+    assert "Failed to decode file_content_base64" in payload["error"]
 
 
 def test_feishu_drive_file_upload_handler_chunked(monkeypatch, tmp_path):
@@ -1451,6 +1493,22 @@ def test_feishu_calendar_event_attendee_list_handler(monkeypatch):
     assert payload["attendees"][0]["user_id"] == "ou_1"
 
 
+def test_feishu_calendar_event_attendee_rejects_unsupported_attendee_type(monkeypatch):
+    from tools.feishu.calendar_event_attendee import _handle_calendar_event_attendee
+
+    payload = json.loads(
+        _handle_calendar_event_attendee(
+            {
+                "action": "create",
+                "calendar_id": "cal_1",
+                "event_id": "evt_1",
+                "attendees": [{"type": "robot", "attendee_id": "rb_1"}],
+            }
+        )
+    )
+    assert "unsupported attendee type" in payload["error"]
+
+
 def test_feishu_task_task_create_handler(monkeypatch):
     from tools.feishu.task import _handle_task
 
@@ -1575,6 +1633,28 @@ def test_feishu_task_tasklist_add_members_handler(monkeypatch):
         )
     )
     assert payload["tasklist"]["guid"] == "tl_1"
+
+
+def test_feishu_task_tasklist_add_members_requires_non_empty_members(monkeypatch):
+    from tools.feishu.tasklist import _handle_tasklist
+
+    payload = json.loads(_handle_tasklist({"action": "add_members", "tasklist_guid": "tl_1", "members": []}))
+    assert "members must be a non-empty array" in payload["error"]
+
+
+def test_feishu_task_tasklist_add_members_requires_member_id(monkeypatch):
+    from tools.feishu.tasklist import _handle_tasklist
+
+    payload = json.loads(
+        _handle_tasklist(
+            {
+                "action": "add_members",
+                "tasklist_guid": "tl_1",
+                "members": [{"role": "editor"}],
+            }
+        )
+    )
+    assert "member.id is required" in payload["error"]
 
 
 def test_feishu_task_comment_create_handler(monkeypatch):
