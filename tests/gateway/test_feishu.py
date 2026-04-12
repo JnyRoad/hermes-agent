@@ -2907,6 +2907,141 @@ class TestAdapterBehavior(unittest.TestCase):
         api_request.assert_not_called()
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_resolve_comment_event_context_includes_document_title_and_quote(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Project Spec"}]}},
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_123",
+                            "quote": "Current paragraph",
+                            "reply_list": {
+                                "replies": [
+                                    {
+                                        "content": {
+                                            "elements": [
+                                                {"type": "text_run", "text_run": {"text": "Please refine this section"}},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            },
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses):
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context["document_title"], "Project Spec")
+        self.assertIn('The user added a comment in "Project Spec": Please refine this section', context["prompt"])
+        self.assertIn("Quoted content: Current paragraph", context["prompt"])
+        self.assertIn("Event type: add_comment", context["prompt"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_resolve_comment_event_context_includes_reply_chain(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Review Notes"}]}},
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_123",
+                            "quote": "Anchor line",
+                            "reply_list": {
+                                "replies": [
+                                    {
+                                        "content": {
+                                            "elements": [
+                                                {"type": "text_run", "text_run": {"text": "Please review this block"}},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            },
+            {
+                "data": {
+                    "items": [
+                        {
+                            "reply_id": "reply_prev",
+                            "user_id": {"open_id": "ou_alice"},
+                            "content": {
+                                "elements": [
+                                    {"type": "text_run", "text_run": {"text": "I think this can be shorter"}},
+                                ]
+                            },
+                        },
+                        {
+                            "reply_id": "reply_target",
+                            "user_id": {"open_id": "ou_bob"},
+                            "content": {
+                                "elements": [
+                                    {"type": "text_run", "text_run": {"text": "Please rewrite the summary"}},
+                                ]
+                            },
+                        },
+                    ]
+                }
+            },
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses):
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+                reply_id="reply_target",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertIn('The user added a reply in "Review Notes": Please rewrite the summary', context["prompt"])
+        self.assertIn("Original comment: Please review this block", context["prompt"])
+        self.assertIn("Reply chain context:", context["prompt"])
+        self.assertIn("[ou_alice]: I think this can be shorter", context["prompt"])
+        self.assertIn("reply_id: reply_target", context["prompt"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_resolve_comment_event_context_degrades_when_meta_lookup_fails(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with patch(
+            "tools.feishu.client.feishu_api_request",
+            side_effect=[
+                RuntimeError("meta failed"),
+                {"data": {"items": []}},
+            ],
+        ):
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context["document_title"], "")
+        self.assertIn("docx document doc_token", context["prompt"])
+        self.assertIn("comment_id: comment_123", context["prompt"])
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_stream_consumer_config_respects_feishu_block_streaming_settings(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter

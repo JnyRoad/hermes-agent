@@ -2291,8 +2291,26 @@ class FeishuAdapter(BasePlatformAdapter):
         comment_id: str,
         reply_id: Optional[str] = None,
     ) -> Optional[Dict[str, str]]:
-        """读取评论线程的最小上下文，供 agent 理解评论任务。"""
+        """读取评论线程上下文，构造更贴近文档评论场景的提示词。"""
         from tools.feishu.client import feishu_api_request
+
+        document_title = ""
+        try:
+            meta_payload = feishu_api_request(
+                "POST",
+                "/open-apis/drive/v1/metas/batch_query",
+                json_body={"request_docs": [{"doc_token": file_token, "doc_type": file_type}]},
+            )
+            metas = (meta_payload.get("data") or {}).get("metas") or []
+            if metas and isinstance(metas[0], dict):
+                document_title = str(
+                    metas[0].get("title")
+                    or metas[0].get("name")
+                    or metas[0].get("obj_name")
+                    or ""
+                ).strip()
+        except Exception:
+            logger.debug("[Feishu] Failed to fetch document title for %s", file_token, exc_info=True)
 
         try:
             comment_payload = feishu_api_request(
@@ -2311,24 +2329,32 @@ class FeishuAdapter(BasePlatformAdapter):
                 target_comment = item
                 break
         if not isinstance(target_comment, dict):
+            document_label = f'"{document_title}"' if document_title else f"{file_type} document {file_token}"
             return {
                 "file_token": file_token,
                 "file_type": file_type,
                 "comment_id": comment_id,
-                "document_title": "",
+                "document_title": document_title,
                 "prompt": (
-                    "Feishu document comment event.\n"
-                    f"File token: {file_token}\n"
-                    f"File type: {file_type}\n"
-                    f"Comment ID: {comment_id}\n"
-                    "Reply in the current comment thread."
+                    f"The user added a comment in {document_label}.\n"
+                    "This is a Feishu document comment-thread event, not a Feishu IM conversation.\n"
+                    f"file_token: {file_token}\n"
+                    f"file_type: {file_type}\n"
+                    f"comment_id: {comment_id}\n"
+                    "Reply in the current comment thread.\n"
+                    "If you already reply through a dedicated tool, end your final response with NO_REPLY."
                 ),
             }
 
         root_replies = (((target_comment.get("reply_list") or {}).get("replies")) or [])
-        root_comment_text = _extract_comment_plain_text(root_replies[0].get("content", {}).get("elements", [])) if root_replies else ""
+        root_comment_text = (
+            _extract_comment_plain_text(root_replies[0].get("content", {}).get("elements", []))
+            if root_replies
+            else ""
+        )
 
         reply_text = ""
+        reply_chain_lines: List[str] = []
         if reply_id:
             try:
                 reply_payload = feishu_api_request(
@@ -2340,25 +2366,52 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.debug("[Feishu] Failed to list comment replies for %s", comment_id, exc_info=True)
                 reply_payload = {}
             for item in (reply_payload.get("data") or {}).get("items") or []:
-                if isinstance(item, dict) and str(item.get("reply_id", "")).strip() == reply_id:
-                    reply_text = _extract_comment_plain_text((item.get("content") or {}).get("elements", []))
-                    break
+                if not isinstance(item, dict):
+                    continue
+                current_reply_id = str(item.get("reply_id", "")).strip()
+                reply_author = (
+                    str((((item.get("user_id") or {}).get("open_id")) or "")).strip() or "unknown"
+                )
+                current_text = _extract_comment_plain_text((item.get("content") or {}).get("elements", []))
+                if current_reply_id == reply_id:
+                    reply_text = current_text
+                    continue
+                if current_text:
+                    reply_chain_lines.append(f"[{reply_author}]: {current_text}")
 
         quoted_text = str(target_comment.get("quote", "") or "").strip()
         active_text = reply_text or root_comment_text
-        prompt_lines = [
-            "Feishu document comment event.",
-            f"File token: {file_token}",
-            f"File type: {file_type}",
-            f"Comment ID: {comment_id}",
-        ]
+        action_label = "reply" if reply_id else "comment"
+        document_label = f'"{document_title}"' if document_title else f"{file_type} document {file_token}"
+        first_line = (
+            f"The user added a {action_label} in {document_label}: {active_text}"
+            if active_text
+            else f"The user added a {action_label} in {document_label}."
+        )
+        prompt_lines = [first_line]
+        if reply_id and root_comment_text and root_comment_text != active_text:
+            prompt_lines.append(f"Original comment: {root_comment_text}")
         if quoted_text:
-            prompt_lines.append(f"Quoted text: {quoted_text}")
-        if active_text:
-            prompt_lines.append(f"Comment text: {active_text}")
+            prompt_lines.append(f"Quoted content: {quoted_text}")
+        if reply_chain_lines:
+            prompt_lines.append("Reply chain context:")
+            prompt_lines.extend(reply_chain_lines)
         prompt_lines.extend(
             [
-                "Reply in the current comment thread, not as an instant message.",
+                f"Event type: {'add_reply' if reply_id else 'add_comment'}",
+                f"file_token: {file_token}",
+                f"file_type: {file_type}",
+                f"comment_id: {comment_id}",
+            ]
+        )
+        if reply_id:
+            prompt_lines.append(f"reply_id: {reply_id}")
+        prompt_lines.extend(
+            [
+                "This is a Feishu document comment-thread event, not a Feishu IM conversation. Your final text reply will be posted automatically to the current comment thread.",
+                "If the comment asks you to modify the document, first use the relevant Feishu document tools to make the change instead of replying with only a plan.",
+                "If the quoted content identifies a local section, treat it as the primary edit or reading anchor before falling back to broader document context.",
+                "When document edits fail or you cannot locate the anchor, explain the failure clearly in the comment thread.",
                 "If you already reply through a dedicated tool, end your final response with NO_REPLY.",
             ]
         )
@@ -2366,7 +2419,7 @@ class FeishuAdapter(BasePlatformAdapter):
             "file_token": file_token,
             "file_type": file_type,
             "comment_id": comment_id,
-            "document_title": "",
+            "document_title": document_title,
             "prompt": "\n".join(prompt_lines),
         }
 
