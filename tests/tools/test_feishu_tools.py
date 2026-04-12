@@ -222,6 +222,27 @@ def test_feishu_sheet_export_handler(monkeypatch, tmp_path):
     assert output.read_bytes() == b"xlsx-bytes"
 
 
+def test_feishu_sheet_find_requires_sheet_id(monkeypatch):
+    from tools.feishu.sheet import _handle_sheet
+
+    payload = json.loads(_handle_sheet({"action": "find", "spreadsheet_token": "sht_1", "find": "Bob"}))
+    assert "sheet_id" in payload["error"]
+
+
+def test_feishu_sheet_export_requires_sheet_id_for_csv(monkeypatch):
+    from tools.feishu.sheet import _handle_sheet
+
+    payload = json.loads(_handle_sheet({"action": "export", "spreadsheet_token": "sht_1", "file_extension": "csv"}))
+    assert "sheet_id is required" in payload["error"]
+
+
+def test_feishu_sheet_export_rejects_invalid_extension(monkeypatch):
+    from tools.feishu.sheet import _handle_sheet
+
+    payload = json.loads(_handle_sheet({"action": "export", "spreadsheet_token": "sht_1", "file_extension": "pdf"}))
+    assert "file_extension" in payload["error"]
+
+
 def test_feishu_doc_comments_list_handler(monkeypatch):
     from tools.feishu.doc_comments import _handle_doc_comments
 
@@ -376,6 +397,20 @@ def test_feishu_doc_media_download_handler(monkeypatch, tmp_path):
     )
     assert payload["saved_path"].endswith(".txt")
     assert Path(payload["saved_path"]).read_bytes() == b"hello"
+
+
+def test_feishu_doc_media_insert_rejects_invalid_type(monkeypatch):
+    from tools.feishu.doc_media import _handle_doc_media
+
+    payload = json.loads(_handle_doc_media({"action": "insert", "doc_id": "dox_1", "file_path": "/tmp/a", "type": "video"}))
+    assert "must be image or file" in payload["error"]
+
+
+def test_feishu_doc_media_download_requires_output_path(monkeypatch):
+    from tools.feishu.doc_media import _handle_doc_media
+
+    payload = json.loads(_handle_doc_media({"action": "download", "resource_token": "file_1", "resource_type": "media"}))
+    assert "output_path" in payload["error"]
 
 
 def test_feishu_bitable_app_list_handler(monkeypatch):
@@ -1360,6 +1395,29 @@ def test_feishu_calendar_freebusy_list_handler(monkeypatch):
     assert payload["freebusy_lists"][0]["user_id"] == "ou_1"
 
 
+def test_feishu_calendar_freebusy_requires_user_ids(monkeypatch):
+    from tools.feishu.calendar_freebusy import _handle_calendar_freebusy
+
+    payload = json.loads(
+        _handle_calendar_freebusy(
+            {"action": "list", "time_min": "2024-03-01T10:00:00+08:00", "time_max": "2024-03-01T11:00:00+08:00", "user_ids": []}
+        )
+    )
+    assert "user_ids" in payload["error"]
+
+
+def test_feishu_calendar_freebusy_rejects_more_than_ten_users(monkeypatch):
+    from tools.feishu.calendar_freebusy import _handle_calendar_freebusy
+
+    user_ids = [f"ou_{idx}" for idx in range(11)]
+    payload = json.loads(
+        _handle_calendar_freebusy(
+            {"action": "list", "time_min": "2024-03-01T10:00:00+08:00", "time_max": "2024-03-01T11:00:00+08:00", "user_ids": user_ids}
+        )
+    )
+    assert "maximum 10 users" in payload["error"]
+
+
 def test_feishu_calendar_event_attendee_create_handler(monkeypatch):
     from tools.feishu.calendar_event_attendee import _handle_calendar_event_attendee
 
@@ -1699,6 +1757,13 @@ def test_feishu_im_get_messages_handler_with_open_id(monkeypatch):
     assert calls[1][2]["params"]["container_id"] == "oc_p2p_1"
 
 
+def test_feishu_im_get_messages_rejects_chat_id_and_open_id_together(monkeypatch):
+    from tools.feishu.im import _handle_get_messages
+
+    payload = json.loads(_handle_get_messages({"chat_id": "oc_1", "open_id": "ou_1"}))
+    assert "mutually exclusive" in payload["error"]
+
+
 def test_feishu_im_get_thread_messages_handler(monkeypatch):
     from tools.feishu.im import _handle_get_thread_messages
 
@@ -1909,6 +1974,20 @@ def test_feishu_im_message_reply_handler(monkeypatch):
     assert payload["chat_id"] == "oc_chat_1"
 
 
+def test_feishu_im_message_send_requires_receive_id(monkeypatch):
+    from tools.feishu.im import _handle_im_message
+
+    payload = json.loads(_handle_im_message({"action": "send", "msg_type": "text", "content": '{"text":"hello"}'}))
+    assert "receive_id" in payload["error"]
+
+
+def test_feishu_im_message_reply_requires_message_id(monkeypatch):
+    from tools.feishu.im import _handle_im_message
+
+    payload = json.loads(_handle_im_message({"action": "reply", "msg_type": "text", "content": '{"text":"hello"}'}))
+    assert "message_id" in payload["error"]
+
+
 def test_feishu_fetch_doc_handler(monkeypatch):
     from tools.feishu.docs import _handle_fetch_doc
 
@@ -1944,6 +2023,13 @@ def test_feishu_create_doc_handler(monkeypatch):
     assert any(item[0] == "POST" and item[1].endswith("/children") for item in calls)
 
 
+def test_feishu_create_doc_rejects_conflicting_targets(monkeypatch):
+    from tools.feishu.docs import _handle_create_doc
+
+    payload = json.loads(_handle_create_doc({"title": "Hello", "folder_token": "fld_1", "wiki_node": "wik_1"}))
+    assert "mutually exclusive" in payload["error"]
+
+
 def test_feishu_update_doc_handler_replace_range(monkeypatch):
     from tools.feishu.docs import _handle_update_doc
 
@@ -1971,6 +2057,13 @@ def test_feishu_update_doc_handler_replace_range(monkeypatch):
     assert payload["updated"] is True
     assert any(item[0] == "DELETE" for item in calls)
     assert any(item[0] == "POST" and item[1].endswith("/children") for item in calls)
+
+
+def test_feishu_update_doc_requires_mode(monkeypatch):
+    from tools.feishu.docs import _handle_update_doc
+
+    payload = json.loads(_handle_update_doc({"doc_id": "doxcn1234567890"}))
+    assert "Missing required parameter: mode" in payload["error"]
 
 
 def test_feishu_ask_user_question_uses_active_adapter(monkeypatch):
@@ -2008,6 +2101,15 @@ def test_feishu_ask_user_question_uses_active_adapter(monkeypatch):
         unregister_adapter(Platform.FEISHU, adapter)
 
 
+def test_feishu_ask_user_question_rejects_too_many_options(monkeypatch):
+    from tools.feishu.ask_user_question import _handle_ask_user_question
+
+    payload = json.loads(
+        _handle_ask_user_question({"question": "Which one?", "options": ["1", "2", "3", "4", "5", "6"]})
+    )
+    assert "at most 5 options" in payload["error"]
+
+
 def test_feishu_oauth_uses_active_adapter(monkeypatch):
     from tools.feishu.oauth import _handle_feishu_oauth
 
@@ -2033,6 +2135,13 @@ def test_feishu_oauth_uses_active_adapter(monkeypatch):
         adapter.send_oauth_request_card.assert_awaited_once()
     finally:
         unregister_adapter(Platform.FEISHU, adapter)
+
+
+def test_feishu_oauth_requires_scopes(monkeypatch):
+    from tools.feishu.oauth import _handle_feishu_oauth
+
+    payload = json.loads(_handle_feishu_oauth({"scopes": []}))
+    assert "scopes" in payload["error"]
 
 
 def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
