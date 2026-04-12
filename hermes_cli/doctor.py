@@ -297,7 +297,7 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
         return {"items": items, "issues": issues}
 
     try:
-        from tools.feishu.client import get_app_granted_scopes
+        from tools.feishu.client import get_app_granted_scopes, get_app_granted_scopes_by_token_type, get_app_info
 
         granted_scopes = get_app_granted_scopes()
         _record("ok", f"Feishu app scopes: {len(granted_scopes)} granted")
@@ -306,6 +306,17 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
         else:
             _record("warn", "App self-manage scope missing", "cannot reliably query current Feishu app permissions")
             issues.append("Grant application:application:self_manage to improve Feishu scope diagnostics")
+
+        resolved_account_id = str(account_id or "").strip() or None
+        app_info = get_app_info(account_id=resolved_account_id)
+        owner_open_id = str(app_info.get("effective_owner_open_id", "") or "").strip()
+        if owner_open_id:
+            _record("ok", "Feishu app owner detected", owner_open_id)
+        else:
+            _record("warn", "Feishu app owner unavailable", "owner-only onboarding checks will be limited")
+
+        granted_user_scopes = list(get_app_granted_scopes_by_token_type("user", account_id=resolved_account_id))
+        _record("info", f"Feishu user scopes granted: {len(granted_user_scopes)}")
     except Exception as exc:
         if isinstance(exc, Exception) and exc.__class__.__name__ == "FeishuAPIError" and getattr(exc, "code", None) == 99991672:
             _record("warn", "Unable to query Feishu app scopes", "application:application:self_manage is missing")
@@ -314,6 +325,7 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
             _record("warn", "Feishu app scope check failed", str(exc))
 
     if adapter is not None and user_open_id:
+        auth_status = {}
         try:
             resolved_account_id = str(account_id or "").strip() or None
             if resolved_account_id:
@@ -334,6 +346,30 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
                 _record("info", label)
         except Exception as exc:
             _record("warn", "Current user authorization status unavailable", str(exc))
+
+        try:
+            owner_info = get_app_info(account_id=resolved_account_id)
+            owner_open_id = str(owner_info.get("effective_owner_open_id", "") or "").strip()
+            granted_user_scopes = list(
+                get_app_granted_scopes_by_token_type("user", account_id=resolved_account_id)
+            )
+            if owner_open_id:
+                if owner_open_id == user_open_id:
+                    _record("ok", "Current user is Feishu app owner")
+                    if granted_user_scopes:
+                        granted_scope_set = set(auth_status.get("granted_scopes") or [])
+                        missing_owner_scopes = [scope for scope in granted_user_scopes if scope not in granted_scope_set]
+                        if missing_owner_scopes:
+                            _record(
+                                "warn",
+                                "Owner batch authorization recommended",
+                                f"{len(missing_owner_scopes)} user scopes still missing locally",
+                            )
+                            issues.append("Run `/feishu auth batch` as the app owner to authorize remaining user scopes")
+                else:
+                    _record("info", "Current user is not the Feishu app owner", owner_open_id)
+        except Exception as exc:
+            _record("warn", "Feishu owner diagnostics unavailable", str(exc))
 
     return {"items": items, "issues": issues}
 
