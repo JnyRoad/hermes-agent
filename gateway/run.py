@@ -1293,16 +1293,16 @@ class GatewayRunner:
         return True
 
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
-        snapshot = self._snapshot_running_agents()
-        last_active_count = self._running_agent_count()
+        snapshot = GatewayRunner._snapshot_running_agents(self)
+        last_active_count = GatewayRunner._running_agent_count(self)
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
             nonlocal last_active_count, last_status_at
             now = asyncio.get_running_loop().time()
-            active_count = self._running_agent_count()
+            active_count = GatewayRunner._running_agent_count(self)
             if force or active_count != last_active_count or (now - last_status_at) >= 1.0:
-                self._update_runtime_status("draining")
+                GatewayRunner._update_runtime_status(self, "draining")
                 last_active_count = active_count
                 last_status_at = now
 
@@ -1874,8 +1874,9 @@ class GatewayRunner:
             self._restart_requested = True
             self._restart_detached = detached_restart
             self._restart_via_service = service_restart
-        if self._stop_task is not None:
-            await self._stop_task
+        existing_stop_task = getattr(self, "_stop_task", None)
+        if existing_stop_task is not None and hasattr(existing_stop_task, "__await__"):
+            await existing_stop_task
             return
 
         async def _stop_impl() -> None:
@@ -1886,20 +1887,25 @@ class GatewayRunner:
             self._running = False
             self._draining = True
 
-            timeout = self._restart_drain_timeout
-            active_agents, timed_out = await self._drain_active_agents(timeout)
+            timeout = getattr(self, "_restart_drain_timeout", 0.0)
+            try:
+                timeout = float(timeout)
+            except (TypeError, ValueError):
+                timeout = 0.0
+            active_agents, timed_out = await GatewayRunner._drain_active_agents(self, timeout)
             if timed_out:
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s); interrupting remaining work.",
                     timeout,
-                    self._running_agent_count(),
+                    GatewayRunner._running_agent_count(self),
                 )
-                self._interrupt_running_agents(
+                GatewayRunner._interrupt_running_agents(
+                    self,
                     "Gateway restarting" if self._restart_requested else "Gateway shutting down"
                 )
                 interrupt_deadline = asyncio.get_running_loop().time() + 5.0
                 while self._running_agents and asyncio.get_running_loop().time() < interrupt_deadline:
-                    self._update_runtime_status("draining")
+                    GatewayRunner._update_runtime_status(self, "draining")
                     await asyncio.sleep(0.1)
 
             if self._restart_requested and self._restart_detached:
@@ -1908,7 +1914,7 @@ class GatewayRunner:
                 except Exception as e:
                     logger.error("Failed to launch detached gateway restart: %s", e)
 
-            self._finalize_shutdown_agents(active_agents)
+            GatewayRunner._finalize_shutdown_agents(self, active_agents)
 
             for platform, adapter in list(self.adapters.items()):
                 try:
@@ -1971,7 +1977,7 @@ class GatewayRunner:
                 self._exit_reason = self._exit_reason or "Gateway restart requested"
 
             self._draining = False
-            self._update_runtime_status("stopped", self._exit_reason)
+            GatewayRunner._update_runtime_status(self, "stopped", self._exit_reason)
             logger.info("Gateway stopped")
 
         self._stop_task = asyncio.create_task(_stop_impl())

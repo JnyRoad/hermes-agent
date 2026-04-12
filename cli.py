@@ -6491,7 +6491,12 @@ class HermesCLI:
 
             if result.get("success") and result.get("transcript", "").strip():
                 transcript = result["transcript"].strip()
-                self._attached_images.clear()
+                # 语音模式下通常会清空本轮已附带的图片，避免上一轮多模态输入
+                # 意外泄漏到新的语音提问。测试里的精简 CLI 对象可能没有这个属性，
+                # 因此这里做兼容保护。
+                attached_images = getattr(self, "_attached_images", None)
+                if attached_images is not None:
+                    attached_images.clear()
                 if hasattr(self, '_app') and self._app:
                     self._app.invalidate()
                 self._pending_input.put(transcript)

@@ -424,6 +424,11 @@ class AudioRecorder:
         return time.monotonic() - self._start_time
 
     @property
+    def is_recording(self) -> bool:
+        """兼容外部调用方的录音状态查询接口。"""
+        return self._recording
+
+    @property
     def current_rms(self) -> int:
         """Current audio input RMS level (0-32767). Updated each audio chunk."""
         return self._current_rms
