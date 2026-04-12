@@ -298,6 +298,7 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
 
     try:
         from tools.feishu.client import get_app_granted_scopes, get_app_granted_scopes_by_token_type, get_app_info
+        from tools.feishu.scopes import REQUIRED_APP_SCOPES
 
         granted_scopes = get_app_granted_scopes()
         _record("ok", f"Feishu app scopes: {len(granted_scopes)} granted")
@@ -306,6 +307,22 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
         else:
             _record("warn", "App self-manage scope missing", "cannot reliably query current Feishu app permissions")
             issues.append("Grant application:application:self_manage to improve Feishu scope diagnostics")
+
+        missing_required_app_scopes = [scope for scope in REQUIRED_APP_SCOPES if scope not in set(granted_scopes)]
+        if missing_required_app_scopes:
+            preview = ", ".join(missing_required_app_scopes[:5])
+            if len(missing_required_app_scopes) > 5:
+                preview += ", ..."
+            _record(
+                "warn",
+                f"Feishu required app scopes missing: {len(missing_required_app_scopes)}",
+                preview,
+            )
+            issues.append(
+                "Grant the missing Feishu app scopes to stabilize chat commands, cards, and auto-authorization flows"
+            )
+        else:
+            _record("ok", "Feishu required app scopes configured")
 
         resolved_account_id = str(account_id or "").strip() or None
         app_info = get_app_info(account_id=resolved_account_id)

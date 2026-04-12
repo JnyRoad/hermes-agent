@@ -497,6 +497,37 @@ class TestFeishuDoctorChecks:
         assert any(item["label"] == "Owner batch authorization recommended" for item in report["items"])
         assert any("/feishu auth batch" in issue for issue in report["issues"])
 
+    def test_collect_report_warns_missing_required_app_scopes(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr("tools.feishu.client.get_app_granted_scopes", lambda: ["application:application:self_manage"])
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_info",
+            lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes_by_token_type",
+            lambda token_type, account_id=None: [],
+        )
+
+        report = doctor.collect_feishu_doctor_report(user_open_id="ou_owner", account_id="feishu-cn")
+
+        assert any(item["label"].startswith("Feishu required app scopes missing:") for item in report["items"])
+        assert any("Grant the missing Feishu app scopes" in issue for issue in report["issues"])
+
 
 def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):
     """Doctor should present CLI-gated tools as available in CLI context."""
