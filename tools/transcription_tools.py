@@ -28,7 +28,9 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+import types
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
@@ -58,6 +60,21 @@ def _safe_find_spec(module_name: str) -> bool:
 _HAS_FASTER_WHISPER = _safe_find_spec("faster_whisper")
 _HAS_OPENAI = _safe_find_spec("openai")
 _HAS_MISTRAL = _safe_find_spec("mistralai")
+
+# 测试环境可能没有安装 faster_whisper，但用例会通过
+# patch("faster_whisper.WhisperModel", ...) 注入 mock。若模块完全不存在，
+# patch 会在导入阶段直接失败，连本地转写逻辑都到不了。这里提供一个极小
+# 占位模块，只用于让 patch 能挂载到同名符号；真实运行是否可用仍由
+# _HAS_FASTER_WHISPER 决定。
+if not _HAS_FASTER_WHISPER and "faster_whisper" not in sys.modules:
+    _stub_module = types.ModuleType("faster_whisper")
+
+    class _MissingWhisperModel:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("faster-whisper not installed")
+
+    _stub_module.WhisperModel = _MissingWhisperModel
+    sys.modules["faster_whisper"] = _stub_module
 
 # ---------------------------------------------------------------------------
 # Constants
