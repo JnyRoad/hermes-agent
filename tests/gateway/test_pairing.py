@@ -79,6 +79,14 @@ class TestCodeGeneration:
         assert pending[0]["user_id"] == "user1"
         assert pending[0]["user_name"] == "Alice"
 
+    def test_stores_pending_account_id(self, tmp_path):
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            code = store.generate_code("feishu", "ou_user", "Alice", account_id="feishu-cn")
+            pending = store.list_pending("feishu")
+        assert pending[0]["code"] == code
+        assert pending[0]["account_id"] == "feishu-cn"
+
 
 # ---------------------------------------------------------------------------
 # Rate limiting
@@ -164,6 +172,16 @@ class TestApprovalFlow:
         assert "user_name" in result
         assert result["user_id"] == "user1"
         assert result["user_name"] == "Alice"
+
+    def test_approve_preserves_account_id(self, tmp_path):
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            code = store.generate_code("feishu", "ou_user", "Alice", account_id="feishu-cn")
+            result = store.approve_code("feishu", code)
+            approved = store.list_approved("feishu")
+
+        assert result["account_id"] == "feishu-cn"
+        assert approved[0]["account_id"] == "feishu-cn"
 
     def test_approved_user_is_approved(self, tmp_path):
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):

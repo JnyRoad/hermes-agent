@@ -133,12 +133,20 @@ class PairingStore:
                 results.append({"platform": p, "user_id": uid, **info})
         return results
 
-    def _approve_user(self, platform: str, user_id: str, user_name: str = "") -> None:
+    def _approve_user(
+        self,
+        platform: str,
+        user_id: str,
+        user_name: str = "",
+        *,
+        account_id: Optional[str] = None,
+    ) -> None:
         """Add a user to the approved list. Must be called under self._lock."""
         approved = self._load_json(self._approved_path(platform))
         approved[user_id] = {
             "user_name": user_name,
             "approved_at": time.time(),
+            "account_id": str(account_id or "").strip(),
         }
         self._save_json(self._approved_path(platform), approved)
 
@@ -156,7 +164,12 @@ class PairingStore:
     # ----- Pending codes -----
 
     def generate_code(
-        self, platform: str, user_id: str, user_name: str = ""
+        self,
+        platform: str,
+        user_id: str,
+        user_name: str = "",
+        *,
+        account_id: Optional[str] = None,
     ) -> Optional[str]:
         """
         Generate a pairing code for a new user.
@@ -190,6 +203,7 @@ class PairingStore:
                 "user_id": user_id,
                 "user_name": user_name,
                 "created_at": time.time(),
+                "account_id": str(account_id or "").strip(),
             }
             self._save_json(self._pending_path(platform), pending)
 
@@ -217,11 +231,17 @@ class PairingStore:
             self._save_json(self._pending_path(platform), pending)
 
             # Add to approved list
-            self._approve_user(platform, entry["user_id"], entry.get("user_name", ""))
+            self._approve_user(
+                platform,
+                entry["user_id"],
+                entry.get("user_name", ""),
+                account_id=entry.get("account_id", ""),
+            )
 
             return {
                 "user_id": entry["user_id"],
                 "user_name": entry.get("user_name", ""),
+                "account_id": str(entry.get("account_id", "") or "").strip(),
             }
 
     def list_pending(self, platform: str = None) -> list:
@@ -238,6 +258,7 @@ class PairingStore:
                     "code": code,
                     "user_id": info["user_id"],
                     "user_name": info.get("user_name", ""),
+                    "account_id": str(info.get("account_id", "") or "").strip(),
                     "age_minutes": age_min,
                 })
         return results

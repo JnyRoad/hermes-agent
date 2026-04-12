@@ -2289,7 +2289,10 @@ class GatewayRunner:
                 if self.pairing_store._is_rate_limited(platform_name, source.user_id):
                     return None
                 code = self.pairing_store.generate_code(
-                    platform_name, source.user_id, source.user_name or ""
+                    platform_name,
+                    source.user_id,
+                    source.user_name or "",
+                    account_id=getattr(source, "account_id", None),
                 )
                 if code:
                     adapter = self.adapters.get(source.platform)
