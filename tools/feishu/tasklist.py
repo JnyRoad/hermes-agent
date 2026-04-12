@@ -7,7 +7,7 @@ import logging
 from typing import Any, Dict, List
 
 from tools.feishu.client import feishu_api_request
-from tools.feishu.scopes import ensure_authorization
+from tools.feishu.scopes import ensure_authorization, handle_authorization_error
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,7 @@ def _handle_tasklist(args: dict, **_kw) -> str:
             tool_name="feishu_task_tasklist",
             action=action,
             title="Feishu Task Authorization Required",
+            tool_args=args,
         )
         if auth_result is not None:
             return auth_result
@@ -166,6 +167,15 @@ def _handle_tasklist(args: dict, **_kw) -> str:
 
         return tool_error("Unsupported action. Supported actions: create, get, list, tasks, patch, add_members")
     except Exception as exc:
+        auth_error = handle_authorization_error(
+            exc,
+            tool_name="feishu_task_tasklist",
+            action=action,
+            title="Feishu Task Authorization Required",
+            tool_args=args,
+        )
+        if auth_error is not None:
+            return auth_error
         logger.error("feishu_task_tasklist error: %s", exc)
         return tool_error(f"Failed to execute feishu_task_tasklist: {exc}")
 

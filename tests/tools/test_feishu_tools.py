@@ -3181,6 +3181,9 @@ def test_feishu_tasklist_auto_auth_pending(monkeypatch):
         assert payload["tool"] == "feishu_task_tasklist"
         assert payload["action"] == "list"
         assert payload["missing_scopes"] == ["task:tasklist:read", "task:tasklist:write"]
+        assert payload["replay_id"].startswith("fr_")
+        pending = getattr(adapter, "_pending_tool_replays")
+        assert pending[payload["replay_id"]]["tool_name"] == "feishu_task_tasklist"
         adapter.send_oauth_request_card.assert_awaited_once()
     finally:
         unregister_adapter(Platform.FEISHU, adapter)
@@ -3219,6 +3222,58 @@ def test_feishu_chat_members_auto_auth_pending(monkeypatch):
         assert payload["status"] == "pending_authorization"
         assert payload["tool"] == "feishu_chat_members"
         assert payload["missing_scopes"] == ["im:chat.members:read"]
+        assert payload["replay_id"].startswith("fr_")
+        pending = getattr(adapter, "_pending_tool_replays")
+        assert pending[payload["replay_id"]]["tool_name"] == "feishu_chat_members"
+        adapter.send_oauth_request_card.assert_awaited_once()
+    finally:
+        unregister_adapter(Platform.FEISHU, adapter)
+
+
+def test_feishu_chat_members_handles_user_scope_error_after_api_response(monkeypatch):
+    from tools.feishu.chat_members import _handle_chat_members
+    from tools.feishu.client import FeishuAPIError
+
+    adapter = SimpleNamespace(
+        get_authorization_status=lambda user_open_id, scopes=None: {
+            "authorized": True,
+            "granted_scopes": list(scopes or []),
+            "requested_scopes": list(scopes or []),
+            "missing_scopes": [],
+            "updated_at": 1.0,
+            "updated_by": "ou_user_1",
+            "source": "interactive_confirm",
+        },
+        send_oauth_request_card=AsyncMock(
+            return_value=SendResult(
+                success=True,
+                message_id="msg_auth_retry_chat_members",
+                raw_response={"request_id": "fo_retry_chat_members_1"},
+            )
+        ),
+    )
+
+    register_adapter(Platform.FEISHU, adapter)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "oc_chat_1")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_user_1")
+    monkeypatch.setattr(
+        "tools.feishu.chat_members.feishu_api_request",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            FeishuAPIError(
+                code=99991679,
+                message="missing user scopes [im:chat.members:read]",
+                missing_scopes=["im:chat.members:read"],
+            )
+        ),
+    )
+
+    try:
+        payload = json.loads(_handle_chat_members({"chat_id": "oc_chat_2"}))
+        assert payload["status"] == "pending_authorization"
+        assert payload["missing_scopes"] == ["im:chat.members:read"]
+        assert payload["replay_id"].startswith("fr_")
         adapter.send_oauth_request_card.assert_awaited_once()
     finally:
         unregister_adapter(Platform.FEISHU, adapter)
