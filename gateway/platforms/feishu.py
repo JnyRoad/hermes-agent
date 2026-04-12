@@ -115,6 +115,7 @@ _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+_FEISHU_COMMENT_TARGET_RE = re.compile(r"^feishu-comment://([^/]+)/([^/]+)/([^/?#]+)$")
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -380,6 +381,49 @@ def _coerce_optional_bool(value: Any) -> Optional[bool]:
         if normalized in {"false", "0", "no", "off"}:
             return False
     return None
+
+
+def _build_feishu_comment_target(*, file_type: str, file_token: str, comment_id: str) -> str:
+    """把评论线程目标编码成适配器内部 chat_id，复用网关现有 send 流水线。"""
+    return f"feishu-comment://{file_type}/{file_token}/{comment_id}"
+
+
+def _extract_comment_plain_text(elements: Any) -> str:
+    """从飞书评论元素数组中提取可读文本。"""
+    parts: List[str] = []
+    for item in elements or []:
+        if isinstance(item, SimpleNamespace):
+            item = vars(item)
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type", "") or "").strip().lower()
+        if kind == "text_run":
+            text_run = item.get("text_run")
+            if isinstance(text_run, SimpleNamespace):
+                text_run = vars(text_run)
+            if isinstance(text_run, dict):
+                text = str(text_run.get("text", "") or "").strip()
+                if text:
+                    parts.append(text)
+            continue
+        if kind == "person":
+            person = item.get("person")
+            if isinstance(person, SimpleNamespace):
+                person = vars(person)
+            if isinstance(person, dict):
+                mention_name = str(person.get("name", "") or person.get("user_id", "") or "").strip()
+                if mention_name:
+                    parts.append(f"@{mention_name}")
+            continue
+        if kind == "docs_link":
+            docs_link = item.get("docs_link")
+            if isinstance(docs_link, SimpleNamespace):
+                docs_link = vars(docs_link)
+            if isinstance(docs_link, dict):
+                link_text = str(docs_link.get("url", "") or "").strip()
+                if link_text:
+                    parts.append(link_text)
+    return " ".join(part for part in parts if part).strip()
 
 
 def _is_style_enabled(style: Dict[str, Any] | None, key: str) -> bool:
@@ -1309,6 +1353,8 @@ class FeishuAdapter(BasePlatformAdapter):
             lambda data: self._on_reaction_event("im.message.reaction.deleted_v1", data)
         )
         builder = builder.register_p2_card_action_trigger(self._on_card_action_trigger)
+        if hasattr(builder, "register_p2_drive_notice_comment_add_v1"):
+            builder = builder.register_p2_drive_notice_comment_add_v1(self._on_comment_event)
         if hasattr(builder, "register_p2_im_chat_member_bot_added_v1"):
             builder = builder.register_p2_im_chat_member_bot_added_v1(self._on_bot_added_to_chat)
         if hasattr(builder, "register_p2_im_chat_member_bot_deleted_v1"):
@@ -2211,6 +2257,18 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         future.add_done_callback(self._log_background_failure)
 
+    def _on_comment_event(self, data: Any) -> None:
+        """Route Drive comment webhook events onto the adapter loop."""
+        loop = self._loop
+        if loop is None or bool(getattr(loop, "is_closed", lambda: False)()):
+            logger.warning("[Feishu] Dropping comment event before adapter loop is ready")
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self._handle_comment_event(data),
+            loop,
+        )
+        future.add_done_callback(self._log_background_failure)
+
     def _on_card_action_trigger(self, data: Any) -> Any:
         """Schedule Feishu card actions on the adapter loop and acknowledge immediately."""
         loop = self._loop
@@ -2225,6 +2283,92 @@ class FeishuAdapter(BasePlatformAdapter):
         if P2CardActionTriggerResponse is None:
             return None
         return P2CardActionTriggerResponse()
+
+    @staticmethod
+    def _resolve_comment_event_context(
+        file_token: str,
+        file_type: str,
+        comment_id: str,
+        reply_id: Optional[str] = None,
+    ) -> Optional[Dict[str, str]]:
+        """读取评论线程的最小上下文，供 agent 理解评论任务。"""
+        from tools.feishu.client import feishu_api_request
+
+        try:
+            comment_payload = feishu_api_request(
+                "GET",
+                f"/open-apis/drive/v1/files/{file_token}/comments",
+                params={"file_type": file_type, "page_size": 100},
+            )
+        except Exception:
+            logger.debug("[Feishu] Failed to list comments for %s", file_token, exc_info=True)
+            return None
+
+        comment_items = (comment_payload.get("data") or {}).get("items") or []
+        target_comment = None
+        for item in comment_items:
+            if isinstance(item, dict) and str(item.get("comment_id", "")).strip() == comment_id:
+                target_comment = item
+                break
+        if not isinstance(target_comment, dict):
+            return {
+                "file_token": file_token,
+                "file_type": file_type,
+                "comment_id": comment_id,
+                "document_title": "",
+                "prompt": (
+                    "Feishu document comment event.\n"
+                    f"File token: {file_token}\n"
+                    f"File type: {file_type}\n"
+                    f"Comment ID: {comment_id}\n"
+                    "Reply in the current comment thread."
+                ),
+            }
+
+        root_replies = (((target_comment.get("reply_list") or {}).get("replies")) or [])
+        root_comment_text = _extract_comment_plain_text(root_replies[0].get("content", {}).get("elements", [])) if root_replies else ""
+
+        reply_text = ""
+        if reply_id:
+            try:
+                reply_payload = feishu_api_request(
+                    "GET",
+                    f"/open-apis/drive/v1/files/{file_token}/comments/{comment_id}/replies",
+                    params={"file_type": file_type, "page_size": 100},
+                )
+            except Exception:
+                logger.debug("[Feishu] Failed to list comment replies for %s", comment_id, exc_info=True)
+                reply_payload = {}
+            for item in (reply_payload.get("data") or {}).get("items") or []:
+                if isinstance(item, dict) and str(item.get("reply_id", "")).strip() == reply_id:
+                    reply_text = _extract_comment_plain_text((item.get("content") or {}).get("elements", []))
+                    break
+
+        quoted_text = str(target_comment.get("quote", "") or "").strip()
+        active_text = reply_text or root_comment_text
+        prompt_lines = [
+            "Feishu document comment event.",
+            f"File token: {file_token}",
+            f"File type: {file_type}",
+            f"Comment ID: {comment_id}",
+        ]
+        if quoted_text:
+            prompt_lines.append(f"Quoted text: {quoted_text}")
+        if active_text:
+            prompt_lines.append(f"Comment text: {active_text}")
+        prompt_lines.extend(
+            [
+                "Reply in the current comment thread, not as an instant message.",
+                "If you already reply through a dedicated tool, end your final response with NO_REPLY.",
+            ]
+        )
+        return {
+            "file_token": file_token,
+            "file_type": file_type,
+            "comment_id": comment_id,
+            "document_title": "",
+            "prompt": "\n".join(prompt_lines),
+        }
 
     async def _handle_reaction_event(self, event_type: str, data: Any) -> None:
         """Fetch the reacted-to message; if it was sent by this bot, emit a synthetic text event."""
@@ -2283,6 +2427,84 @@ class FeishuAdapter(BasePlatformAdapter):
             timestamp=datetime.now(),
         )
         logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
+        await self._handle_message_with_guards(synthetic_event)
+
+    async def _handle_comment_event(self, data: Any) -> None:
+        """把飞书文档评论事件转成 synthetic message 进入 agent。"""
+        event = getattr(data, "event", None)
+        notice_meta = getattr(event, "notice_meta", None) or event
+        if not event or not notice_meta:
+            logger.debug("[Feishu] Dropping malformed comment event: missing event payload")
+            return
+
+        file_token = str(getattr(notice_meta, "file_token", "") or getattr(event, "file_token", "") or "").strip()
+        file_type = str(getattr(notice_meta, "file_type", "") or getattr(event, "file_type", "") or "").strip()
+        comment_id = str(getattr(event, "comment_id", "") or "").strip()
+        reply_id = str(getattr(event, "reply_id", "") or "").strip()
+        sender_open_id = str(
+            getattr(notice_meta, "from_user_id", "") or getattr(event, "from_user_id", "") or ""
+        ).strip()
+        is_mentioned = bool(
+            getattr(notice_meta, "is_mentioned", None)
+            if getattr(notice_meta, "is_mentioned", None) is not None
+            else getattr(event, "is_mention", False)
+        )
+        if not file_token or not file_type or not comment_id or not sender_open_id:
+            logger.debug("[Feishu] Dropping malformed comment event: missing token/comment/sender")
+            return
+        if sender_open_id == self._bot_open_id:
+            logger.debug("[Feishu] Dropping self-authored comment event on %s", file_token)
+            return
+        if not self._allow_dm_message(SimpleNamespace(open_id=sender_open_id, user_id=None)):
+            logger.debug("[Feishu] Dropping comment event that failed dm_policy gate: %s", comment_id)
+            return
+        if not is_mentioned:
+            logger.debug("[Feishu] Dropping comment event without bot mention: %s", comment_id)
+            return
+
+        dedup_key = f"comment:{comment_id}:{reply_id or 'root'}"
+        if self._is_duplicate(dedup_key):
+            logger.debug("[Feishu] Dropping duplicate comment event: %s", dedup_key)
+            return
+
+        context = await asyncio.to_thread(
+            self._resolve_comment_event_context,
+            file_token,
+            file_type,
+            comment_id,
+            reply_id or None,
+        )
+        if not context:
+            logger.debug("[Feishu] Unable to resolve comment context for %s", comment_id)
+            return
+
+        sender_profile = await self._resolve_sender_profile(SimpleNamespace(open_id=sender_open_id, user_id=None))
+        source = self.build_source(
+            chat_id=_build_feishu_comment_target(
+                file_type=context["file_type"],
+                file_token=context["file_token"],
+                comment_id=context["comment_id"],
+            ),
+            chat_name=context.get("document_title") or f"Feishu Comment {context['file_token']}",
+            chat_type="dm",
+            user_id=sender_profile["user_id"] or sender_open_id,
+            user_name=sender_profile["user_name"],
+            thread_id=context["comment_id"],
+            user_id_alt=sender_profile["user_id_alt"],
+        )
+        synthetic_event = MessageEvent(
+            text=context["prompt"],
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=data,
+            message_id=dedup_key,
+            timestamp=datetime.now(),
+        )
+        logger.info(
+            "[Feishu] Routing document comment %s on %s as synthetic event",
+            context["comment_id"],
+            context["file_token"],
+        )
         await self._handle_message_with_guards(synthetic_event)
 
     async def _execute_pending_tool_replay(
@@ -3000,6 +3222,8 @@ class FeishuAdapter(BasePlatformAdapter):
             self._on_reaction_event(event_type, data)
         elif event_type == "card.action.trigger":
             self._on_card_action_trigger(data)
+        elif event_type == "drive.notice.comment_add_v1":
+            await self._handle_comment_event(data)
         else:
             logger.debug("[Feishu] Ignoring webhook event type: %s", event_type or "unknown")
         return self._web_json_response({"code": 0, "msg": "ok"})
@@ -4050,6 +4274,15 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
+        comment_target = self._parse_comment_target(chat_id)
+        if comment_target is not None:
+            text_payload = payload
+            if msg_type == "text":
+                try:
+                    text_payload = json.loads(payload).get("text", "")
+                except Exception:
+                    text_payload = payload
+            return await self._send_comment_message(comment_target=comment_target, content=str(text_payload or ""))
         reply_in_thread = bool((metadata or {}).get("thread_id"))
         if reply_to:
             body = self._build_reply_message_body(
@@ -4069,6 +4302,55 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         request = self._build_create_message_request("chat_id", body)
         return await asyncio.to_thread(self._client.im.v1.message.create, request)
+
+    @staticmethod
+    def _parse_comment_target(chat_id: str) -> Optional[Dict[str, str]]:
+        match = _FEISHU_COMMENT_TARGET_RE.match(str(chat_id or "").strip())
+        if not match:
+            return None
+        return {
+            "file_type": match.group(1),
+            "file_token": match.group(2),
+            "comment_id": match.group(3),
+        }
+
+    async def _send_comment_message(self, *, comment_target: Dict[str, str], content: str) -> Any:
+        """把最终回复发回飞书评论线程。
+
+        先尝试回复评论线程；如果接口拒绝，再退回创建新的文档评论，保证用户能收到结果。
+        """
+        normalized = str(content or "").strip()
+        if not normalized:
+            return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id=""))
+        if normalized.endswith("NO_REPLY"):
+            return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id=""))
+
+        from tools.feishu.client import feishu_api_request
+
+        file_token = comment_target["file_token"]
+        file_type = comment_target["file_type"]
+        comment_id = comment_target["comment_id"]
+        plain_text = _strip_markdown_to_plain_text(normalized.replace("NO_REPLY", "").strip())
+        if not plain_text:
+            return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id=""))
+        elements = [{"type": "text_run", "text_run": {"text": plain_text}}]
+        try:
+            await asyncio.to_thread(
+                feishu_api_request,
+                "POST",
+                f"/open-apis/drive/v1/files/{file_token}/comments/{comment_id}/replies",
+                params={"file_type": file_type},
+                json_body={"content": {"elements": elements}},
+            )
+        except Exception:
+            await asyncio.to_thread(
+                feishu_api_request,
+                "POST",
+                f"/open-apis/drive/v1/files/{file_token}/comments",
+                params={"file_type": file_type},
+                json_body={"reply_list": {"replies": [{"content": {"elements": elements}}]}},
+            )
+        return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id=f"comment:{comment_id}"))
 
     @staticmethod
     def _response_succeeded(response: Any) -> bool:

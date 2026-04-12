@@ -24,6 +24,7 @@ def _mock_event_dispatcher_builder(mock_handler_class):
     mock_builder.register_p2_im_message_reaction_created_v1 = Mock(return_value=mock_builder)
     mock_builder.register_p2_im_message_reaction_deleted_v1 = Mock(return_value=mock_builder)
     mock_builder.register_p2_card_action_trigger = Mock(return_value=mock_builder)
+    mock_builder.register_p2_drive_notice_comment_add_v1 = Mock(return_value=mock_builder)
     mock_builder.build = Mock(return_value=object())
     mock_handler_class.builder = Mock(return_value=mock_builder)
     return mock_builder
@@ -2858,6 +2859,54 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_send_comment_target_replies_to_drive_comment(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("tools.feishu.client.feishu_api_request", return_value={"data": {}}) as api_request, patch(
+            "gateway.platforms.feishu.asyncio.to_thread",
+            side_effect=_direct,
+        ):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="feishu-comment://docx/doc_token/comment_123",
+                    content="请按评论内容处理",
+                )
+            )
+
+        self.assertTrue(result.success)
+        api_request.assert_called_once()
+        self.assertEqual(
+            api_request.call_args.args[:2],
+            ("POST", "/open-apis/drive/v1/files/doc_token/comments/comment_123/replies"),
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_comment_target_respects_no_reply_marker(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+
+        with patch("tools.feishu.client.feishu_api_request") as api_request:
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="feishu-comment://docx/doc_token/comment_123",
+                    content="NO_REPLY",
+                )
+            )
+
+        self.assertTrue(result.success)
+        api_request.assert_not_called()
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_stream_consumer_config_respects_feishu_block_streaming_settings(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -3220,6 +3269,39 @@ class TestWebhookSecurity(unittest.TestCase):
         response = asyncio.run(adapter._handle_webhook_request(request))
         self.assertEqual(response.status, 200)
         self.assertIn(b'"code": 0', response.body)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_comment_event_routes_to_comment_handler(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        body = json.dumps(
+            {
+                "header": {"event_type": "drive.notice.comment_add_v1"},
+                "event": {
+                    "comment_id": "comment_123",
+                    "notice_meta": {
+                        "file_token": "doc_token",
+                        "file_type": "docx",
+                        "from_user_id": "ou_alice",
+                        "is_mentioned": True,
+                    },
+                },
+            }
+        ).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+
+        with patch.object(adapter, "_handle_comment_event", new=AsyncMock()) as handle_comment:
+            response = asyncio.run(adapter._handle_webhook_request(request))
+
+        self.assertEqual(response.status, 200)
+        handle_comment.assert_awaited_once()
 
 
 class TestDedupTTL(unittest.TestCase):
