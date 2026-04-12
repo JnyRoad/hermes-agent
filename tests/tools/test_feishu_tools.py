@@ -20,7 +20,9 @@ def test_feishu_toolset_is_included_in_hermes_feishu():
     assert "feishu_search_doc_wiki" in resolved
     assert "feishu_bitable_app" in resolved
     assert "feishu_bitable_app_table" in resolved
+    assert "feishu_bitable_app_table_field" in resolved
     assert "feishu_bitable_app_table_record" in resolved
+    assert "feishu_bitable_app_table_view" in resolved
     assert "feishu_sheet" in resolved
     assert "feishu_fetch_doc" in resolved
     assert "feishu_ask_user_question" in resolved
@@ -262,6 +264,76 @@ def test_feishu_bitable_app_table_record_delete_handler(monkeypatch):
     )
     assert payload["deleted"] is True
     assert payload["record_id"] == "rec_1"
+
+
+def test_feishu_bitable_app_table_field_list_handler(monkeypatch):
+    from tools.feishu.bitable_app_table_field import _handle_bitable_app_table_field
+
+    monkeypatch.setattr(
+        "tools.feishu.bitable_app_table_field.feishu_api_request",
+        lambda *a, **kw: {"data": {"items": [{"field_id": "fld_1", "field_name": "Name"}], "has_more": False}},
+    )
+    payload = json.loads(
+        _handle_bitable_app_table_field({"action": "list", "app_token": "app_1", "table_id": "tbl_1"})
+    )
+    assert payload["fields"][0]["field_id"] == "fld_1"
+
+
+def test_feishu_bitable_app_table_field_update_autofills_missing_properties(monkeypatch):
+    from tools.feishu.bitable_app_table_field import _handle_bitable_app_table_field
+
+    calls = []
+
+    def _fake_request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        if method == "GET":
+            return {
+                "data": {
+                    "items": [
+                        {"field_id": "fld_1", "field_name": "Name", "type": 1, "property": {"formatter": "text"}}
+                    ]
+                }
+            }
+        return {"data": {"field": {"field_id": "fld_1", "field_name": "Full Name", "type": 1}}}
+
+    monkeypatch.setattr("tools.feishu.bitable_app_table_field.feishu_api_request", _fake_request)
+    payload = json.loads(
+        _handle_bitable_app_table_field(
+            {"action": "update", "app_token": "app_1", "table_id": "tbl_1", "field_id": "fld_1", "field_name": "Full Name"}
+        )
+    )
+    update_body = calls[-1][2]["json_body"]
+    assert update_body["type"] == 1
+    assert update_body["property"]["formatter"] == "text"
+    assert payload["field"]["field_name"] == "Full Name"
+
+
+def test_feishu_bitable_app_table_view_list_handler(monkeypatch):
+    from tools.feishu.bitable_app_table_view import _handle_bitable_app_table_view
+
+    monkeypatch.setattr(
+        "tools.feishu.bitable_app_table_view.feishu_api_request",
+        lambda *a, **kw: {"data": {"items": [{"view_id": "viw_1", "view_name": "Grid"}], "has_more": False}},
+    )
+    payload = json.loads(
+        _handle_bitable_app_table_view({"action": "list", "app_token": "app_1", "table_id": "tbl_1"})
+    )
+    assert payload["views"][0]["view_id"] == "viw_1"
+
+
+def test_feishu_bitable_app_table_view_create_handler(monkeypatch):
+    from tools.feishu.bitable_app_table_view import _handle_bitable_app_table_view
+
+    monkeypatch.setattr(
+        "tools.feishu.bitable_app_table_view.feishu_api_request",
+        lambda *a, **kw: {"data": {"view": {"view_id": "viw_1", "view_name": "Board"}}},
+    )
+    payload = json.loads(
+        _handle_bitable_app_table_view(
+            {"action": "create", "app_token": "app_1", "table_id": "tbl_1", "view_name": "Board", "view_type": "kanban"}
+        )
+    )
+    assert payload["view"]["view_name"] == "Board"
 
 
 def test_feishu_drive_file_list_handler(monkeypatch):
