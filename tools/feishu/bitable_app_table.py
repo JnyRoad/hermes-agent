@@ -35,6 +35,13 @@ def _sanitize_fields(fields: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sanitized
 
 
+def _sanitize_table_payload(table: dict[str, Any]) -> dict[str, Any]:
+    current = dict(table)
+    if isinstance(current.get("fields"), list):
+        current["fields"] = _sanitize_fields(current["fields"])
+    return current
+
+
 def _handle_bitable_app_table(args: dict, **_kw) -> str:
     action = str(args.get("action", "")).strip().lower()
     app_token = str(args.get("app_token", "")).strip()
@@ -45,9 +52,7 @@ def _handle_bitable_app_table(args: dict, **_kw) -> str:
             table = args.get("table")
             if not isinstance(table, dict):
                 return tool_error("Missing required parameter: table")
-            body = {"table": dict(table)}
-            if isinstance(body["table"].get("fields"), list):
-                body["table"]["fields"] = _sanitize_fields(body["table"]["fields"])
+            body = {"table": _sanitize_table_payload(table)}
             data = feishu_api_request(
                 "POST",
                 f"/open-apis/bitable/v1/apps/{app_token}/tables",
@@ -59,6 +64,31 @@ def _handle_bitable_app_table(args: dict, **_kw) -> str:
                     "table_id": payload.get("table_id"),
                     "default_view_id": payload.get("default_view_id"),
                     "field_id_list": payload.get("field_id_list"),
+                },
+                ensure_ascii=False,
+            )
+
+        if action == "batch_create":
+            tables = args.get("tables")
+            if not isinstance(tables, list) or not tables:
+                return tool_error("Parameter 'tables' must be a non-empty array.")
+            sanitized_tables: list[dict[str, Any]] = []
+            for index, item in enumerate(tables):
+                if not isinstance(item, dict):
+                    return tool_error(f"tables[{index}] must be an object.")
+                if not str(item.get("name", "")).strip():
+                    return tool_error(f"tables[{index}].name is required.")
+                sanitized_tables.append(_sanitize_table_payload(item))
+            data = feishu_api_request(
+                "POST",
+                f"/open-apis/bitable/v1/apps/{app_token}/tables/batch_create",
+                json_body={"tables": sanitized_tables},
+            )
+            payload = data.get("data") or {}
+            return json.dumps(
+                {
+                    "tables": payload.get("tables", []),
+                    "total": payload.get("total"),
                 },
                 ensure_ascii=False,
             )
@@ -97,7 +127,7 @@ def _handle_bitable_app_table(args: dict, **_kw) -> str:
             payload = data.get("data") or {}
             return json.dumps({"table": payload.get("table", payload)}, ensure_ascii=False)
 
-        return tool_error("Unsupported action. Supported actions: create, list, patch")
+        return tool_error("Unsupported action. Supported actions: create, list, patch, batch_create")
     except Exception as exc:
         logger.error("feishu_bitable_app_table error: %s", exc)
         return tool_error(f"Failed to execute feishu_bitable_app_table: {exc}")
@@ -105,11 +135,11 @@ def _handle_bitable_app_table(args: dict, **_kw) -> str:
 
 FEISHU_BITABLE_APP_TABLE_SCHEMA = {
     "name": "feishu_bitable_app_table",
-    "description": "Manage Feishu bitable tables. Hermes currently supports create, list, and patch.",
+    "description": "Manage Feishu bitable tables. Hermes currently supports create, list, patch, and batch_create.",
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["create", "list", "patch"], "description": "Bitable table action."},
+            "action": {"type": "string", "enum": ["create", "list", "patch", "batch_create"], "description": "Bitable table action."},
             "app_token": {"type": "string", "description": "Bitable app token."},
             "table_id": {"type": "string", "description": "Table ID for patch action."},
             "name": {"type": "string", "description": "Table name for patch action."},
@@ -135,6 +165,11 @@ FEISHU_BITABLE_APP_TABLE_SCHEMA = {
                     },
                 },
                 "required": ["name"],
+            },
+            "tables": {
+                "type": "array",
+                "description": "Table definitions for batch_create action.",
+                "items": {"type": "object"},
             },
         },
         "required": ["action", "app_token"],

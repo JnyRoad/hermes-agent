@@ -409,6 +409,33 @@ def test_feishu_bitable_app_table_create_sanitizes_field_property(monkeypatch):
     assert payload["table_id"] == "tbl_1"
 
 
+def test_feishu_bitable_app_table_batch_create_handler(monkeypatch):
+    from tools.feishu.bitable_app_table import _handle_bitable_app_table
+
+    captured = {}
+
+    def _fake_request(method, path, **kwargs):
+        captured["json_body"] = kwargs.get("json_body")
+        return {"data": {"tables": [{"table_id": "tbl_1"}, {"table_id": "tbl_2"}], "total": 2}}
+
+    monkeypatch.setattr("tools.feishu.bitable_app_table.feishu_api_request", _fake_request)
+    payload = json.loads(
+        _handle_bitable_app_table(
+            {
+                "action": "batch_create",
+                "app_token": "app_1",
+                "tables": [
+                    {"name": "Leads", "fields": [{"field_name": "Done", "type": 7, "property": {"formatter": "x"}}]},
+                    {"name": "Accounts"},
+                ],
+            }
+        )
+    )
+    assert captured["json_body"]["tables"][0]["fields"][0].get("property") is None
+    assert payload["total"] == 2
+    assert payload["tables"][1]["table_id"] == "tbl_2"
+
+
 def test_feishu_bitable_app_table_record_list_handler(monkeypatch):
     from tools.feishu.bitable_app_table_record import _handle_bitable_app_table_record
 
