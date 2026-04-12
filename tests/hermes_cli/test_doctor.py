@@ -295,6 +295,70 @@ class TestFeishuDoctorChecks:
         assert "lark-oapi SDK not installed" in out
         assert any("lark-oapi" in item for item in issues)
 
+    def test_reports_app_scope_status_when_query_succeeds(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes",
+            lambda: ["application:application:self_manage", "im:message:readonly"],
+        )
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Feishu app scopes: 2 granted" in out
+        assert "App self-manage scope available" in out
+
+    def test_warns_when_app_scope_query_cannot_run(self, monkeypatch, capsys):
+        from tools.feishu.client import FeishuAPIError
+
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes",
+            lambda: (_ for _ in ()).throw(
+                FeishuAPIError(
+                    code=99991672,
+                    message="missing application:application:self_manage",
+                    missing_scopes=["application:application:self_manage"],
+                )
+            ),
+        )
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Unable to query Feishu app scopes" in out
+        assert any("application:application:self_manage" in item for item in issues)
+
 
 def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):
     """Doctor should present CLI-gated tools as available in CLI context."""

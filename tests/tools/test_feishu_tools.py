@@ -3221,6 +3221,82 @@ def test_feishu_chat_members_auto_auth_pending(monkeypatch):
         unregister_adapter(Platform.FEISHU, adapter)
 
 
+def test_feishu_drive_handles_user_scope_error_after_api_response(monkeypatch):
+    from tools.feishu.client import FeishuAPIError
+    from tools.feishu.drive import _handle_drive_file
+
+    adapter = SimpleNamespace(
+        get_authorization_status=lambda user_open_id, scopes=None: {
+            "authorized": True,
+            "granted_scopes": list(scopes or []),
+            "requested_scopes": list(scopes or []),
+            "missing_scopes": [],
+            "updated_at": 1.0,
+            "updated_by": "ou_user_1",
+            "source": "interactive_confirm",
+        },
+        send_oauth_request_card=AsyncMock(
+            return_value=SendResult(
+                success=True,
+                message_id="msg_auth_retry_drive",
+                raw_response={"request_id": "fo_retry_drive_1"},
+            )
+        ),
+    )
+
+    register_adapter(Platform.FEISHU, adapter)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "oc_chat_1")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_user_1")
+    monkeypatch.setattr(
+        "tools.feishu.drive.feishu_api_request",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            FeishuAPIError(
+                code=99991679,
+                message="missing user scopes [space:document:delete]",
+                missing_scopes=["space:document:delete"],
+            )
+        ),
+    )
+
+    try:
+        payload = json.loads(_handle_drive_file({"action": "delete", "file_token": "file_1", "type": "file"}))
+        assert payload["status"] == "pending_authorization"
+        assert payload["missing_scopes"] == ["space:document:delete"]
+        adapter.send_oauth_request_card.assert_awaited_once()
+    finally:
+        unregister_adapter(Platform.FEISHU, adapter)
+
+
+def test_feishu_calendar_handles_app_scope_missing(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+    from tools.feishu.client import FeishuAPIError
+
+    monkeypatch.setattr("tools.feishu.scopes.get_app_granted_scopes", lambda: ["calendar:calendar.event:read"])
+    monkeypatch.setattr(
+        "tools.feishu.calendar_event.feishu_api_request",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            FeishuAPIError(
+                code=99991672,
+                message="app missing scopes [calendar:calendar.event:delete]",
+                missing_scopes=["calendar:calendar.event:delete"],
+            )
+        ),
+    )
+    payload = json.loads(
+        _handle_calendar_event(
+            {
+                "action": "delete",
+                "calendar_id": "cal_1",
+                "event_id": "evt_1",
+            }
+        )
+    )
+    assert payload["error_type"] == "app_scope_missing"
+    assert payload["missing_app_scopes"] == ["calendar:calendar.event:delete"]
+
+
 def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
     from gateway.platforms.feishu import FeishuAdapter, FeishuPendingOAuthRequest
 

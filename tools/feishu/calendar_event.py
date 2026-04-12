@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from tools.feishu.client import feishu_api_request
-from tools.feishu.scopes import ensure_authorization
+from tools.feishu.scopes import ensure_authorization, handle_authorization_error
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -365,6 +365,14 @@ def _handle_calendar_event(args: dict, **_kw) -> str:
 
         return tool_error("Unsupported action. Supported actions: create, list, get, patch, delete, search, reply, instances, instance_view")
     except Exception as exc:
+        auth_error = handle_authorization_error(
+            exc,
+            tool_name="feishu_calendar_event",
+            action=action,
+            title="Feishu Calendar Authorization Required",
+        )
+        if auth_error is not None:
+            return auth_error
         logger.error("feishu_calendar_event error: %s", exc)
         return tool_error(f"Failed to execute feishu_calendar_event: {exc}")
 

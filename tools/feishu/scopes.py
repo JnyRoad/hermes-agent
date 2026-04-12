@@ -17,6 +17,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+from tools.feishu.client import FeishuAPIError, get_app_granted_scopes
 from tools.feishu.runtime import get_active_feishu_adapter, require_feishu_session
 from tools.registry import tool_error
 
@@ -111,6 +112,29 @@ SENSITIVE_SCOPES = {
     "base:table:delete",
 }
 
+REQUIRED_APP_SCOPES: List[str] = [
+    "contact:contact.base:readonly",
+    "docx:document:readonly",
+    "im:chat:read",
+    "im:chat:update",
+    "im:message.group_at_msg:readonly",
+    "im:message.p2p_msg:readonly",
+    "im:message.pins:read",
+    "im:message.pins:write_only",
+    "im:message.reactions:read",
+    "im:message.reactions:write_only",
+    "im:message:readonly",
+    "im:message:recall",
+    "im:message:send_as_bot",
+    "im:message:send_multi_users",
+    "im:message:send_sys_msg",
+    "im:message:update",
+    "im:resource",
+    "application:application:self_manage",
+    "cardkit:card:write",
+    "cardkit:card:read",
+]
+
 
 def _run_async(coro):
     """在同步工具 handler 中安全执行协程。"""
@@ -181,6 +205,8 @@ def ensure_authorization(
     action: Optional[str],
     title: Optional[str] = None,
     reason: Optional[str] = None,
+    force_request: bool = False,
+    override_scopes: Optional[List[str]] = None,
 ) -> Optional[str]:
     """在飞书网关会话里自动检查用户授权状态。
 
@@ -191,7 +217,7 @@ def ensure_authorization(
     当前阶段只在“存在飞书会话 + 存在活跃适配器”时拦截。这样不会破坏 CLI
     或其他离线环境中直接使用 tenant token 的既有行为。
     """
-    required_scopes = get_required_scopes(tool_name, action)
+    required_scopes = _normalize_scopes(list(override_scopes or [])) or get_required_scopes(tool_name, action)
     if not required_scopes:
         return None
 
@@ -207,10 +233,12 @@ def ensure_authorization(
         return None
 
     status = adapter.get_authorization_status(user_open_id, required_scopes)
-    if status.get("authorized"):
+    if status.get("authorized") and not force_request:
         return None
 
     missing_scopes = _normalize_scopes(list(status.get("missing_scopes") or []))
+    if force_request and not missing_scopes:
+        missing_scopes = list(required_scopes)
     if not missing_scopes:
         return None
 
@@ -271,3 +299,55 @@ def ensure_authorization(
         },
         ensure_ascii=False,
     )
+
+
+def get_missing_app_scopes(required_scopes: List[str]) -> List[str]:
+    """计算当前应用尚未开通的 scopes。
+
+    如果无法查询应用权限，交由调用方决定如何降级。
+    """
+    granted = set(get_app_granted_scopes())
+    return [scope for scope in _normalize_scopes(required_scopes) if scope not in granted]
+
+
+def handle_authorization_error(
+    exc: Exception,
+    *,
+    tool_name: str,
+    action: Optional[str],
+    title: Optional[str] = None,
+) -> Optional[str]:
+    """将飞书服务端权限错误转换为更可执行的结果。
+
+    - 99991679: 用户未授权或授权不足 → 自动发授权卡
+    - 99991672: 应用未开通权限 → 返回结构化 app_scope_missing
+    """
+    if not isinstance(exc, FeishuAPIError):
+        return None
+
+    required_scopes = get_required_scopes(tool_name, action)
+    if exc.code == 99991679:
+        missing_scopes = _normalize_scopes(exc.missing_scopes or required_scopes)
+        return ensure_authorization(
+            tool_name=tool_name,
+            action=action,
+            title=title,
+            reason="The Feishu API reported that the current user still needs more permissions.",
+            force_request=True,
+            override_scopes=missing_scopes,
+        )
+
+    if exc.code == 99991672:
+        try:
+            missing_app_scopes = get_missing_app_scopes(required_scopes) or _normalize_scopes(exc.missing_scopes or required_scopes)
+        except Exception:
+            missing_app_scopes = _normalize_scopes(exc.missing_scopes or required_scopes)
+        return tool_error(
+            f"Feishu app scopes are missing for {tool_name}.{str(action or 'default').strip().lower() or 'default'}.",
+            error_type="app_scope_missing",
+            code=exc.code,
+            missing_app_scopes=missing_app_scopes,
+            requested_scopes=required_scopes,
+        )
+
+    return None

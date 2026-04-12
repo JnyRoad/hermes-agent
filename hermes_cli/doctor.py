@@ -252,6 +252,30 @@ def _check_feishu_integration(issues: list[str]) -> None:
     except ImportError:
         check_warn("lark-oapi SDK not installed", "(Feishu runtime adapter will be unavailable)")
         issues.append(f"Install lark-oapi: {_python_install_cmd()} lark-oapi")
+        return
+
+    try:
+        from tools.feishu.client import FeishuAPIError, get_app_granted_scopes
+
+        granted_scopes = get_app_granted_scopes()
+        check_ok(f"Feishu app scopes: {len(granted_scopes)} granted")
+        if "application:application:self_manage" in granted_scopes:
+            check_ok("App self-manage scope available")
+        else:
+            check_warn(
+                "App self-manage scope missing",
+                "(cannot reliably query current Feishu app permissions)",
+            )
+            issues.append("Grant application:application:self_manage to improve Feishu scope diagnostics")
+    except Exception as exc:
+        if isinstance(exc, Exception) and exc.__class__.__name__ == "FeishuAPIError" and getattr(exc, "code", None) == 99991672:
+            check_warn(
+                "Unable to query Feishu app scopes",
+                "(application:application:self_manage is missing)",
+            )
+            issues.append("Grant application:application:self_manage so Hermes can inspect Feishu app permissions")
+        else:
+            check_warn("Feishu app scope check failed", f"({exc})")
 
 
 def run_doctor(args):

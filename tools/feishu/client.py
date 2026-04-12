@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -18,6 +18,30 @@ from tools.feishu.runtime import get_feishu_platform_extra
 logger = logging.getLogger(__name__)
 
 _TOKEN_CACHE: dict[str, tuple[str, float]] = {}
+_APP_SCOPE_CACHE: dict[str, tuple[list[str], float]] = {}
+
+
+class FeishuAPIError(RuntimeError):
+    """飞书开放平台结构化错误。
+
+    保留错误码和服务端消息，便于工具层区分“应用缺权限”和“用户缺授权”。
+    """
+
+    def __init__(self, *, code: Any, message: str, missing_scopes: Optional[List[str]] = None):
+        self.code = int(code) if str(code).isdigit() else code
+        self.message = str(message or "")
+        self.missing_scopes = list(missing_scopes or [])
+        super().__init__(f"Feishu API error: code={self.code} msg={self.message}")
+
+
+def _extract_scopes_from_message(message: str) -> List[str]:
+    """从飞书报错消息中提取 `[scope1,scope2]` 片段。"""
+    import re
+
+    match = re.search(r"\[([^\]]+)\]", str(message or ""))
+    if not match:
+        return []
+    return [item.strip() for item in match.group(1).split(",") if item.strip()]
 
 
 def _feishu_domain_name() -> str:
@@ -102,8 +126,10 @@ def feishu_api_request(
     if not isinstance(data, dict):
         raise RuntimeError("Feishu API returned a non-object response.")
     if data.get("code") not in (0, None):
-        raise RuntimeError(
-            f"Feishu API error: code={data.get('code')} msg={data.get('msg') or data.get('message')}"
+        raise FeishuAPIError(
+            code=data.get("code"),
+            message=str(data.get("msg") or data.get("message") or ""),
+            missing_scopes=_extract_scopes_from_message(str(data.get("msg") or data.get("message") or "")),
         )
     return data
 
@@ -135,3 +161,32 @@ def feishu_api_request_bytes(
 def feishu_json(result: Dict[str, Any]) -> str:
     """输出标准 JSON 字符串。"""
     return json.dumps(result, ensure_ascii=False)
+
+
+def get_app_granted_scopes(force_refresh: bool = False) -> List[str]:
+    """查询当前飞书应用已开通的权限列表。
+
+    依赖 `application:application:self_manage`。如果应用未开通该权限，飞书会返回 99991672。
+    """
+    key = _cache_key()
+    now = time.time()
+    cached = _APP_SCOPE_CACHE.get(key)
+    if cached and not force_refresh and cached[1] > now + 30:
+        return list(cached[0])
+
+    app_id, _ = get_feishu_credentials()
+    data = feishu_api_request(
+        "GET",
+        f"/open-apis/application/v6/applications/{app_id}",
+        params={"lang": "zh_cn"},
+    )
+    app = data.get("data", {}).get("app", {}) if isinstance(data.get("data"), dict) else {}
+    raw_scopes = app.get("scopes") or app.get("online_version", {}).get("scopes") or []
+    scopes = [
+        str(item.get("scope", "")).strip()
+        for item in raw_scopes
+        if isinstance(item, dict) and str(item.get("scope", "")).strip()
+    ]
+    deduped = list(dict.fromkeys(scopes))
+    _APP_SCOPE_CACHE[key] = (deduped, now + 30)
+    return deduped

@@ -12,7 +12,7 @@ from urllib.parse import quote
 
 from gateway.platforms.feishu import normalize_feishu_message
 from tools.feishu.client import feishu_api_request, feishu_api_request_bytes
-from tools.feishu.scopes import ensure_authorization
+from tools.feishu.scopes import ensure_authorization, handle_authorization_error
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -346,6 +346,14 @@ def _handle_get_messages(args: dict, **_kw) -> str:
             end_time=time_range.get("end", ""),
         )
     except Exception as exc:
+        auth_error = handle_authorization_error(
+            exc,
+            tool_name="feishu_im_user_get_messages",
+            action="default",
+            title="Feishu Message Authorization Required",
+        )
+        if auth_error is not None:
+            return auth_error
         logger.error("feishu_im_user_get_messages error: %s", exc)
         return tool_error(f"Failed to get Feishu messages: {exc}")
 
@@ -373,6 +381,14 @@ def _handle_get_thread_messages(args: dict, **_kw) -> str:
             end_time=time_range.get("end", ""),
         )
     except Exception as exc:
+        auth_error = handle_authorization_error(
+            exc,
+            tool_name="feishu_im_user_get_thread_messages",
+            action="default",
+            title="Feishu Message Authorization Required",
+        )
+        if auth_error is not None:
+            return auth_error
         logger.error("feishu_im_user_get_thread_messages error: %s", exc)
         return tool_error(f"Failed to get Feishu thread messages: {exc}")
 
@@ -490,6 +506,14 @@ def _handle_search_messages(args: dict, **_kw) -> str:
             ensure_ascii=False,
         )
     except Exception as exc:
+        auth_error = handle_authorization_error(
+            exc,
+            tool_name="feishu_im_user_search_messages",
+            action="default",
+            title="Feishu Search Authorization Required",
+        )
+        if auth_error is not None:
+            return auth_error
         logger.error("feishu_im_user_search_messages error: %s", exc)
         return tool_error(f"Failed to search Feishu messages: {exc}")
 
@@ -552,6 +576,14 @@ def _handle_im_message(args: dict, **_kw) -> str:
             ensure_ascii=False,
         )
     except Exception as exc:
+        auth_error = handle_authorization_error(
+            exc,
+            tool_name="feishu_im_user_message",
+            action=action,
+            title="Feishu Send Message Authorization Required",
+        )
+        if auth_error is not None:
+            return auth_error
         logger.error("feishu_im_user_message error: %s", exc)
         return tool_error(f"Failed to send Feishu IM message: {exc}")
 
@@ -594,6 +626,14 @@ def _handle_fetch_resource(args: dict, **_kw) -> str:
             ensure_ascii=False,
         )
     except Exception as exc:
+        auth_error = handle_authorization_error(
+            exc,
+            tool_name="feishu_im_user_fetch_resource",
+            action="default",
+            title="Feishu Resource Authorization Required",
+        )
+        if auth_error is not None:
+            return auth_error
         logger.error("feishu_im_user_fetch_resource error: %s", exc)
         return tool_error(f"Failed to fetch Feishu message resource: {exc}")
 

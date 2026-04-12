@@ -11,7 +11,7 @@ from pathlib import Path
 import httpx
 
 from tools.feishu.client import feishu_api_request, feishu_api_request_bytes, get_feishu_base_url, get_tenant_access_token
-from tools.feishu.scopes import ensure_authorization
+from tools.feishu.scopes import ensure_authorization, handle_authorization_error
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -325,6 +325,14 @@ def _handle_drive_file(args: dict, **_kw) -> str:
 
         return tool_error("Unsupported action. Supported actions: list, get_meta, copy, move, delete, upload, download")
     except Exception as exc:
+        auth_error = handle_authorization_error(
+            exc,
+            tool_name="feishu_drive_file",
+            action=action,
+            title="Feishu Drive Authorization Required",
+        )
+        if auth_error is not None:
+            return auth_error
         logger.error("feishu_drive_file error: %s", exc)
         return tool_error(f"Failed to execute feishu_drive_file: {exc}")
 
