@@ -3832,8 +3832,28 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound payload construction and send pipeline
     # =========================================================================
 
-    def _build_outbound_payload(self, content: str) -> tuple[str, str]:
+    def _resolve_reply_mode(self, content: str) -> str:
+        """根据当前适配器配置决定出站消息形态。
+
+        text:
+            始终发送纯文本，避免富文本渲染差异。
+        card:
+            始终发送 post 结构，保证飞书内展示为富文本卡片样式。
+        auto:
+            仅在检测到 Markdown 语义时使用 post，其余走 text。
+        """
+        mode = str(self._reply_mode or "auto").strip().lower()
+        if mode == "text":
+            return "text"
+        if mode == "card":
+            return "post"
         if _MARKDOWN_HINT_RE.search(content):
+            return "post"
+        return "text"
+
+    def _build_outbound_payload(self, content: str) -> tuple[str, str]:
+        resolved_mode = self._resolve_reply_mode(content)
+        if resolved_mode == "post":
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
