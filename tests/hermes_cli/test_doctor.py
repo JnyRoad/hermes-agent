@@ -139,6 +139,71 @@ class TestFeishuDoctorChecks:
         assert "lark-oapi SDK" in out
         assert issues == []
 
+    def test_reports_multi_account_webhook_configuration(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                        "verification_token": "verify_primary",
+                        "encrypt_key": "encrypt_primary",
+                        "accounts": {
+                            "feishu-cn": {
+                                "app_id": "cli_cn",
+                                "app_secret": "sec_cn",
+                                "webhook_path": "/webhook/feishu-cn",
+                            }
+                        },
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Feishu accounts configured: 2" in out
+        assert "Account `feishu-cn`" in out
+        assert "Multi-account webhook routing enabled" in out
+        assert issues == []
+
+    def test_warns_when_multi_account_uses_websocket(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                        "accounts": {
+                            "feishu-cn": {
+                                "app_id": "cli_cn",
+                                "app_secret": "sec_cn",
+                            }
+                        },
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Multi-account websocket support incomplete" in out
+        assert any("webhook mode for multi-account Feishu" in item for item in issues)
+
     def test_webhook_mode_warns_when_tokens_missing(self, monkeypatch, capsys):
         cfg = GatewayConfig(
             platforms={
@@ -358,6 +423,39 @@ class TestFeishuDoctorChecks:
         out = capsys.readouterr().out
         assert "Unable to query Feishu app scopes" in out
         assert any("application:application:self_manage" in item for item in issues)
+
+    def test_collect_report_scopes_user_authorization_by_account(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr("tools.feishu.client.get_app_granted_scopes", lambda: [])
+
+        captured = {}
+
+        class _Adapter:
+            def get_authorization_status(self, user_open_id, scopes=None, account_id=None):
+                captured["account_id"] = account_id
+                return {"authorized": True, "granted_scopes": ["im:chat:read"]}
+
+        report = doctor.collect_feishu_doctor_report(
+            user_open_id="ou_user",
+            adapter=_Adapter(),
+            account_id="feishu-cn",
+        )
+        assert captured["account_id"] == "feishu-cn"
+        assert any("Current user authorization (feishu-cn): 1 granted" in item["label"] for item in report["items"])
 
 
 def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):

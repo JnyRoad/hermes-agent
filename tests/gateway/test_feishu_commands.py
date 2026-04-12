@@ -73,6 +73,21 @@ async def test_feishu_doctor_uses_shared_report(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_feishu_doctor_forwards_account_id(monkeypatch):
+    runner = _make_runner()
+    runner.adapters[Platform.FEISHU] = SimpleNamespace()
+    captured = {}
+
+    def _collect(**kwargs):
+        captured.update(kwargs)
+        return {"items": [], "issues": []}
+
+    monkeypatch.setattr("hermes_cli.doctor.collect_feishu_doctor_report", _collect)
+    await runner._handle_feishu_doctor_command(_make_event("/feishu-doctor", account_id="feishu-cn"))
+    assert captured["account_id"] == "feishu-cn"
+
+
+@pytest.mark.asyncio
 async def test_feishu_auth_status_reports_current_grants():
     runner = _make_runner()
     runner.adapters[Platform.FEISHU] = SimpleNamespace(

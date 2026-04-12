@@ -158,7 +158,7 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
         check_warn("Could not verify systemd linger", f"({linger_detail})")
 
 
-def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=None) -> dict:
+def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=None, account_id: str | None = None) -> dict:
     """汇总飞书集成诊断结果，供 CLI doctor 与网关命令复用。"""
     items: list[dict[str, str]] = []
     issues: list[str] = []
@@ -199,6 +199,27 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
     app_secret = str(feishu_config.extra.get("app_secret", "")).strip()
     connection_mode = str(feishu_config.extra.get("connection_mode", "websocket")).strip().lower() or "websocket"
     domain = str(feishu_config.extra.get("domain", "feishu")).strip().lower() or "feishu"
+    raw_accounts = feishu_config.extra.get("accounts") or {}
+    enabled_accounts: list[dict[str, str]] = []
+    if isinstance(raw_accounts, dict):
+        for raw_account_id, raw_cfg in raw_accounts.items():
+            if not isinstance(raw_cfg, dict):
+                continue
+            if raw_cfg.get("enabled", True) is False:
+                continue
+            enabled_accounts.append(
+                {
+                    "account_id": str(raw_account_id or "").strip(),
+                    "app_id": str(raw_cfg.get("app_id", "") or "").strip(),
+                    "connection_mode": str(
+                        raw_cfg.get("connection_mode")
+                        or connection_mode
+                    ).strip().lower()
+                    or connection_mode,
+                    "domain": str(raw_cfg.get("domain") or domain).strip().lower() or domain,
+                    "webhook_path": str(raw_cfg.get("webhook_path", "") or "").strip(),
+                }
+            )
 
     if app_id:
         _record("ok", "FEISHU_APP_ID configured")
@@ -217,6 +238,24 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
     else:
         _record("warn", f"Unknown connection mode: {connection_mode}", "expected websocket or webhook")
         issues.append("Set gateway.feishu.extra.connection_mode to websocket or webhook")
+
+    if enabled_accounts:
+        total_accounts = 1 + len(enabled_accounts)
+        _record("ok", f"Feishu accounts configured: {total_accounts}", "primary + enabled secondary accounts")
+        for item in enabled_accounts:
+            detail = f"app_id={item['app_id'] or 'missing'} mode={item['connection_mode']} domain={item['domain']}"
+            if item["webhook_path"]:
+                detail += f" path={item['webhook_path']}"
+            _record("info", f"Account `{item['account_id']}`", detail)
+        if total_accounts > 1 and connection_mode == "websocket":
+            _record(
+                "warn",
+                "Multi-account websocket support incomplete",
+                "secondary accounts are configured, but websocket mode still uses only the primary account",
+            )
+            issues.append("Use webhook mode for multi-account Feishu until websocket multi-account support is implemented")
+        elif total_accounts > 1 and connection_mode == "webhook":
+            _record("ok", "Multi-account webhook routing enabled", f"{total_accounts} accounts")
 
     if domain in {"feishu", "lark"}:
         _record("ok", f"Feishu domain: {domain}")
@@ -276,13 +315,23 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
 
     if adapter is not None and user_open_id:
         try:
-            auth_status = adapter.get_authorization_status(user_open_id)
+            resolved_account_id = str(account_id or "").strip() or None
+            if resolved_account_id:
+                auth_status = adapter.get_authorization_status(user_open_id, account_id=resolved_account_id)
+            else:
+                auth_status = adapter.get_authorization_status(user_open_id)
             granted_scopes = list(auth_status.get("granted_scopes") or [])
             if granted_scopes:
                 preview = ", ".join(granted_scopes[:5])
-                _record("ok", f"Current user authorization: {len(granted_scopes)} granted", preview)
+                label = "Current user authorization"
+                if resolved_account_id:
+                    label += f" ({resolved_account_id})"
+                _record("ok", f"{label}: {len(granted_scopes)} granted", preview)
             else:
-                _record("info", "Current user authorization not granted yet")
+                label = "Current user authorization not granted yet"
+                if resolved_account_id:
+                    label += f" ({resolved_account_id})"
+                _record("info", label)
         except Exception as exc:
             _record("warn", "Current user authorization status unavailable", str(exc))
 

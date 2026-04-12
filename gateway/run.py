@@ -4113,6 +4113,7 @@ class GatewayRunner:
         report = collect_feishu_doctor_report(
             user_open_id=str(event.source.user_id or "").strip() or None,
             adapter=adapter,
+            account_id=getattr(event.source, "account_id", None),
         )
         marker_map = {"ok": "✓", "warn": "⚠", "fail": "✗", "info": "→"}
         lines = ["🩺 **Feishu Doctor**", ""]
