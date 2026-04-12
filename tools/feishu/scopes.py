@@ -18,7 +18,12 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from tools.feishu.client import FeishuAPIError, get_app_granted_scopes
-from tools.feishu.runtime import get_active_feishu_adapter, register_pending_feishu_tool_replay, require_feishu_session
+from tools.feishu.runtime import (
+    get_active_feishu_adapter,
+    get_current_feishu_account_id,
+    register_pending_feishu_tool_replay,
+    require_feishu_session,
+)
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -362,16 +367,47 @@ def handle_authorization_error(
         )
 
     if exc.code == 99991672:
+        account_id = None
+        owner_open_id = ""
+        requester_open_id = ""
+        try:
+            from tools.feishu.client import get_app_info
+
+            account_id = get_current_feishu_account_id() or None
+            app_info = get_app_info(account_id=account_id)
+            owner_open_id = str(app_info.get("effective_owner_open_id", "") or "").strip()
+        except Exception:
+            owner_open_id = ""
+        try:
+            session = require_feishu_session()
+            requester_open_id = str(session.get("user_id", "") or "").strip()
+            account_id = account_id or session.get("account_id") or None
+        except Exception:
+            requester_open_id = ""
+
         try:
             missing_app_scopes = get_missing_app_scopes(required_scopes) or _normalize_scopes(exc.missing_scopes or required_scopes)
         except Exception:
             missing_app_scopes = _normalize_scopes(exc.missing_scopes or required_scopes)
+        is_owner = bool(owner_open_id and requester_open_id and owner_open_id == requester_open_id)
+        resolution_command = "/feishu auth batch" if is_owner else ""
+        resolution_hint = (
+            "Run `/feishu auth batch` in the current Feishu chat after the app owner grants the missing app scopes."
+            if is_owner
+            else "Ask the Feishu app owner to grant the missing app scopes and then run `/feishu auth batch` in chat."
+        )
         return tool_error(
             f"Feishu app scopes are missing for {tool_name}.{str(action or 'default').strip().lower() or 'default'}.",
             error_type="app_scope_missing",
             code=exc.code,
             missing_app_scopes=missing_app_scopes,
             requested_scopes=required_scopes,
+            owner_open_id=owner_open_id,
+            requester_open_id=requester_open_id,
+            requester_is_owner=is_owner,
+            resolution_command=resolution_command,
+            resolution_hint=resolution_hint,
+            account_id=account_id,
         )
 
     return None

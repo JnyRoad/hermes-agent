@@ -3553,6 +3553,14 @@ def test_feishu_calendar_handles_app_scope_missing(monkeypatch):
 
     monkeypatch.setattr("tools.feishu.scopes.get_app_granted_scopes", lambda: ["calendar:calendar.event:read"])
     monkeypatch.setattr(
+        "tools.feishu.client.get_app_info",
+        lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
+    )
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "oc_chat_1")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_owner")
+    monkeypatch.setenv("HERMES_SESSION_ACCOUNT_ID", "feishu-cn")
+    monkeypatch.setattr(
         "tools.feishu.calendar_event.feishu_api_request",
         lambda *a, **kw: (_ for _ in ()).throw(
             FeishuAPIError(
@@ -3573,6 +3581,52 @@ def test_feishu_calendar_handles_app_scope_missing(monkeypatch):
     )
     assert payload["error_type"] == "app_scope_missing"
     assert payload["missing_app_scopes"] == ["calendar:calendar.event:delete"]
+    assert payload["owner_open_id"] == "ou_owner"
+    assert payload["requester_is_owner"] is True
+    assert payload["resolution_command"] == "/feishu auth batch"
+    assert payload["account_id"] == "feishu-cn"
+
+
+def test_feishu_calendar_app_scope_missing_for_non_owner_has_owner_hint(monkeypatch):
+    from tools.feishu.calendar_event import _handle_calendar_event
+    from tools.feishu.client import FeishuAPIError
+
+    monkeypatch.setattr("tools.feishu.scopes.get_app_granted_scopes", lambda: ["calendar:calendar.event:read"])
+    monkeypatch.setattr(
+        "tools.feishu.client.get_app_info",
+        lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
+    )
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "oc_chat_1")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_member")
+    monkeypatch.setenv("HERMES_SESSION_ACCOUNT_ID", "feishu-cn")
+    monkeypatch.setattr(
+        "tools.feishu.calendar_event.feishu_api_request",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            FeishuAPIError(
+                code=99991672,
+                message="app missing scopes [calendar:calendar.event:delete]",
+                missing_scopes=["calendar:calendar.event:delete"],
+            )
+        ),
+    )
+
+    payload = json.loads(
+        _handle_calendar_event(
+            {
+                "action": "delete",
+                "calendar_id": "cal_1",
+                "event_id": "evt_1",
+            }
+        )
+    )
+
+    assert payload["error_type"] == "app_scope_missing"
+    assert payload["owner_open_id"] == "ou_owner"
+    assert payload["requester_open_id"] == "ou_member"
+    assert payload["requester_is_owner"] is False
+    assert payload["resolution_command"] == ""
+    assert "Ask the Feishu app owner" in payload["resolution_hint"]
 
 
 def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):
