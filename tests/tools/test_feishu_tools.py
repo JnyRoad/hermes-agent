@@ -3556,6 +3556,25 @@ def test_feishu_calendar_handles_app_scope_missing(monkeypatch):
         "tools.feishu.client.get_app_info",
         lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
     )
+    adapter = SimpleNamespace(
+        get_authorization_status=lambda user_open_id, scopes=None, account_id=None: {
+            "authorized": True,
+            "granted_scopes": list(scopes or []),
+            "requested_scopes": list(scopes or []),
+            "missing_scopes": [],
+            "updated_at": 1.0,
+            "updated_by": "ou_owner",
+            "source": "interactive_confirm",
+        },
+        send_app_scope_request_card=AsyncMock(
+            return_value=SendResult(
+                success=True,
+                message_id="msg_app_scope_1",
+                raw_response={"request_id": "fas_1"},
+            )
+        )
+    )
+    register_adapter(Platform.FEISHU, adapter)
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "oc_chat_1")
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_owner")
@@ -3579,12 +3598,24 @@ def test_feishu_calendar_handles_app_scope_missing(monkeypatch):
             }
         )
     )
-    assert payload["error_type"] == "app_scope_missing"
-    assert payload["missing_app_scopes"] == ["calendar:calendar.event:delete"]
-    assert payload["owner_open_id"] == "ou_owner"
-    assert payload["requester_is_owner"] is True
-    assert payload["resolution_command"] == "/feishu auth batch"
-    assert payload["account_id"] == "feishu-cn"
+    try:
+        assert payload["error_type"] == "app_scope_missing"
+        assert payload["missing_app_scopes"] == ["calendar:calendar.event:delete"]
+        assert payload["owner_open_id"] == "ou_owner"
+        assert payload["requester_is_owner"] is True
+        assert payload["resolution_command"] == "/feishu auth batch"
+        assert payload["account_id"] == "feishu-cn"
+        assert payload["request_created"] is True
+        assert payload["request_id"] == "fas_1"
+        assert payload["message_id"] == "msg_app_scope_1"
+        assert payload["replay_id"].startswith("fr_")
+        adapter.send_app_scope_request_card.assert_awaited_once()
+        kwargs = adapter.send_app_scope_request_card.await_args.kwargs
+        assert kwargs["metadata"]["tool_name"] == "feishu_calendar_event"
+        assert kwargs["metadata"]["action"] == "delete"
+        assert kwargs["metadata"]["owner_open_id"] == "ou_owner"
+    finally:
+        unregister_adapter(Platform.FEISHU, adapter)
 
 
 def test_feishu_calendar_app_scope_missing_for_non_owner_has_owner_hint(monkeypatch):
@@ -3596,6 +3627,25 @@ def test_feishu_calendar_app_scope_missing_for_non_owner_has_owner_hint(monkeypa
         "tools.feishu.client.get_app_info",
         lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
     )
+    adapter = SimpleNamespace(
+        get_authorization_status=lambda user_open_id, scopes=None, account_id=None: {
+            "authorized": True,
+            "granted_scopes": list(scopes or []),
+            "requested_scopes": list(scopes or []),
+            "missing_scopes": [],
+            "updated_at": 1.0,
+            "updated_by": "ou_owner",
+            "source": "interactive_confirm",
+        },
+        send_app_scope_request_card=AsyncMock(
+            return_value=SendResult(
+                success=True,
+                message_id="msg_app_scope_2",
+                raw_response={"request_id": "fas_2"},
+            )
+        )
+    )
+    register_adapter(Platform.FEISHU, adapter)
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "oc_chat_1")
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_member")
@@ -3620,13 +3670,122 @@ def test_feishu_calendar_app_scope_missing_for_non_owner_has_owner_hint(monkeypa
             }
         )
     )
+    try:
+        assert payload["error_type"] == "app_scope_missing"
+        assert payload["owner_open_id"] == "ou_owner"
+        assert payload["requester_open_id"] == "ou_member"
+        assert payload["requester_is_owner"] is False
+        assert payload["resolution_command"] == ""
+        assert "Ask the Feishu app owner" in payload["resolution_hint"]
+        assert payload["request_created"] is True
+        assert payload["request_id"] == "fas_2"
+        adapter.send_app_scope_request_card.assert_awaited_once()
+    finally:
+        unregister_adapter(Platform.FEISHU, adapter)
 
-    assert payload["error_type"] == "app_scope_missing"
-    assert payload["owner_open_id"] == "ou_owner"
-    assert payload["requester_open_id"] == "ou_member"
-    assert payload["requester_is_owner"] is False
-    assert payload["resolution_command"] == ""
-    assert "Ask the Feishu app owner" in payload["resolution_hint"]
+
+def test_feishu_adapter_promotes_app_scope_request_to_user_oauth(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingAppScopeRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._pending_app_scope_requests["fas_1"] = FeishuPendingAppScopeRequest(
+        request_id="fas_1",
+        chat_id="oc_chat_1",
+        message_id="msg_app_scope_1",
+        scopes=["calendar:calendar.event:delete"],
+        reason="App scopes are required.",
+        title="Feishu App Authorization Required",
+        owner_open_id="ou_owner",
+        requester_open_id="ou_requester",
+        thread_id="omt_1",
+        account_id="feishu-cn",
+        tool_name="feishu_calendar_event",
+        tool_action="delete",
+        replay_id="fr_1",
+    )
+    adapter.record_authorization_grant(
+        user_open_id="ou_requester",
+        scopes=["calendar:calendar:read"],
+        account_id="feishu-cn",
+    )
+    adapter._resolve_sender_profile = AsyncMock(
+        return_value={"user_id": "ou_owner", "user_name": "Alice", "user_id_alt": "ou_owner"}
+    )
+    adapter._update_interactive_card = AsyncMock()
+    adapter.send_oauth_request_card = AsyncMock(return_value=SendResult(success=True, message_id="msg_oauth_1"))
+    monkeypatch.setattr(
+        "tools.feishu.client.get_app_granted_scopes_by_token_type",
+        lambda *args, **kwargs: ["calendar:calendar:read", "calendar:calendar.event:delete"],
+    )
+
+    event = SimpleNamespace(
+        token="tok_app_scope_1",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_owner"),
+        action=SimpleNamespace(tag="button", value={"hermes_action": "complete_app_scope_request", "request_id": "fas_1"}),
+    )
+
+    import asyncio
+
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+    assert "fas_1" not in adapter._pending_app_scope_requests
+    adapter._update_interactive_card.assert_awaited_once()
+    adapter.send_oauth_request_card.assert_awaited_once()
+    kwargs = adapter.send_oauth_request_card.await_args.kwargs
+    assert kwargs["chat_id"] == "oc_chat_1"
+    assert kwargs["scopes"] == ["calendar:calendar.event:delete"]
+    assert kwargs["metadata"]["requester_open_id"] == "ou_requester"
+    assert kwargs["metadata"]["replay_id"] == "fr_1"
+
+
+def test_feishu_adapter_rejects_app_scope_completion_before_scopes_exist(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingAppScopeRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._pending_app_scope_requests["fas_1"] = FeishuPendingAppScopeRequest(
+        request_id="fas_1",
+        chat_id="oc_chat_1",
+        message_id="msg_app_scope_1",
+        scopes=["calendar:calendar.event:delete"],
+        reason="App scopes are required.",
+        title="Feishu App Authorization Required",
+        owner_open_id="ou_owner",
+        requester_open_id="ou_requester",
+        account_id="feishu-cn",
+    )
+    adapter._resolve_sender_profile = AsyncMock(
+        return_value={"user_id": "ou_owner", "user_name": "Alice", "user_id_alt": "ou_owner"}
+    )
+    adapter._update_interactive_card = AsyncMock()
+    adapter.send_oauth_request_card = AsyncMock()
+    monkeypatch.setattr(
+        "tools.feishu.client.get_app_granted_scopes_by_token_type",
+        lambda *args, **kwargs: ["calendar:calendar:read"],
+    )
+
+    event = SimpleNamespace(
+        token="tok_app_scope_2",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_owner"),
+        action=SimpleNamespace(tag="button", value={"hermes_action": "complete_app_scope_request", "request_id": "fas_1"}),
+    )
+
+    import asyncio
+
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+    assert "fas_1" in adapter._pending_app_scope_requests
+    adapter._update_interactive_card.assert_awaited_once()
+    adapter.send_oauth_request_card.assert_not_awaited()
 
 
 def test_feishu_adapter_merges_pending_oauth_request(monkeypatch):

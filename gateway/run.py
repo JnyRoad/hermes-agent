@@ -3137,7 +3137,8 @@ class GatewayRunner:
                         f"{_compress_token_threshold:,}",
                     )
 
-                    _hyg_meta = _build_source_metadata(adapter, source)
+                    _hyg_adapter = self.adapters.get(source.platform)
+                    _hyg_meta = _build_source_metadata(_hyg_adapter, source)
 
                     try:
                         from run_agent import AIAgent

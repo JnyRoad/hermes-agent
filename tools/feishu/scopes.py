@@ -370,6 +370,10 @@ def handle_authorization_error(
         account_id = None
         owner_open_id = ""
         requester_open_id = ""
+        replay_id = ""
+        request_created = False
+        request_id = ""
+        message_id = ""
         try:
             from tools.feishu.client import get_app_info
 
@@ -382,6 +386,12 @@ def handle_authorization_error(
             session = require_feishu_session()
             requester_open_id = str(session.get("user_id", "") or "").strip()
             account_id = account_id or session.get("account_id") or None
+            if tool_args is not None:
+                replay_id = register_pending_feishu_tool_replay(
+                    tool_name=tool_name,
+                    args=tool_args,
+                    session=session,
+                )
         except Exception:
             requester_open_id = ""
 
@@ -389,6 +399,35 @@ def handle_authorization_error(
             missing_app_scopes = get_missing_app_scopes(required_scopes) or _normalize_scopes(exc.missing_scopes or required_scopes)
         except Exception:
             missing_app_scopes = _normalize_scopes(exc.missing_scopes or required_scopes)
+        try:
+            session = require_feishu_session()
+            adapter = get_active_feishu_adapter()
+            result = _run_async(
+                adapter.send_app_scope_request_card(
+                    chat_id=str(session.get("chat_id", "") or "").strip(),
+                    scopes=missing_app_scopes,
+                    reason=(
+                        "The Feishu API reported that the application is missing app scopes for this action."
+                    ),
+                    title="Feishu App Authorization Required",
+                    metadata={
+                        "thread_id": session.get("thread_id") or None,
+                        "account_id": account_id,
+                        "owner_open_id": owner_open_id,
+                        "requester_open_id": requester_open_id,
+                        "tool_name": tool_name,
+                        "action": str(action or "").strip().lower() or "default",
+                        "replay_id": replay_id or None,
+                    },
+                )
+            )
+            if result.success:
+                request_created = True
+                message_id = str(result.message_id or "").strip()
+                raw_response = result.raw_response if isinstance(result.raw_response, dict) else {}
+                request_id = str(raw_response.get("request_id", "") or "").strip()
+        except Exception:
+            logger.debug("failed to create Feishu app-scope request card", exc_info=True)
         is_owner = bool(owner_open_id and requester_open_id and owner_open_id == requester_open_id)
         resolution_command = "/feishu auth batch" if is_owner else ""
         resolution_hint = (
@@ -408,6 +447,10 @@ def handle_authorization_error(
             resolution_command=resolution_command,
             resolution_hint=resolution_hint,
             account_id=account_id,
+            request_created=request_created,
+            request_id=request_id,
+            message_id=message_id,
+            replay_id=replay_id,
         )
 
     return None

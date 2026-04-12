@@ -366,6 +366,25 @@ class FeishuPendingOAuthRequest:
 
 
 @dataclass
+class FeishuPendingAppScopeRequest:
+    """等待应用所有者完成 app scope 配置的卡片状态。"""
+
+    request_id: str
+    chat_id: str
+    message_id: str
+    scopes: List[str]
+    reason: str
+    title: str
+    owner_open_id: str = ""
+    requester_open_id: str = ""
+    thread_id: str = ""
+    account_id: str = ""
+    tool_name: str = ""
+    tool_action: str = "default"
+    replay_id: str = ""
+
+
+@dataclass
 class FeishuAuthorizationGrant:
     """记录某个飞书用户在当前应用上的已确认授权范围。"""
 
@@ -1237,6 +1256,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._approval_counter = itertools.count(1)
         self._pending_questions: Dict[str, FeishuPendingQuestion] = {}
         self._pending_oauth_requests: Dict[str, FeishuPendingOAuthRequest] = {}
+        self._pending_app_scope_requests: Dict[str, FeishuPendingAppScopeRequest] = {}
         self._authorization_grants: Dict[str, Dict[str, FeishuAuthorizationGrant]] = {}
         self._load_seen_message_ids()
         self._load_authorization_grants()
@@ -2048,6 +2068,186 @@ class FeishuAdapter(BasePlatformAdapter):
             return result
         except Exception as exc:
             logger.warning("[Feishu] send_oauth_request_card failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def send_app_scope_request_card(
+        self,
+        *,
+        chat_id: str,
+        scopes: List[str],
+        reason: str,
+        title: str = "Feishu App Authorization Required",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """发送应用级缺权提示卡片，并在 owner 确认后续接用户批量授权。"""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        def _build_app_scope_body(
+            *,
+            scope_items: List[str],
+            reason_text: str,
+            owner_id: str,
+            requester_id: str,
+        ) -> str:
+            scope_lines = "\n".join(f"- `{scope}`" for scope in scope_items)
+            owner_line = f"`{owner_id}`" if owner_id else "the Feishu app owner"
+            requester_line = f"`{requester_id}`" if requester_id else "the current requester"
+            body = (
+                f"{reason_text}\n\n"
+                "The Feishu application is still missing required app scopes. "
+                "Grant them in the developer console before Hermes retries the action.\n\n"
+                f"Missing app scopes:\n{scope_lines}\n\n"
+                f"App owner: {owner_line}\n"
+                f"Requester waiting for continuation: {requester_line}"
+            )
+            if owner_id:
+                body += (
+                    "\n\nAfter the owner grants these scopes, they can click the button below. "
+                    "Hermes will then continue with user authorization if it is still needed."
+                )
+            return body
+
+        request_id = f"fas_{uuid.uuid4().hex[:12]}"
+        scopes = self._normalize_scope_list(scopes)
+        metadata = dict(metadata or {})
+        thread_id = str(metadata.get("thread_id", "") or "").strip()
+        requester_open_id = str(metadata.get("requester_open_id", "") or "").strip()
+        owner_open_id = str(metadata.get("owner_open_id", "") or "").strip()
+        account_id = str(metadata.get("account_id", "") or "").strip()
+        tool_name = str(metadata.get("tool_name", "") or "").strip()
+        tool_action = str(metadata.get("action", "") or "").strip().lower() or "default"
+        replay_id = str(metadata.get("replay_id", "") or "").strip()
+
+        for state in self._pending_app_scope_requests.values():
+            if state.chat_id != chat_id:
+                continue
+            if (state.thread_id or "") != thread_id:
+                continue
+            if requester_open_id and state.requester_open_id and state.requester_open_id != requester_open_id:
+                continue
+            if owner_open_id and state.owner_open_id and state.owner_open_id != owner_open_id:
+                continue
+            merged_scopes = self._normalize_scope_list([*state.scopes, *scopes])
+            merged_reason = state.reason
+            if reason and reason != state.reason:
+                merged_reason = f"{state.reason}\n\nAdditional missing app scopes were reported by a later action."
+            actions: List[Dict[str, Any]] = []
+            if owner_open_id or state.owner_open_id:
+                actions.append(
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "I Granted App Scopes"},
+                        "type": "primary",
+                        "value": {
+                            "hermes_action": "complete_app_scope_request",
+                            "request_id": state.request_id,
+                        },
+                    }
+                )
+            await self._update_interactive_card(
+                message_id=state.message_id,
+                title=state.title or title,
+                body_markdown=_build_app_scope_body(
+                    scope_items=merged_scopes,
+                    reason_text=merged_reason,
+                    owner_id=owner_open_id or state.owner_open_id,
+                    requester_id=requester_open_id or state.requester_open_id,
+                ),
+                template="orange",
+                button_label="I Granted App Scopes" if actions else None,
+                button_value=actions[0]["value"] if actions else None,
+                account_id=account_id or state.account_id or None,
+            )
+            state.scopes = merged_scopes
+            state.reason = merged_reason
+            state.title = state.title or title
+            if owner_open_id:
+                state.owner_open_id = state.owner_open_id or owner_open_id
+            if requester_open_id:
+                state.requester_open_id = state.requester_open_id or requester_open_id
+            if account_id:
+                state.account_id = state.account_id or account_id
+            if tool_name:
+                state.tool_name = state.tool_name or tool_name
+            if tool_action:
+                state.tool_action = state.tool_action or tool_action
+            if replay_id:
+                state.replay_id = state.replay_id or replay_id
+            return SendResult(
+                success=True,
+                message_id=state.message_id,
+                raw_response={"request_id": state.request_id, "merged": True},
+            )
+
+        elements: List[Dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": _build_app_scope_body(
+                    scope_items=scopes,
+                    reason_text=reason,
+                    owner_id=owner_open_id,
+                    requester_id=requester_open_id,
+                ),
+            }
+        ]
+        if owner_open_id:
+            elements.append(
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "I Granted App Scopes"},
+                            "type": "primary",
+                            "value": {
+                                "hermes_action": "complete_app_scope_request",
+                                "request_id": request_id,
+                            },
+                        }
+                    ],
+                }
+            )
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": title, "tag": "plain_text"},
+                "template": "orange",
+            },
+            "elements": elements,
+        }
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=json.dumps(card, ensure_ascii=False),
+                reply_to=None,
+                metadata=metadata,
+            )
+            result = self._finalize_send_result(response, "send_app_scope_request_card failed")
+            if result.success:
+                self._pending_app_scope_requests[request_id] = FeishuPendingAppScopeRequest(
+                    request_id=request_id,
+                    chat_id=chat_id,
+                    message_id=result.message_id or "",
+                    scopes=list(scopes),
+                    reason=reason,
+                    title=title,
+                    owner_open_id=owner_open_id,
+                    requester_open_id=requester_open_id,
+                    thread_id=thread_id,
+                    account_id=account_id,
+                    tool_name=tool_name,
+                    tool_action=tool_action,
+                    replay_id=replay_id,
+                )
+                result.raw_response = {
+                    **(result.raw_response if isinstance(result.raw_response, dict) else {}),
+                    "request_id": request_id,
+                }
+            return result
+        except Exception as exc:
+            logger.warning("[Feishu] send_app_scope_request_card failed: %s", exc)
             return SendResult(success=False, error=str(exc))
 
     async def _update_interactive_card(
@@ -3185,6 +3385,107 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
                 logger.info("[Feishu] Routed OAuth completion for %s from %s", request_id, user_name)
                 await self._handle_message_with_guards(synthetic_event)
+                return
+
+            if hermes_action == "complete_app_scope_request":
+                request_id = str(action_value.get("request_id", "") or "")
+                state = self._pending_app_scope_requests.pop(request_id, None)
+                if not state:
+                    logger.debug("[Feishu] App scope request %s already resolved or unknown", request_id)
+                    return
+
+                if state.owner_open_id and state.owner_open_id != open_id:
+                    logger.warning(
+                        "[Feishu] Ignoring app scope completion from %s for request %s owned by %s",
+                        open_id,
+                        request_id,
+                        state.owner_open_id,
+                    )
+                    self._pending_app_scope_requests[request_id] = state
+                    return
+
+                account_id = self._extract_event_account_id(data)
+                resolved_account_id = account_id or state.account_id or None
+                sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
+                user_name = sender_profile.get("user_name") or open_id
+
+                from tools.feishu.client import get_app_granted_scopes_by_token_type
+
+                granted_user_scopes = self._normalize_scope_list(
+                    list(get_app_granted_scopes_by_token_type("user", force_refresh=True, account_id=resolved_account_id))
+                )
+                remaining_scopes = [scope for scope in state.scopes if scope not in set(granted_user_scopes)]
+                if remaining_scopes:
+                    state.scopes = remaining_scopes
+                    self._pending_app_scope_requests[request_id] = state
+                    await self._update_interactive_card(
+                        message_id=state.message_id,
+                        title=state.title,
+                        body_markdown=(
+                            f"{state.reason}\n\n"
+                            f"**Checked by:** {user_name}\n"
+                            f"**Still missing app scopes:** {', '.join(remaining_scopes)}\n\n"
+                            "Hermes could not verify that the app scopes are granted yet. "
+                            "Please confirm the developer console changes and try again."
+                        ),
+                        template="orange",
+                        button_label="I Granted App Scopes",
+                        button_value={
+                            "hermes_action": "complete_app_scope_request",
+                            "request_id": request_id,
+                        },
+                        account_id=resolved_account_id,
+                    )
+                    return
+
+                follow_up_missing_scopes: List[str] = []
+                if state.requester_open_id:
+                    status = self.get_authorization_status(
+                        state.requester_open_id,
+                        granted_user_scopes,
+                        account_id=resolved_account_id,
+                    )
+                    follow_up_missing_scopes = self._normalize_scope_list(list(status.get("missing_scopes") or []))
+
+                await self._update_interactive_card(
+                    message_id=state.message_id,
+                    title=state.title,
+                    body_markdown=(
+                        f"{state.reason}\n\n"
+                        f"**Confirmed by owner:** {user_name}\n"
+                        f"**App scopes verified:** {', '.join(granted_user_scopes) if granted_user_scopes else 'none'}\n"
+                        f"**Next user auth scopes:** {', '.join(follow_up_missing_scopes) if follow_up_missing_scopes else 'none'}"
+                    ),
+                    template="green",
+                    account_id=resolved_account_id,
+                )
+
+                if not state.requester_open_id or not follow_up_missing_scopes:
+                    return
+
+                await self.send_oauth_request_card(
+                    chat_id=state.chat_id,
+                    scopes=follow_up_missing_scopes,
+                    reason=(
+                        "The Feishu app owner has granted the missing app scopes. "
+                        "Complete the remaining user authorization to continue the original action."
+                    ),
+                    title="Feishu Batch Authorization Required",
+                    metadata={
+                        "thread_id": state.thread_id or None,
+                        "account_id": resolved_account_id,
+                        "requester_open_id": state.requester_open_id,
+                        "tool_name": state.tool_name,
+                        "action": state.tool_action,
+                        "replay_id": state.replay_id or None,
+                    },
+                )
+                logger.info(
+                    "[Feishu] Promoted app scope request %s to user authorization for %s",
+                    request_id,
+                    state.requester_open_id,
+                )
                 return
 
             approval_id = action_value.get("approval_id")
