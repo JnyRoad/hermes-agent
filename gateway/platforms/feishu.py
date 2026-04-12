@@ -331,6 +331,7 @@ class FeishuPendingOAuthRequest:
     requester_open_id: str = ""
     tool_name: str = ""
     tool_action: str = "default"
+    replay_id: str = ""
 
 
 @dataclass
@@ -1661,6 +1662,7 @@ class FeishuAdapter(BasePlatformAdapter):
         requester_open_id = str(metadata.get("requester_open_id", "") or "").strip()
         tool_name = str(metadata.get("tool_name", "") or "").strip()
         tool_action = str(metadata.get("action", "") or "").strip().lower() or "default"
+        replay_id = str(metadata.get("replay_id", "") or "").strip()
 
         for state in self._pending_oauth_requests.values():
             if state.chat_id != chat_id:
@@ -1691,6 +1693,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 state.tool_name = state.tool_name or tool_name
             if tool_action:
                 state.tool_action = state.tool_action or tool_action
+            if replay_id:
+                state.replay_id = state.replay_id or replay_id
             return SendResult(
                 success=True,
                 message_id=state.message_id,
@@ -1745,6 +1749,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     requester_open_id=requester_open_id,
                     tool_name=tool_name,
                     tool_action=tool_action,
+                    replay_id=replay_id,
                 )
                 result.raw_response = {
                     **(result.raw_response if isinstance(result.raw_response, dict) else {}),
@@ -2229,6 +2234,62 @@ class FeishuAdapter(BasePlatformAdapter):
         logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
         await self._handle_message_with_guards(synthetic_event)
 
+    async def _execute_pending_tool_replay(
+        self,
+        *,
+        state: FeishuPendingOAuthRequest,
+        requester_open_id: str,
+    ) -> bool:
+        """授权完成后直接重放原始工具调用，并把结果回发到当前会话。
+
+        这里走工具注册表的同步 dispatch，避免重新进入完整 agent 循环。
+        目标是把“缺权限 -> 授权 -> 重放”闭环收敛到平台侧，而不是再依赖模型理解
+        提示文本后自行重试一次。
+        """
+        replay_id = str(state.replay_id or "").strip()
+        if not replay_id:
+            return False
+        pending_replays = getattr(self, "_pending_tool_replays", None)
+        if not isinstance(pending_replays, dict):
+            return False
+        replay = pending_replays.pop(replay_id, None)
+        if not isinstance(replay, dict):
+            return False
+
+        tool_name = str(replay.get("tool_name", "") or "").strip()
+        args = replay.get("args") if isinstance(replay.get("args"), dict) else {}
+        if not tool_name:
+            return False
+
+        from tools.registry import registry
+
+        result_text = await asyncio.to_thread(registry.dispatch, tool_name, args, task_id=None, user_task=None)
+        try:
+            parsed = json.loads(result_text)
+        except Exception:
+            parsed = {"raw_result": result_text}
+
+        if isinstance(parsed, dict) and parsed.get("error"):
+            body = (
+                f"Feishu authorized tool replay failed.\n\n"
+                f"Tool: `{tool_name}`\n"
+                f"Authorized user: `{requester_open_id}`\n\n"
+                f"Error:\n```json\n{json.dumps(parsed, ensure_ascii=False, indent=2)}\n```"
+            )
+        else:
+            body = (
+                f"Feishu authorized tool replay completed.\n\n"
+                f"Tool: `{tool_name}`\n"
+                f"Authorized user: `{requester_open_id}`\n\n"
+                f"Result:\n```json\n{json.dumps(parsed, ensure_ascii=False, indent=2)}\n```"
+            )
+        send_result = await self.send(
+            state.chat_id,
+            body,
+            metadata={"thread_id": state.thread_id or None},
+        )
+        return bool(send_result.success)
+
     def _is_card_action_duplicate(self, token: str) -> bool:
         """Return True if this card action token was already processed within the dedup window."""
         now = time.time()
@@ -2345,6 +2406,18 @@ class FeishuAdapter(BasePlatformAdapter):
                     ),
                     template="green",
                 )
+                replayed = await self._execute_pending_tool_replay(
+                    state=state,
+                    requester_open_id=authorized_open_id,
+                )
+                if replayed:
+                    logger.info(
+                        "[Feishu] Replayed authorized tool %s.%s for %s",
+                        state.tool_name or "unknown",
+                        state.tool_action or "default",
+                        authorized_open_id,
+                    )
+                    return
 
                 chat_info = await self.get_chat_info(chat_id)
                 source = self.build_source(

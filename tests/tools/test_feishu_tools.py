@@ -2947,6 +2947,9 @@ def test_feishu_drive_auto_auth_pending(monkeypatch):
         assert payload["tool"] == "feishu_drive_file"
         assert payload["action"] == "delete"
         assert payload["missing_scopes"] == ["space:document:delete"]
+        assert payload["replay_id"].startswith("fr_")
+        pending = getattr(adapter, "_pending_tool_replays")
+        assert pending[payload["replay_id"]]["tool_name"] == "feishu_drive_file"
         adapter.send_oauth_request_card.assert_awaited_once()
     finally:
         unregister_adapter(Platform.FEISHU, adapter)
@@ -3365,6 +3368,7 @@ def test_feishu_adapter_records_oauth_completion(monkeypatch):
         requester_open_id="ou_requester",
         tool_name="feishu_drive_file",
         tool_action="delete",
+        replay_id="fr_1",
     )
     adapter._resolve_sender_profile = AsyncMock(
         return_value={"user_id": "ou_operator", "user_name": "Alice", "user_id_alt": "ou_operator"}
@@ -3372,6 +3376,20 @@ def test_feishu_adapter_records_oauth_completion(monkeypatch):
     adapter.get_chat_info = AsyncMock(return_value={"name": "Backend Chat", "chat_type": "group"})
     adapter._update_interactive_card = AsyncMock()
     adapter._handle_message_with_guards = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg_result"))
+    adapter._pending_tool_replays = {
+        "fr_1": {
+            "tool_name": "feishu_drive_file",
+            "args": {"action": "delete", "file_token": "file_1", "type": "file"},
+            "chat_id": "oc_chat_1",
+            "thread_id": "",
+            "user_id": "ou_requester",
+        }
+    }
+    monkeypatch.setattr(
+        "tools.registry.registry.dispatch",
+        lambda name, args, **kwargs: json.dumps({"success": True, "tool": name, "args": args}, ensure_ascii=False),
+    )
 
     event = SimpleNamespace(
         token="tok_auth_1",
@@ -3386,10 +3404,11 @@ def test_feishu_adapter_records_oauth_completion(monkeypatch):
     assert status["authorized"] is True
     assert status["missing_scopes"] == []
     adapter._update_interactive_card.assert_awaited_once()
-    adapter._handle_message_with_guards.assert_awaited_once()
-    routed_event = adapter._handle_message_with_guards.await_args.args[0]
-    assert "Retry tool: feishu_drive_file" in routed_event.text
-    assert "Retry action: delete" in routed_event.text
+    adapter.send.assert_awaited_once()
+    sent_text = adapter.send.await_args.args[1]
+    assert "Feishu authorized tool replay completed" in sent_text
+    assert "`feishu_drive_file`" in sent_text
+    adapter._handle_message_with_guards.assert_not_awaited()
 
 
 def test_feishu_adapter_rejects_oauth_completion_from_other_user(monkeypatch):

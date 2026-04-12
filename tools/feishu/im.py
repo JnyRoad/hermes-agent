@@ -330,6 +330,7 @@ def _handle_get_messages(args: dict, **_kw) -> str:
             tool_name="feishu_im_user_get_messages",
             action="default",
             title="Feishu Message Authorization Required",
+            tool_args=args,
         )
         if auth_result is not None:
             return auth_result
@@ -351,6 +352,7 @@ def _handle_get_messages(args: dict, **_kw) -> str:
             tool_name="feishu_im_user_get_messages",
             action="default",
             title="Feishu Message Authorization Required",
+            tool_args=args,
         )
         if auth_error is not None:
             return auth_error
@@ -367,6 +369,7 @@ def _handle_get_thread_messages(args: dict, **_kw) -> str:
             tool_name="feishu_im_user_get_thread_messages",
             action="default",
             title="Feishu Message Authorization Required",
+            tool_args=args,
         )
         if auth_result is not None:
             return auth_result
@@ -386,6 +389,7 @@ def _handle_get_thread_messages(args: dict, **_kw) -> str:
             tool_name="feishu_im_user_get_thread_messages",
             action="default",
             title="Feishu Message Authorization Required",
+            tool_args=args,
         )
         if auth_error is not None:
             return auth_error
@@ -399,6 +403,7 @@ def _handle_search_messages(args: dict, **_kw) -> str:
             tool_name="feishu_im_user_search_messages",
             action="default",
             title="Feishu Search Authorization Required",
+            tool_args=args,
         )
         if auth_result is not None:
             return auth_result
@@ -511,6 +516,7 @@ def _handle_search_messages(args: dict, **_kw) -> str:
             tool_name="feishu_im_user_search_messages",
             action="default",
             title="Feishu Search Authorization Required",
+            tool_args=args,
         )
         if auth_error is not None:
             return auth_error
@@ -531,6 +537,7 @@ def _handle_im_message(args: dict, **_kw) -> str:
             tool_name="feishu_im_user_message",
             action=action,
             title="Feishu Send Message Authorization Required",
+            tool_args=args,
         )
         if auth_result is not None:
             return auth_result
@@ -581,6 +588,7 @@ def _handle_im_message(args: dict, **_kw) -> str:
             tool_name="feishu_im_user_message",
             action=action,
             title="Feishu Send Message Authorization Required",
+            tool_args=args,
         )
         if auth_error is not None:
             return auth_error
@@ -599,6 +607,7 @@ def _handle_fetch_resource(args: dict, **_kw) -> str:
             tool_name="feishu_im_user_fetch_resource",
             action="default",
             title="Feishu Resource Authorization Required",
+            tool_args=args,
         )
         if auth_result is not None:
             return auth_result
@@ -631,6 +640,7 @@ def _handle_fetch_resource(args: dict, **_kw) -> str:
             tool_name="feishu_im_user_fetch_resource",
             action="default",
             title="Feishu Resource Authorization Required",
+            tool_args=args,
         )
         if auth_error is not None:
             return auth_error

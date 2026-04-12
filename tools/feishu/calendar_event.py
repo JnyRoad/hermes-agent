@@ -120,6 +120,7 @@ def _handle_calendar_event(args: dict, **_kw) -> str:
             tool_name="feishu_calendar_event",
             action=action,
             title="Feishu Calendar Authorization Required",
+            tool_args=args,
         )
         if auth_result is not None:
             return auth_result
@@ -370,6 +371,7 @@ def _handle_calendar_event(args: dict, **_kw) -> str:
             tool_name="feishu_calendar_event",
             action=action,
             title="Feishu Calendar Authorization Required",
+            tool_args=args,
         )
         if auth_error is not None:
             return auth_error

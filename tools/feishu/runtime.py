@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import Any, Dict
 
 from gateway.adapter_registry import get_adapter
@@ -43,3 +44,40 @@ def get_feishu_platform_extra() -> Dict[str, Any]:
     if not platform_config:
         return {}
     return dict(platform_config.extra or {})
+
+
+def register_pending_feishu_tool_replay(
+    *,
+    tool_name: str,
+    args: Dict[str, Any],
+    session: Dict[str, str] | None = None,
+) -> str:
+    """为后续授权完成后的工具自动重放登记一条请求。
+
+    数据保存在活跃飞书适配器实例上，生命周期跟随网关进程。这里不做跨进程持久化，
+    因为 replay 只针对当前会话内、当前聊天上下文中的短周期授权闭环。
+    """
+    adapter = get_active_feishu_adapter()
+    current_session = session or require_feishu_session()
+    pending = getattr(adapter, "_pending_tool_replays", None)
+    if pending is None:
+        pending = {}
+        setattr(adapter, "_pending_tool_replays", pending)
+    replay_id = f"fr_{uuid.uuid4().hex[:12]}"
+    pending[replay_id] = {
+        "tool_name": str(tool_name or "").strip(),
+        "args": dict(args or {}),
+        "chat_id": str(current_session.get("chat_id", "") or "").strip(),
+        "thread_id": str(current_session.get("thread_id", "") or "").strip(),
+        "user_id": str(current_session.get("user_id", "") or "").strip(),
+    }
+    return replay_id
+
+
+def pop_pending_feishu_tool_replay(replay_id: str) -> Dict[str, Any] | None:
+    """取出并移除待自动重放的工具调用。"""
+    adapter = get_active_feishu_adapter()
+    pending = getattr(adapter, "_pending_tool_replays", None)
+    if not isinstance(pending, dict):
+        return None
+    return pending.pop(str(replay_id or "").strip(), None)

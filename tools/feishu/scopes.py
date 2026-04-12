@@ -18,7 +18,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from tools.feishu.client import FeishuAPIError, get_app_granted_scopes
-from tools.feishu.runtime import get_active_feishu_adapter, require_feishu_session
+from tools.feishu.runtime import get_active_feishu_adapter, register_pending_feishu_tool_replay, require_feishu_session
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -207,6 +207,7 @@ def ensure_authorization(
     reason: Optional[str] = None,
     force_request: bool = False,
     override_scopes: Optional[List[str]] = None,
+    tool_args: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """在飞书网关会话里自动检查用户授权状态。
 
@@ -231,6 +232,16 @@ def ensure_authorization(
     chat_id = str(session.get("chat_id", "") or "").strip()
     if not user_open_id or not chat_id:
         return None
+    replay_id = ""
+    if tool_args is not None:
+        try:
+            replay_id = register_pending_feishu_tool_replay(
+                tool_name=tool_name,
+                args=tool_args,
+                session=session,
+            )
+        except Exception:
+            logger.debug("failed to register pending Feishu tool replay", exc_info=True)
 
     status = adapter.get_authorization_status(user_open_id, required_scopes)
     if status.get("authorized") and not force_request:
@@ -270,6 +281,7 @@ def ensure_authorization(
                 "requester_open_id": user_open_id,
                 "tool_name": tool_name,
                 "action": action_name,
+                "replay_id": replay_id or None,
             },
         )
     )
@@ -296,6 +308,7 @@ def ensure_authorization(
             "sensitive_scopes": sensitive_scopes,
             "message_id": result.message_id,
             "request_id": raw_response.get("request_id"),
+            "replay_id": replay_id,
         },
         ensure_ascii=False,
     )
@@ -316,6 +329,7 @@ def handle_authorization_error(
     tool_name: str,
     action: Optional[str],
     title: Optional[str] = None,
+    tool_args: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """将飞书服务端权限错误转换为更可执行的结果。
 
@@ -335,6 +349,7 @@ def handle_authorization_error(
             reason="The Feishu API reported that the current user still needs more permissions.",
             force_request=True,
             override_scopes=missing_scopes,
+            tool_args=tool_args,
         )
 
     if exc.code == 99991672:

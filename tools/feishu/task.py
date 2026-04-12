@@ -53,6 +53,7 @@ def _handle_task(args: dict, **_kw) -> str:
             tool_name="feishu_task_task",
             action=action,
             title="Feishu Task Authorization Required",
+            tool_args=args,
         )
         if auth_result is not None:
             return auth_result
@@ -161,6 +162,7 @@ def _handle_task(args: dict, **_kw) -> str:
             tool_name="feishu_task_task",
             action=action,
             title="Feishu Task Authorization Required",
+            tool_args=args,
         )
         if auth_error is not None:
             return auth_error
