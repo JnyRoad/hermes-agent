@@ -290,6 +290,27 @@ class FeishuAdapterSettings:
     streaming_cards_enabled: bool = True
     block_streaming_enabled: bool = True
     block_streaming_coalesce_ms: int = 600
+    accounts: Dict[str, "FeishuAccountSettings"] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FeishuAccountSettings:
+    """飞书账号级配置，供多账号 webhook 路由与归属校验使用。"""
+
+    account_id: str
+    app_id: str
+    app_secret: str
+    domain_name: str
+    connection_mode: str
+    encrypt_key: str
+    verification_token: str
+    bot_open_id: str
+    bot_user_id: str
+    bot_name: str
+    webhook_path: str
+    webhook_port: int
+    webhook_host: str
+    enabled: bool = True
 
 
 @dataclass
@@ -1222,6 +1243,62 @@ class FeishuAdapter(BasePlatformAdapter):
         raw_group_allow_from = extra.get("group_allow_from", [])
         group_allow_from = frozenset(str(u).strip() for u in raw_group_allow_from if str(u).strip())
 
+        def _build_account_settings(account_id: str, account_extra: Dict[str, Any]) -> FeishuAccountSettings:
+            """解析单个飞书账号配置，并继承顶层默认值。"""
+            return FeishuAccountSettings(
+                account_id=account_id,
+                app_id=str(account_extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")).strip(),
+                app_secret=str(account_extra.get("app_secret") or os.getenv("FEISHU_APP_SECRET", "")).strip(),
+                domain_name=str(
+                    account_extra.get("domain") or extra.get("domain") or os.getenv("FEISHU_DOMAIN", "feishu")
+                ).strip().lower(),
+                connection_mode=str(
+                    account_extra.get("connection_mode")
+                    or extra.get("connection_mode")
+                    or os.getenv("FEISHU_CONNECTION_MODE", "websocket")
+                ).strip().lower(),
+                encrypt_key=str(account_extra.get("encrypt_key") or os.getenv("FEISHU_ENCRYPT_KEY", "")).strip(),
+                verification_token=str(
+                    account_extra.get("verification_token") or os.getenv("FEISHU_VERIFICATION_TOKEN", "")
+                ).strip(),
+                bot_open_id=str(account_extra.get("bot_open_id") or os.getenv("FEISHU_BOT_OPEN_ID", "")).strip(),
+                bot_user_id=str(account_extra.get("bot_user_id") or os.getenv("FEISHU_BOT_USER_ID", "")).strip(),
+                bot_name=str(account_extra.get("bot_name") or os.getenv("FEISHU_BOT_NAME", "")).strip(),
+                webhook_host=str(
+                    account_extra.get("webhook_host")
+                    or extra.get("webhook_host")
+                    or os.getenv("FEISHU_WEBHOOK_HOST", _DEFAULT_WEBHOOK_HOST)
+                ).strip(),
+                webhook_port=int(
+                    account_extra.get("webhook_port")
+                    or extra.get("webhook_port")
+                    or os.getenv("FEISHU_WEBHOOK_PORT", str(_DEFAULT_WEBHOOK_PORT))
+                ),
+                webhook_path=(
+                    str(
+                        account_extra.get("webhook_path")
+                        or extra.get("webhook_path")
+                        or os.getenv("FEISHU_WEBHOOK_PATH", _DEFAULT_WEBHOOK_PATH)
+                    ).strip()
+                    or _DEFAULT_WEBHOOK_PATH
+                ),
+                enabled=_to_boolean(account_extra.get("enabled", True)),
+            )
+
+        account_settings: Dict[str, FeishuAccountSettings] = {}
+        raw_accounts = extra.get("accounts") or {}
+        if isinstance(raw_accounts, dict):
+            for account_id, account_cfg in raw_accounts.items():
+                if not isinstance(account_cfg, dict):
+                    continue
+                parsed = _build_account_settings(str(account_id).strip(), account_cfg)
+                if parsed.enabled and parsed.app_id and parsed.app_secret:
+                    account_settings[parsed.account_id] = parsed
+
+        primary_account = _build_account_settings("default", extra)
+        if primary_account.app_id and primary_account.app_secret:
+            account_settings.setdefault(primary_account.account_id, primary_account)
+
         return FeishuAdapterSettings(
             app_id=str(extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")).strip(),
             app_secret=str(extra.get("app_secret") or os.getenv("FEISHU_APP_SECRET", "")).strip(),
@@ -1295,6 +1372,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 default=600,
                 min_value=50,
             ),
+            accounts=account_settings,
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1336,6 +1414,24 @@ class FeishuAdapter(BasePlatformAdapter):
         self._streaming_cards_enabled = settings.streaming_cards_enabled
         self._block_streaming_enabled = settings.block_streaming_enabled
         self._block_streaming_coalesce_ms = settings.block_streaming_coalesce_ms
+        self._accounts = dict(settings.accounts)
+        self._account_by_app_id = {
+            account.app_id: account for account in self._accounts.values() if account.app_id
+        }
+        self._accounts_by_webhook_path = {
+            account.webhook_path: account
+            for account in self._accounts.values()
+            if account.webhook_path
+        }
+        self._bot_open_ids = {
+            account.bot_open_id for account in self._accounts.values() if account.bot_open_id
+        }
+        self._bot_user_ids = {
+            account.bot_user_id for account in self._accounts.values() if account.bot_user_id
+        }
+        self._bot_names = {
+            account.bot_name for account in self._accounts.values() if account.bot_name
+        }
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -1361,6 +1457,37 @@ class FeishuAdapter(BasePlatformAdapter):
             builder = builder.register_p2_im_chat_member_bot_deleted_v1(self._on_bot_removed_from_chat)
         return builder.build()
 
+    def _resolve_account_for_request(self, payload: Dict[str, Any], request: Any = None) -> Optional[FeishuAccountSettings]:
+        """根据 app_id 或 webhook path 解析当前请求所属的飞书账号。"""
+        header = payload.get("header") or {}
+        incoming_app_id = str(header.get("app_id") or payload.get("app_id") or "").strip()
+        if incoming_app_id:
+            return self._account_by_app_id.get(incoming_app_id)
+        request_path = str(getattr(request, "path", "") or "").strip()
+        if request_path:
+            return self._accounts_by_webhook_path.get(request_path)
+        return self._account_by_app_id.get(self._app_id)
+
+    @staticmethod
+    def _inject_event_account(data: Any, account: Optional[FeishuAccountSettings]) -> Any:
+        """把解析出的账号信息挂到事件对象上，供后续路由与自消息过滤使用。"""
+        if account is None:
+            return data
+        try:
+            setattr(data, "_hermes_feishu_account_id", account.account_id)
+            setattr(data, "_hermes_feishu_app_id", account.app_id)
+            event = getattr(data, "event", None)
+            if event is not None:
+                setattr(event, "_hermes_feishu_account_id", account.account_id)
+                setattr(event, "_hermes_feishu_app_id", account.app_id)
+                notice_meta = getattr(event, "notice_meta", None)
+                if notice_meta is not None:
+                    setattr(notice_meta, "_hermes_feishu_account_id", account.account_id)
+                    setattr(notice_meta, "_hermes_feishu_app_id", account.app_id)
+        except Exception:
+            logger.debug("[Feishu] Failed to attach account metadata to event", exc_info=True)
+        return data
+
     async def connect(self) -> bool:
         """Connect to Feishu/Lark."""
         if not FEISHU_AVAILABLE:
@@ -1375,6 +1502,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._connection_mode,
             )
             return False
+        if self._connection_mode == "websocket" and len(self._accounts) > 1:
+            logger.warning(
+                "[Feishu] Multiple accounts configured, but websocket mode currently uses only the primary account %s",
+                self._app_id or "unknown",
+            )
 
         try:
             self._app_lock_identity = self._app_id
@@ -2505,7 +2637,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if not file_token or not file_type or not comment_id or not sender_open_id:
             logger.debug("[Feishu] Dropping malformed comment event: missing token/comment/sender")
             return
-        if sender_open_id == self._bot_open_id:
+        if sender_open_id == self._bot_open_id or sender_open_id in getattr(self, "_bot_open_ids", set()):
             logger.debug("[Feishu] Dropping self-authored comment event on %s", file_token)
             return
         if not self._allow_dm_message(SimpleNamespace(open_id=sender_open_id, user_id=None)):
@@ -3174,13 +3306,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def _handle_webhook_request(self, request: Any) -> Any:
         remote_ip = (getattr(request, "remote", None) or "unknown")
-
-        # Rate limiting — composite key: app_id:path:remote_ip (matches openclaw key structure).
-        rate_key = f"{self._app_id}:{self._webhook_path}:{remote_ip}"
-        if not self._check_webhook_rate_limit(rate_key):
-            logger.warning("[Feishu] Webhook rate limit exceeded for %s", remote_ip)
-            self._record_webhook_anomaly(remote_ip, "429")
-            return self._web_response(status=429, text="Too Many Requests")
+        request_path = str(getattr(request, "path", "") or self._webhook_path)
 
         # Content-Type guard — Feishu always sends application/json.
         headers = getattr(request, "headers", {}) or {}
@@ -3226,30 +3352,50 @@ class FeishuAdapter(BasePlatformAdapter):
         if payload.get("type") == "url_verification":
             return self._web_json_response({"challenge": payload.get("challenge", "")})
 
-        # 应用归属校验：如果事件头里带了 app_id，则必须与当前 adapter 配置一致，
-        # 避免同机多应用或错误回调地址把别的应用事件投递进来。
         header = payload.get("header") or {}
         incoming_app_id = str(header.get("app_id") or payload.get("app_id") or "").strip()
-        if incoming_app_id and incoming_app_id != self._app_id:
+        account = self._resolve_account_for_request(payload, request)
+        resolved_app_id = account.app_id if account else self._app_id
+
+        # Rate limiting — composite key: app_id:path:remote_ip (matches openclaw key structure).
+        rate_key = f"{resolved_app_id}:{request_path}:{remote_ip}"
+        if not self._check_webhook_rate_limit(rate_key):
+            logger.warning("[Feishu] Webhook rate limit exceeded for %s", remote_ip)
+            self._record_webhook_anomaly(remote_ip, "429")
+            return self._web_response(status=429, text="Too Many Requests")
+
+        # 应用归属校验：优先按 event app_id 找账号，再校验 path 与账号归属是否一致，
+        # 避免多应用共用一台 Hermes 时把事件投递到错误账号路由。
+        if incoming_app_id and not account:
             logger.warning(
-                "[Feishu] Webhook rejected: event app_id %s does not match configured app_id %s from %s",
+                "[Feishu] Webhook rejected: event app_id %s is not configured on this adapter from %s",
                 incoming_app_id,
-                self._app_id,
+                remote_ip,
+            )
+            self._record_webhook_anomaly(remote_ip, "403-app")
+            return self._web_response(status=403, text="Event app_id is not configured")
+        if incoming_app_id and incoming_app_id != resolved_app_id:
+            logger.warning(
+                "[Feishu] Webhook rejected: event app_id %s does not match resolved account app_id %s from %s",
+                incoming_app_id,
+                resolved_app_id,
                 remote_ip,
             )
             self._record_webhook_anomaly(remote_ip, "403-app")
             return self._web_response(status=403, text="Event app_id does not match configured app")
 
         # Verification token check — second layer of defence beyond signature (matches openclaw).
-        if self._verification_token:
+        verification_token = account.verification_token if account else self._verification_token
+        if verification_token:
             incoming_token = str(header.get("token") or payload.get("token") or "")
-            if not incoming_token or not hmac.compare_digest(incoming_token, self._verification_token):
+            if not incoming_token or not hmac.compare_digest(incoming_token, verification_token):
                 logger.warning("[Feishu] Webhook rejected: invalid verification token from %s", remote_ip)
                 self._record_webhook_anomaly(remote_ip, "401-token")
                 return self._web_response(status=401, text="Invalid verification token")
 
         # Timing-safe signature verification (only enforced when encrypt_key is set).
-        if self._encrypt_key and not self._is_webhook_signature_valid(request.headers, body_bytes):
+        encrypt_key = account.encrypt_key if account else self._encrypt_key
+        if encrypt_key and not self._is_webhook_signature_valid(request.headers, body_bytes, encrypt_key=encrypt_key):
             logger.warning("[Feishu] Webhook rejected: invalid signature from %s", remote_ip)
             self._record_webhook_anomaly(remote_ip, "401-sig")
             return self._web_response(status=401, text="Invalid signature")
@@ -3262,7 +3408,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._clear_webhook_anomaly(remote_ip)
 
         event_type = str((payload.get("header") or {}).get("event_type") or "")
-        data = self._namespace_from_mapping(payload)
+        data = self._inject_event_account(self._namespace_from_mapping(payload), account)
         if event_type == "im.message.receive_v1":
             self._on_message_event(data)
         elif event_type == "im.message.message_read_v1":
@@ -3281,7 +3427,7 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Ignoring webhook event type: %s", event_type or "unknown")
         return self._web_json_response({"code": 0, "msg": "ok"})
 
-    def _is_webhook_signature_valid(self, headers: Any, body_bytes: bytes) -> bool:
+    def _is_webhook_signature_valid(self, headers: Any, body_bytes: bytes, *, encrypt_key: Optional[str] = None) -> bool:
         """Verify Feishu webhook signature using timing-safe comparison.
 
         Feishu signature algorithm:
@@ -3295,7 +3441,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return False
         try:
             body_str = body_bytes.decode("utf-8", errors="replace")
-            content = f"{timestamp}{nonce}{self._encrypt_key}{body_str}"
+            content = f"{timestamp}{nonce}{encrypt_key or self._encrypt_key}{body_str}"
             computed = hashlib.sha256(content.encode("utf-8")).hexdigest()
             return hmac.compare_digest(computed, signature)
         except Exception:
@@ -3957,11 +4103,17 @@ class FeishuAdapter(BasePlatformAdapter):
             mention_user_id = getattr(mention_id, "user_id", None)
             mention_name = (getattr(mention, "name", None) or "").strip()
 
-            if self._bot_open_id and mention_open_id == self._bot_open_id:
+            if (self._bot_open_id and mention_open_id == self._bot_open_id) or (
+                mention_open_id and mention_open_id in getattr(self, "_bot_open_ids", set())
+            ):
                 return True
-            if self._bot_user_id and mention_user_id == self._bot_user_id:
+            if (self._bot_user_id and mention_user_id == self._bot_user_id) or (
+                mention_user_id and mention_user_id in getattr(self, "_bot_user_ids", set())
+            ):
                 return True
-            if self._bot_name and mention_name == self._bot_name:
+            if (self._bot_name and mention_name == self._bot_name) or (
+                mention_name and mention_name in getattr(self, "_bot_names", set())
+            ):
                 return True
 
         return False
@@ -3972,6 +4124,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if self._bot_open_id and self._bot_open_id in mentioned_ids:
             return True
         if self._bot_user_id and self._bot_user_id in mentioned_ids:
+            return True
+        if any(bot_open_id in mentioned_ids for bot_open_id in getattr(self, "_bot_open_ids", set())):
+            return True
+        if any(bot_user_id in mentioned_ids for bot_user_id in getattr(self, "_bot_user_ids", set())):
             return True
         return False
 
@@ -4514,7 +4670,14 @@ class FeishuAdapter(BasePlatformAdapter):
             raise RuntimeError("failed to build Feishu event handler")
         await self._hydrate_bot_identity()
         app = web.Application()
-        app.router.add_post(self._webhook_path, self._handle_webhook_request)
+        webhook_paths = {self._webhook_path}
+        webhook_paths.update(
+            account.webhook_path
+            for account in self._accounts.values()
+            if account.enabled and account.connection_mode == "webhook" and account.webhook_path
+        )
+        for webhook_path in sorted(webhook_paths):
+            app.router.add_post(webhook_path, self._handle_webhook_request)
         self._webhook_runner = web.AppRunner(app)
         await self._webhook_runner.setup()
         self._webhook_site = web.TCPSite(self._webhook_runner, self._webhook_host, self._webhook_port)

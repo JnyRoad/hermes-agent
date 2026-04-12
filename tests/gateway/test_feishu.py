@@ -289,6 +289,55 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         runner.setup.assert_awaited_once()
         site.start.assert_awaited_once()
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_connect_webhook_mode_registers_secondary_account_paths(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        add_post = Mock()
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "webhook",
+                    "webhook_path": "/webhook/primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "connection_mode": "webhook",
+                            "webhook_path": "/webhook/secondary",
+                        }
+                    },
+                }
+            )
+        )
+        runner = AsyncMock()
+        site = AsyncMock()
+        web_module = SimpleNamespace(
+            Application=lambda: SimpleNamespace(router=SimpleNamespace(add_post=add_post)),
+            AppRunner=lambda _app: runner,
+            TCPSite=lambda _runner, host, port: SimpleNamespace(start=site.start, host=host, port=port),
+        )
+
+        with (
+            patch("gateway.platforms.feishu.FEISHU_AVAILABLE", True),
+            patch("gateway.platforms.feishu.FEISHU_WEBHOOK_AVAILABLE", True),
+            patch("gateway.platforms.feishu.EventDispatcherHandler") as mock_handler_class,
+            patch("gateway.platforms.feishu.acquire_scoped_lock", return_value=(True, None)),
+            patch("gateway.platforms.feishu.release_scoped_lock"),
+            patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
+            patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+            patch("gateway.platforms.feishu.web", web_module),
+        ):
+            _mock_event_dispatcher_builder(mock_handler_class)
+            connected = asyncio.run(adapter.connect())
+
+        self.assertTrue(connected)
+        registered_paths = {call.args[0] for call in add_post.call_args_list}
+        self.assertEqual(registered_paths, {"/webhook/primary", "/webhook/secondary"})
+
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
         "FEISHU_APP_SECRET": "secret_app",
@@ -613,6 +662,34 @@ class TestAdapterModule(unittest.TestCase):
 
         self.assertIsNone(settings.ws_ping_interval)
         self.assertIsNone(settings.ws_ping_timeout)
+
+    def test_load_settings_collects_multi_account_webhook_config(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        settings = FeishuAdapter._load_settings(
+            {
+                "app_id": "cli_primary",
+                "app_secret": "sec_primary",
+                "accounts": {
+                    "feishu-cn": {
+                        "app_id": "cli_cn",
+                        "app_secret": "sec_cn",
+                        "webhook_path": "/feishu-cn",
+                    },
+                    "feishu-disabled": {
+                        "app_id": "cli_disabled",
+                        "app_secret": "sec_disabled",
+                        "enabled": False,
+                    },
+                },
+            }
+        )
+
+        self.assertIn("default", settings.accounts)
+        self.assertIn("feishu-cn", settings.accounts)
+        self.assertNotIn("feishu-disabled", settings.accounts)
+        self.assertEqual(settings.accounts["feishu-cn"].app_id, "cli_cn")
+        self.assertEqual(settings.accounts["feishu-cn"].webhook_path, "/feishu-cn")
 
     def test_runtime_ws_overrides_reapply_after_sdk_configure(self):
         import sys
@@ -3122,6 +3199,35 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertIn("**Tool Activity**", rendered)
         self.assertIn('- 📄 feishu_fetch_doc: "spec.md"', rendered)
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_apply_settings_indexes_secondary_account_identities(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "bot_open_id": "ou_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "bot_open_id": "ou_secondary",
+                            "bot_user_id": "ouu_secondary",
+                            "bot_name": "Hermes CN",
+                            "webhook_path": "/webhook/feishu-secondary",
+                        }
+                    },
+                }
+            )
+        )
+
+        self.assertIn("ou_secondary", adapter._bot_open_ids)
+        self.assertIn("ouu_secondary", adapter._bot_user_ids)
+        self.assertIn("Hermes CN", adapter._bot_names)
+
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
 class TestWebhookSecurity(unittest.TestCase):
@@ -3380,6 +3486,91 @@ class TestWebhookSecurity(unittest.TestCase):
         )
         response = asyncio.run(adapter._handle_webhook_request(request))
         self.assertEqual(response.status, 403)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_request_accepts_event_for_secondary_account_path(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "verification_token": "verify_secondary",
+                            "webhook_path": "/webhook/feishu-secondary",
+                        }
+                    },
+                }
+            )
+        )
+        body = json.dumps(
+            {
+                "header": {
+                    "event_type": "unknown.event",
+                    "app_id": "cli_secondary",
+                    "token": "verify_secondary",
+                }
+            }
+        ).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            path="/webhook/feishu-secondary",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+
+        response = asyncio.run(adapter._handle_webhook_request(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertIn(b'"code": 0', response.body)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_request_rejects_secondary_account_with_wrong_token(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "verification_token": "verify_secondary",
+                            "webhook_path": "/webhook/feishu-secondary",
+                        }
+                    },
+                }
+            )
+        )
+        body = json.dumps(
+            {
+                "header": {
+                    "event_type": "unknown.event",
+                    "app_id": "cli_secondary",
+                    "token": "wrong_token",
+                }
+            }
+        ).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            path="/webhook/feishu-secondary",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+
+        response = asyncio.run(adapter._handle_webhook_request(request))
+
+        self.assertEqual(response.status, 401)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_webhook_request_rejects_encrypted_payload(self):
