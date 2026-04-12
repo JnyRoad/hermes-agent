@@ -210,6 +210,25 @@ def _handle_drive_file(args: dict, **_kw) -> str:
                 ensure_ascii=False,
             )
 
+        if action == "delete":
+            file_token = str(args.get("file_token", "")).strip()
+            file_type = str(args.get("type", "")).strip()
+            if not file_token or not file_type:
+                return tool_error("Parameters 'file_token' and 'type' are required for delete.")
+            feishu_api_request(
+                "DELETE",
+                f"/open-apis/drive/v1/files/{file_token}",
+                params={"type": file_type},
+            )
+            return json.dumps(
+                {
+                    "success": True,
+                    "file_token": file_token,
+                    "type": file_type,
+                },
+                ensure_ascii=False,
+            )
+
         if action == "upload":
             file_path = str(args.get("file_path", "")).strip()
             file_content_base64 = str(args.get("file_content_base64", "")).strip()
@@ -295,7 +314,7 @@ def _handle_drive_file(args: dict, **_kw) -> str:
                 ensure_ascii=False,
             )
 
-        return tool_error("Unsupported action. Supported actions: list, get_meta, copy, move, upload, download")
+        return tool_error("Unsupported action. Supported actions: list, get_meta, copy, move, delete, upload, download")
     except Exception as exc:
         logger.error("feishu_drive_file error: %s", exc)
         return tool_error(f"Failed to execute feishu_drive_file: {exc}")
@@ -303,13 +322,13 @@ def _handle_drive_file(args: dict, **_kw) -> str:
 
 FEISHU_DRIVE_FILE_SCHEMA = {
     "name": "feishu_drive_file",
-    "description": "Manage Feishu Drive files. Supported actions in Hermes now: list, get_meta, copy, move, upload, and download.",
+    "description": "Manage Feishu Drive files. Supported actions in Hermes now: list, get_meta, copy, move, delete, upload, and download.",
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "get_meta", "copy", "move", "upload", "download"],
+                "enum": ["list", "get_meta", "copy", "move", "delete", "upload", "download"],
                 "description": "Drive action to execute.",
             },
             "folder_token": {"type": "string", "description": "Folder token for list action."},
@@ -338,12 +357,12 @@ FEISHU_DRIVE_FILE_SCHEMA = {
                         "required": ["doc_token", "doc_type"],
                 },
             },
-            "file_token": {"type": "string", "description": "File token for copy or move action."},
+            "file_token": {"type": "string", "description": "File token for copy, move, delete, or download action."},
             "name": {"type": "string", "description": "Target file name for copy action."},
             "type": {
                 "type": "string",
                 "enum": ["doc", "sheet", "file", "bitable", "docx", "folder", "mindnote", "slides"],
-                "description": "Drive file type for copy or move action.",
+                "description": "Drive file type for copy, move, or delete action.",
             },
             "file_path": {"type": "string", "description": "Absolute local file path for upload action."},
             "file_content_base64": {"type": "string", "description": "Base64-encoded file content for upload action."},

@@ -34,6 +34,7 @@ def test_feishu_toolset_is_included_in_hermes_feishu():
     assert "feishu_chat_members" in resolved
     assert "feishu_im_user_search_messages" in resolved
     assert "feishu_im_user_message" in resolved
+    assert "feishu_im_bot_image" in resolved
     assert "feishu_calendar_calendar" in resolved
     assert "feishu_calendar_event" in resolved
     assert "feishu_calendar_event_attendee" in resolved
@@ -242,6 +243,42 @@ def test_feishu_sheet_export_rejects_invalid_extension(monkeypatch):
 
     payload = json.loads(_handle_sheet({"action": "export", "spreadsheet_token": "sht_1", "file_extension": "pdf"}))
     assert "file_extension" in payload["error"]
+
+
+def test_feishu_drive_delete_handler(monkeypatch):
+    from tools.feishu.drive import _handle_drive_file
+
+    calls = []
+
+    def _fake_request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"data": {}}
+
+    monkeypatch.setattr("tools.feishu.drive.feishu_api_request", _fake_request)
+    payload = json.loads(_handle_drive_file({"action": "delete", "file_token": "file_1", "type": "file"}))
+    assert payload["success"] is True
+    assert calls[0][0] == "DELETE"
+    assert calls[0][1].endswith("/drive/v1/files/file_1")
+
+
+def test_feishu_im_bot_image_handler(monkeypatch):
+    from tools.feishu.im_bot_image import _handle_im_bot_image
+
+    monkeypatch.setattr(
+        "tools.feishu.im_bot_image.feishu_api_request_bytes",
+        lambda *a, **kw: (b"image-bytes", {"content-type": "image/png"}),
+    )
+    payload = json.loads(_handle_im_bot_image({"message_id": "om_1", "file_key": "img_1", "type": "image"}))
+    assert payload["message_id"] == "om_1"
+    assert payload["content_type"] == "image/png"
+    assert Path(payload["saved_path"]).exists()
+
+
+def test_feishu_im_bot_image_requires_valid_type(monkeypatch):
+    from tools.feishu.im_bot_image import _handle_im_bot_image
+
+    payload = json.loads(_handle_im_bot_image({"message_id": "om_1", "file_key": "img_1", "type": "video"}))
+    assert "type" in payload["error"]
 
 
 def test_feishu_doc_comments_list_handler(monkeypatch):

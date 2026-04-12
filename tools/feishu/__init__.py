@@ -17,6 +17,7 @@ from . import doc_media  # noqa: F401
 from . import docs  # noqa: F401
 from . import drive  # noqa: F401
 from . import im  # noqa: F401
+from . import im_bot_image  # noqa: F401
 from . import oauth  # noqa: F401
 from . import people  # noqa: F401
 from . import search  # noqa: F401

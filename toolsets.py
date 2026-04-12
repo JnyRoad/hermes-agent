@@ -232,6 +232,7 @@ TOOLSETS = {
             "feishu_im_user_search_messages",
             "feishu_im_user_fetch_resource",
             "feishu_im_user_message",
+            "feishu_im_bot_image",
             "feishu_task_comment",
             "feishu_task_section",
             "feishu_task_subtask",
