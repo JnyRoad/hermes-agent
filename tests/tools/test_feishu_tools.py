@@ -960,6 +960,13 @@ def test_feishu_drive_file_get_meta_handler(monkeypatch):
     assert payload["metas"][0]["title"] == "Spec"
 
 
+def test_feishu_drive_file_get_meta_requires_request_docs(monkeypatch):
+    from tools.feishu.drive import _handle_drive_file
+
+    payload = json.loads(_handle_drive_file({"action": "get_meta"}))
+    assert "request_docs" in payload["error"]
+
+
 def test_feishu_drive_file_copy_handler(monkeypatch):
     from tools.feishu.drive import _handle_drive_file
 
@@ -973,6 +980,15 @@ def test_feishu_drive_file_copy_handler(monkeypatch):
         )
     )
     assert payload["file"]["token"] == "fld_new"
+
+
+def test_feishu_drive_file_copy_requires_required_fields(monkeypatch):
+    from tools.feishu.drive import _handle_drive_file
+
+    payload = json.loads(_handle_drive_file({"action": "copy", "file_token": "fld_old"}))
+    assert "file_token" in payload["error"]
+    assert "name" in payload["error"]
+    assert "type" in payload["error"]
 
 
 def test_feishu_drive_file_move_handler(monkeypatch):
@@ -989,6 +1005,15 @@ def test_feishu_drive_file_move_handler(monkeypatch):
     )
     assert payload["success"] is True
     assert payload["task_id"] == "task_1"
+
+
+def test_feishu_drive_file_move_requires_required_fields(monkeypatch):
+    from tools.feishu.drive import _handle_drive_file
+
+    payload = json.loads(_handle_drive_file({"action": "move", "file_token": "fld_old"}))
+    assert "file_token" in payload["error"]
+    assert "type" in payload["error"]
+    assert "folder_token" in payload["error"]
 
 
 def test_feishu_drive_file_upload_handler(monkeypatch, tmp_path):
@@ -1229,6 +1254,13 @@ def test_feishu_calendar_calendar_get_handler(monkeypatch):
     )
     payload = json.loads(_handle_calendar({"action": "get", "calendar_id": "cal_1"}))
     assert payload["calendar"]["summary"] == "团队日历"
+
+
+def test_feishu_calendar_calendar_get_requires_calendar_id(monkeypatch):
+    from tools.feishu.calendar import _handle_calendar
+
+    payload = json.loads(_handle_calendar({"action": "get"}))
+    assert "calendar_id" in payload["error"]
 
 
 def test_feishu_calendar_event_list_handler(monkeypatch):
@@ -1705,6 +1737,14 @@ def test_feishu_task_comment_create_handler(monkeypatch):
     assert payload["comment"]["id"] == "c_1"
 
 
+def test_feishu_task_comment_create_requires_task_guid_and_content(monkeypatch):
+    from tools.feishu.task_comment import _handle_task_comment
+
+    payload = json.loads(_handle_task_comment({"action": "create", "task_guid": "task_1"}))
+    assert "task_guid" in payload["error"]
+    assert "content" in payload["error"]
+
+
 def test_feishu_task_comment_list_handler(monkeypatch):
     from tools.feishu.task_comment import _handle_task_comment
 
@@ -1714,6 +1754,13 @@ def test_feishu_task_comment_list_handler(monkeypatch):
     )
     payload = json.loads(_handle_task_comment({"action": "list", "resource_id": "task_1"}))
     assert payload["comments"][0]["id"] == "c_1"
+
+
+def test_feishu_task_comment_list_requires_resource_id(monkeypatch):
+    from tools.feishu.task_comment import _handle_task_comment
+
+    payload = json.loads(_handle_task_comment({"action": "list"}))
+    assert "resource_id" in payload["error"]
 
 
 def test_feishu_task_comment_get_handler(monkeypatch):
@@ -1790,6 +1837,13 @@ def test_feishu_task_section_get_handler(monkeypatch):
     assert payload["section"]["name"] == "Doing"
 
 
+def test_feishu_task_section_get_requires_section_guid(monkeypatch):
+    from tools.feishu.task_section import _handle_task_section
+
+    payload = json.loads(_handle_task_section({"action": "get"}))
+    assert "section_guid" in payload["error"]
+
+
 def test_feishu_task_section_patch_handler(monkeypatch):
     from tools.feishu.task_section import _handle_task_section
 
@@ -1827,6 +1881,13 @@ def test_feishu_task_section_list_handler(monkeypatch):
     assert payload["sections"][0]["guid"] == "sec_1"
 
 
+def test_feishu_task_section_list_requires_resource_type(monkeypatch):
+    from tools.feishu.task_section import _handle_task_section
+
+    payload = json.loads(_handle_task_section({"action": "list"}))
+    assert "resource_type" in payload["error"]
+
+
 def test_feishu_task_section_tasks_handler(monkeypatch):
     from tools.feishu.task_section import _handle_task_section
 
@@ -1836,6 +1897,13 @@ def test_feishu_task_section_tasks_handler(monkeypatch):
     )
     payload = json.loads(_handle_task_section({"action": "tasks", "section_guid": "sec_1"}))
     assert payload["tasks"][0]["guid"] == "task_1"
+
+
+def test_feishu_task_section_tasks_requires_section_guid(monkeypatch):
+    from tools.feishu.task_section import _handle_task_section
+
+    payload = json.loads(_handle_task_section({"action": "tasks"}))
+    assert "section_guid" in payload["error"]
 
 
 def test_feishu_im_get_messages_handler(monkeypatch):
