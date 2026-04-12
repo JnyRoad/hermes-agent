@@ -3465,6 +3465,86 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertIn('The user added a comment in "Project Spec": Please refine this section', context["prompt"])
         self.assertIn("Quoted content: Current paragraph", context["prompt"])
         self.assertIn("Event type: add_comment", context["prompt"])
+        self.assertEqual("false", context["is_whole_comment"])
+
+    def test_resolve_comment_event_context_marks_whole_document_comment(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with patch("tools.feishu.client.feishu_api_request") as mock_request:
+            mock_request.side_effect = [
+                {"data": {"metas": [{"title": "Project Spec"}]}},
+                {
+                    "data": {
+                        "items": [
+                            {
+                                "comment_id": "comment_123",
+                                "quote": "",
+                                "reply_list": {
+                                    "replies": [
+                                        {
+                                            "content": {
+                                                "elements": [
+                                                    {"type": "text_run", "text_run": {"text": "Please summarize the whole doc"}}
+                                                ]
+                                            }
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                },
+            ]
+
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+            )
+
+        self.assertEqual("true", context["is_whole_comment"])
+        self.assertIn("whole-document comment", context["prompt"])
+
+    def test_resolve_comment_event_context_marks_bot_mention(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with patch("tools.feishu.client.feishu_api_request") as mock_request:
+            mock_request.side_effect = [
+                {"data": {"metas": [{"title": "Project Spec"}]}},
+                {
+                    "data": {
+                        "items": [
+                            {
+                                "comment_id": "comment_123",
+                                "quote": "Anchor",
+                                "reply_list": {
+                                    "replies": [
+                                        {
+                                            "content": {
+                                                "elements": [
+                                                    {"type": "text_run", "text_run": {"text": "Please handle this"}}
+                                                ]
+                                            }
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                },
+            ]
+
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+                reply_id=None,
+                account_id=None,
+                is_mentioned=True,
+            )
+
+        self.assertEqual("true", context["is_mentioned"])
+        self.assertIn("This comment mentioned you.", context["prompt"])
 
     @patch.dict(os.environ, {}, clear=True)
     def test_resolve_comment_event_context_includes_reply_chain(self):

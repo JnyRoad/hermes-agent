@@ -460,6 +460,13 @@ def _extract_comment_plain_text(elements: Any) -> str:
     return " ".join(part for part in parts if part).strip()
 
 
+def _infer_is_whole_comment(*, explicit_is_whole: Any = None, quoted_text: str = "") -> bool:
+    """Infer whether a document comment targets the whole document."""
+    if explicit_is_whole is not None:
+        return bool(explicit_is_whole)
+    return not str(quoted_text or "").strip()
+
+
 def _is_style_enabled(style: Dict[str, Any] | None, key: str) -> bool:
     if not style:
         return False
@@ -2662,6 +2669,7 @@ class FeishuAdapter(BasePlatformAdapter):
         comment_id: str,
         reply_id: Optional[str] = None,
         account_id: Optional[str] = None,
+        is_mentioned: bool = False,
     ) -> Optional[Dict[str, str]]:
         """读取评论线程上下文，构造更贴近文档评论场景的提示词。"""
         from tools.feishu.client import feishu_api_request
@@ -2755,6 +2763,10 @@ class FeishuAdapter(BasePlatformAdapter):
                     reply_chain_lines.append(f"[{reply_author}]: {current_text}")
 
         quoted_text = str(target_comment.get("quote", "") or "").strip()
+        is_whole_comment = _infer_is_whole_comment(
+            explicit_is_whole=target_comment.get("is_whole"),
+            quoted_text=quoted_text,
+        )
         active_text = reply_text or root_comment_text
         action_label = "reply" if reply_id else "comment"
         document_label = f'"{document_title}"' if document_title else f"{file_type} document {file_token}"
@@ -2768,6 +2780,10 @@ class FeishuAdapter(BasePlatformAdapter):
             prompt_lines.append(f"Original comment: {root_comment_text}")
         if quoted_text:
             prompt_lines.append(f"Quoted content: {quoted_text}")
+        if is_mentioned:
+            prompt_lines.append("This comment mentioned you.")
+        if is_whole_comment:
+            prompt_lines.append("This is a whole-document comment without a local quoted anchor.")
         if reply_chain_lines:
             prompt_lines.append("Reply chain context:")
             prompt_lines.extend(reply_chain_lines)
@@ -2795,6 +2811,8 @@ class FeishuAdapter(BasePlatformAdapter):
             "file_type": file_type,
             "comment_id": comment_id,
             "document_title": document_title,
+            "is_mentioned": "true" if is_mentioned else "false",
+            "is_whole_comment": "true" if is_whole_comment else "false",
             "prompt": "\n".join(prompt_lines),
         }
 
@@ -2905,6 +2923,7 @@ class FeishuAdapter(BasePlatformAdapter):
             comment_id,
             reply_id or None,
             account_id,
+            is_mentioned,
         )
         if not context:
             logger.debug("[Feishu] Unable to resolve comment context for %s", comment_id)
