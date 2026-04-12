@@ -1159,6 +1159,70 @@ class TestAdapterBehavior(unittest.TestCase):
             )
         )
 
+    def test_wildcard_group_rule_applies_to_unlisted_groups(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        config = PlatformConfig(
+            extra={
+                "group_rules": {
+                    "*": {
+                        "policy": "allowlist",
+                        "allow_from": ["ou_alice"],
+                    }
+                }
+            }
+        )
+        adapter = FeishuAdapter(config)
+        adapter._bot_open_id = "ou_bot"
+
+        message = SimpleNamespace(
+            mentions=[SimpleNamespace(name="Bot", id=SimpleNamespace(open_id="ou_bot", user_id=None))]
+        )
+
+        self.assertTrue(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_alice", user_id=None),
+                "oc_chat_unknown",
+            )
+        )
+        self.assertFalse(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_bob", user_id=None),
+                "oc_chat_unknown",
+            )
+        )
+
+    def test_wildcard_group_rule_can_disable_group_chat(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        config = PlatformConfig(
+            extra={
+                "group_policy": "open",
+                "group_rules": {
+                    "*": {
+                        "enabled": False,
+                    }
+                },
+            }
+        )
+        adapter = FeishuAdapter(config)
+        adapter._bot_open_id = "ou_bot"
+
+        message = SimpleNamespace(
+            mentions=[SimpleNamespace(name="Bot", id=SimpleNamespace(open_id="ou_bot", user_id=None))]
+        )
+        self.assertFalse(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_regular", user_id=None),
+                "oc_chat_disabled",
+            )
+        )
+
     def test_default_group_policy_fallback_for_chats_without_explicit_rule(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter

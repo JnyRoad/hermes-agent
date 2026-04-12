@@ -298,6 +298,7 @@ class FeishuGroupRule:
     policy: str  # "open" | "allowlist" | "blacklist" | "admin_only" | "disabled"
     allowlist: set[str] = field(default_factory=set)
     blacklist: set[str] = field(default_factory=set)
+    enabled: Optional[bool] = None
     require_mention: Optional[bool] = None
     respond_to_mention_all: Optional[bool] = None
 
@@ -1157,6 +1158,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     policy=str(rule_cfg.get("policy", "open")).strip().lower(),
                     allowlist=set(str(u).strip() for u in raw_allowlist if str(u).strip()),
                     blacklist=set(str(u).strip() for u in rule_cfg.get("blacklist", []) if str(u).strip()),
+                    enabled=_coerce_optional_bool(rule_cfg.get("enabled")),
                     require_mention=_coerce_optional_bool(
                         rule_cfg.get("require_mention", rule_cfg.get("requireMention"))
                     ),
@@ -3609,8 +3611,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if sender_ids and self._admins and (sender_ids & self._admins):
             return True
 
-        rule = self._group_rules.get(chat_id) if chat_id else None
+        rule = self._resolve_group_rule(chat_id)
         if rule:
+            if rule.enabled is False:
+                return False
             policy = rule.policy
             allowlist = rule.allowlist
             blacklist = rule.blacklist
@@ -3632,11 +3636,19 @@ class FeishuAdapter(BasePlatformAdapter):
 
         return bool(sender_ids and (sender_ids & self._allowed_group_users))
 
+    def _resolve_group_rule(self, chat_id: str = "") -> Optional[FeishuGroupRule]:
+        """解析群配置时优先取精确 chat_id，其次退回默认的 `*` 规则。"""
+        if chat_id:
+            exact_rule = self._group_rules.get(chat_id)
+            if exact_rule is not None:
+                return exact_rule
+        return self._group_rules.get("*")
+
     def _should_accept_group_message(self, message: Any, sender_id: Any, chat_id: str = "") -> bool:
         """Require an explicit @mention before group messages enter the agent."""
         if not self._allow_group_message(sender_id, chat_id):
             return False
-        rule = self._group_rules.get(chat_id) if chat_id else None
+        rule = self._resolve_group_rule(chat_id)
         require_mention = self._require_mention if rule is None or rule.require_mention is None else rule.require_mention
         respond_to_mention_all = (
             self._respond_to_mention_all
