@@ -87,24 +87,19 @@ def _ensure_current_event_loop(request):
         yield
         return
 
-    try:
-        loop = asyncio.get_event_loop_policy().get_event_loop()
-    except RuntimeError:
-        loop = None
-
-    created = loop is None or loop.is_closed()
-    if created:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    # 避免调用 get_event_loop_policy().get_event_loop() 触发
+    # “There is no current event loop” 弃用告警。同步测试只需要一个
+    # 可用的当前 loop，因此直接创建并绑定临时 loop 即可。
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     try:
         yield
     finally:
-        if created and loop is not None:
-            try:
-                loop.close()
-            finally:
-                asyncio.set_event_loop(None)
+        try:
+            loop.close()
+        finally:
+            asyncio.set_event_loop(None)
 
 
 @pytest.fixture(autouse=True)

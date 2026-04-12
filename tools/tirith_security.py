@@ -352,7 +352,9 @@ def _install_tirith(*, log_failures: bool = True) -> tuple[str | None, str]:
                     if ".." in member.name:
                         continue
                     member.name = "tirith"
-                    tar.extract(member, tmpdir)
+                    # 仅解压单个已校验成员，且显式指定过滤策略，避免 Python 3.14
+                    # 对 tar.extract 默认行为变更带来的弃用告警。
+                    tar.extract(member, tmpdir, filter="data")
                     break
             else:
                 log("tirith binary not found in archive")

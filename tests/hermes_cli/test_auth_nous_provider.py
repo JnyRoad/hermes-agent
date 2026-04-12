@@ -2,6 +2,7 @@
 
 import json
 import os
+import ssl
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,15 +28,17 @@ class TestResolveVerifyFallback:
         })
         assert result is True
 
-    def test_valid_ca_bundle_in_auth_state_is_returned(self, tmp_path):
+    def test_valid_ca_bundle_in_auth_state_is_returned(self, tmp_path, monkeypatch):
         from hermes_cli.auth import _resolve_verify
 
         ca_file = tmp_path / "ca-bundle.pem"
         ca_file.write_text("fake cert")
+        fake_ctx = ssl.create_default_context()
+        monkeypatch.setattr("hermes_cli.auth.ssl.create_default_context", lambda **kwargs: fake_ctx)
         result = _resolve_verify(auth_state={
             "tls": {"insecure": False, "ca_bundle": str(ca_file)},
         })
-        assert result == str(ca_file)
+        assert result is fake_ctx
 
     def test_missing_ssl_cert_file_env_falls_back(self, monkeypatch):
         from hermes_cli.auth import _resolve_verify
@@ -76,13 +79,15 @@ class TestResolveVerifyFallback:
         result = _resolve_verify(ca_bundle="/nonexistent/explicit-ca.pem")
         assert result is True
 
-    def test_explicit_ca_bundle_param_valid_is_returned(self, tmp_path):
+    def test_explicit_ca_bundle_param_valid_is_returned(self, tmp_path, monkeypatch):
         from hermes_cli.auth import _resolve_verify
 
         ca_file = tmp_path / "explicit-ca.pem"
         ca_file.write_text("fake cert")
+        fake_ctx = ssl.create_default_context()
+        monkeypatch.setattr("hermes_cli.auth.ssl.create_default_context", lambda **kwargs: fake_ctx)
         result = _resolve_verify(ca_bundle=str(ca_file))
-        assert result == str(ca_file)
+        assert result is fake_ctx
 
 
 def _setup_nous_auth(
@@ -228,4 +233,3 @@ def test_mint_retry_uses_latest_rotated_refresh_token(tmp_path, monkeypatch):
     creds = resolve_nous_runtime_credentials(min_key_ttl_seconds=300)
     assert creds["api_key"] == "agent-key"
     assert refresh_calls == ["refresh-old", "refresh-1"]
-
