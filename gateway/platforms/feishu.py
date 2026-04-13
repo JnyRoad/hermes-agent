@@ -5977,7 +5977,16 @@ class FeishuAdapter(BasePlatformAdapter):
             status, normalized_line = _classify_tool_progress_line(line)
             grouped_lines.setdefault(status, []).append(normalized_line)
 
+        overall_status = "recent activity"
+        if grouped_lines["running"]:
+            overall_status = "active"
+        elif grouped_lines["failed"]:
+            overall_status = "needs attention"
+        elif grouped_lines["completed"]:
+            overall_status = "completed"
+
         rendered_lines = ["**Tool Activity**", ""]
+        rendered_lines.append(f"_Status: {overall_status}._")
         rendered_lines.append(
             (
                 f"_Summary: {total_steps} steps, "

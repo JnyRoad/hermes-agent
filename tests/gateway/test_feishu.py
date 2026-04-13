@@ -4073,6 +4073,7 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
         self.assertIn("**Tool Activity**", rendered)
+        self.assertIn("_Status: active._", rendered)
         self.assertIn("_Summary: 2 steps, 2 running, 0 completed, 0 need attention._", rendered)
         self.assertIn("**Running**", rendered)
         self.assertIn('- 📄 feishu_fetch_doc: "spec.md"', rendered)
@@ -4093,12 +4094,47 @@ class TestAdapterBehavior(unittest.TestCase):
             ]
         )
 
+        self.assertIn("_Status: active._", rendered)
         self.assertIn("**Running**", rendered)
         self.assertIn("**Completed**", rendered)
         self.assertIn("**Needs Attention**", rendered)
         self.assertIn("_Summary: 3 steps, 1 running, 1 completed, 1 need attention._", rendered)
         self.assertIn('- ✅ feishu_doc_update: "summary updated"', rendered)
         self.assertIn('- ❌ feishu_drive_reply_comment: "missing anchor"', rendered)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_feishu_tool_progress_completed_status(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        rendered = adapter.format_tool_progress_content(
+            [
+                '✅ feishu_fetch_doc: "spec.md"',
+                '✅ feishu_doc_update: "summary updated"',
+            ]
+        )
+
+        self.assertIn("_Status: completed._", rendered)
+        self.assertIn("_Recent tool activity for this request._", rendered)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_feishu_tool_progress_failed_status(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        rendered = adapter.format_tool_progress_content(
+            [
+                '✅ feishu_fetch_doc: "spec.md"',
+                '❌ feishu_doc_update: "missing anchor"',
+            ]
+        )
+
+        self.assertIn("_Status: needs attention._", rendered)
+        self.assertIn("_Some tool steps need attention before the request is fully complete._", rendered)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_feishu_tool_progress_summary_mentions_recent_window(self):
