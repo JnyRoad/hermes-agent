@@ -579,7 +579,23 @@ class TestFeishuDoctorChecks:
 
         report = doctor.collect_feishu_doctor_report(
             user_open_id="ou_owner",
-            adapter=SimpleNamespace(search_channel_directory_entries=lambda *args, **kwargs: []),
+            adapter=SimpleNamespace(
+                search_channel_directory_entries=lambda *args, **kwargs: [],
+                get_transport_account_status=lambda: [
+                    {
+                        "account_id": "default",
+                        "connection_mode": "webhook",
+                        "runtime_state": "connected",
+                        "domain": "feishu",
+                    },
+                    {
+                        "account_id": "feishu-cn",
+                        "connection_mode": "webhook",
+                        "runtime_state": "connected",
+                        "domain": "feishu",
+                    },
+                ],
+            ),
             account_id="feishu-cn",
         )
 
@@ -593,6 +609,11 @@ class TestFeishuDoctorChecks:
             item["label"] == "Feishu effective delivery mode"
             and "static card-style replies without streaming updates" in item["detail"]
             and "coalesced edits at 850ms" in item["detail"]
+            for item in report["items"]
+        )
+        assert any(
+            item["label"] == "Feishu runtime transport status"
+            and "default=connected/webhook, feishu-cn=connected/webhook" in item["detail"]
             for item in report["items"]
         )
         assert any(item["label"] == "Feishu cached directory targets: 3" for item in report["items"])

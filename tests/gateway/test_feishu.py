@@ -871,6 +871,51 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertEqual(logged_messages, ["default, feishu-cn"])
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_get_transport_account_status_reports_websocket_and_webhook_runtime_state(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "websocket",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "connection_mode": "webhook",
+                            "domain": "lark",
+                        }
+                    },
+                }
+            )
+        )
+        adapter._ws_futures_by_account = {"default": asyncio.Future()}
+        adapter._webhook_runner = object()
+
+        statuses = adapter.get_transport_account_status()
+
+        self.assertEqual(
+            statuses,
+            [
+                {
+                    "account_id": "default",
+                    "connection_mode": "websocket",
+                    "domain": "feishu",
+                    "runtime_state": "connected",
+                },
+                {
+                    "account_id": "feishu-cn",
+                    "connection_mode": "webhook",
+                    "domain": "lark",
+                    "runtime_state": "connected",
+                },
+            ],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_edit_message_updates_existing_feishu_message(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter

@@ -290,6 +290,22 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
                     f"configured modes: {mixed_modes}",
                 )
 
+    if adapter is not None and hasattr(adapter, "get_transport_account_status"):
+        try:
+            transport_statuses = list(adapter.get_transport_account_status() or [])
+            if transport_statuses:
+                detail = ", ".join(
+                    (
+                        f"{str(item.get('account_id', '') or 'default')}="
+                        f"{str(item.get('runtime_state', '') or 'unknown')}/"
+                        f"{str(item.get('connection_mode', '') or 'unknown')}"
+                    )
+                    for item in transport_statuses
+                )
+                _record("info", "Feishu runtime transport status", detail)
+        except Exception as exc:
+            _record("warn", "Feishu runtime transport status unavailable", str(exc))
+
     if domain in {"feishu", "lark"}:
         _record("ok", f"Feishu domain: {domain}")
     else:

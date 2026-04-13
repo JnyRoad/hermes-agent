@@ -6431,6 +6431,27 @@ class FeishuAdapter(BasePlatformAdapter):
         ]
         return ", ".join(entries) if entries else "none"
 
+    def get_transport_account_status(self) -> List[Dict[str, str]]:
+        """Return runtime transport status for each configured Feishu account."""
+        statuses: List[Dict[str, str]] = []
+        for account in sorted(self._accounts.values(), key=lambda item: (item.account_id != "default", item.account_id)):
+            if not account.enabled:
+                continue
+            runtime_state = "configured"
+            if account.connection_mode == "websocket":
+                runtime_state = "connected" if account.account_id in self._ws_futures_by_account else "configured"
+            elif account.connection_mode == "webhook":
+                runtime_state = "connected" if self._webhook_runner is not None else "configured"
+            statuses.append(
+                {
+                    "account_id": account.account_id,
+                    "connection_mode": account.connection_mode,
+                    "domain": str(account.domain_name or self._domain_name or "feishu").strip().lower() or "feishu",
+                    "runtime_state": runtime_state,
+                }
+            )
+        return statuses
+
     async def _feishu_send_with_retry(
         self,
         *,
