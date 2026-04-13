@@ -3747,6 +3747,15 @@ class TestAdapterBehavior(unittest.TestCase):
                                 ]
                             },
                         },
+                        {
+                            "reply_id": "reply_after",
+                            "user_id": {"open_id": "ou_future"},
+                            "content": {
+                                "elements": [
+                                    {"type": "text_run", "text_run": {"text": "This happened later"}},
+                                ]
+                            },
+                        },
                     ]
                 }
             },
@@ -3766,7 +3775,54 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertIn("Original comment: Please review this block", context["prompt"])
         self.assertIn("Reply chain context:", context["prompt"])
         self.assertIn("[ou_alice]: I think this can be shorter", context["prompt"])
+        self.assertNotIn("[ou_future]: This happened later", context["prompt"])
         self.assertIn("reply_id: reply_target", context["prompt"])
+
+    def test_resolve_comment_event_context_includes_local_anchor_guidance(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Design Notes"}]}},
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_123",
+                            "quote": "Current section",
+                            "reply_list": {
+                                "replies": [
+                                    {
+                                        "content": {
+                                            "elements": [
+                                                {"type": "text_run", "text_run": {"text": "Please summarize this"}},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            },
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses):
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertIn(
+            "For requests like summarize, explain, rewrite, continue, review, or translate this section",
+            context["prompt"],
+        )
+        self.assertIn(
+            "If the quoted content is not enough, read nearby context with Feishu document tools before answering",
+            context["prompt"],
+        )
 
     @patch.dict(os.environ, {}, clear=True)
     def test_resolve_comment_event_context_degrades_when_meta_lookup_fails(self):

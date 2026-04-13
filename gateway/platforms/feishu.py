@@ -511,6 +511,46 @@ def _infer_is_whole_comment(*, explicit_is_whole: Any = None, quoted_text: str =
     return not str(quoted_text or "").strip()
 
 
+def _build_comment_reply_chain_lines(replies: List[Dict[str, Any]], target_reply_id: str) -> List[str]:
+    """Return only the replies that happened before the triggering reply.
+
+    Comment-thread prompts should not include replies that were posted after the
+    triggering reply, otherwise the agent may read future context that the user
+    had not seen at event time. When the target reply cannot be found, fall
+    back to all non-empty replies so the prompt still remains actionable.
+    """
+    normalized_target_reply_id = str(target_reply_id or "").strip()
+    if not normalized_target_reply_id:
+        return []
+
+    reply_chain_lines: List[str] = []
+    target_found = False
+    for item in replies:
+        if not isinstance(item, dict):
+            continue
+        current_reply_id = str(item.get("reply_id", "") or "").strip()
+        if current_reply_id == normalized_target_reply_id:
+            target_found = True
+            break
+        reply_author = str((((item.get("user_id") or {}).get("open_id")) or "")).strip() or "unknown"
+        current_text = _extract_comment_plain_text((item.get("content") or {}).get("elements", []))
+        if current_text:
+            reply_chain_lines.append(f"[{reply_author}]: {current_text}")
+
+    if target_found:
+        return reply_chain_lines
+
+    fallback_lines: List[str] = []
+    for item in replies:
+        if not isinstance(item, dict):
+            continue
+        reply_author = str((((item.get("user_id") or {}).get("open_id")) or "")).strip() or "unknown"
+        current_text = _extract_comment_plain_text((item.get("content") or {}).get("elements", []))
+        if current_text:
+            fallback_lines.append(f"[{reply_author}]: {current_text}")
+    return fallback_lines
+
+
 def _is_style_enabled(style: Dict[str, Any] | None, key: str) -> bool:
     if not style:
         return False
@@ -3318,19 +3358,16 @@ class FeishuAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug("[Feishu] Failed to list comment replies for %s", comment_id, exc_info=True)
                 reply_payload = {}
-            for item in (reply_payload.get("data") or {}).get("items") or []:
+            reply_items = (reply_payload.get("data") or {}).get("items") or []
+            reply_chain_lines = _build_comment_reply_chain_lines(reply_items, reply_id)
+            for item in reply_items:
                 if not isinstance(item, dict):
                     continue
                 current_reply_id = str(item.get("reply_id", "")).strip()
-                reply_author = (
-                    str((((item.get("user_id") or {}).get("open_id")) or "")).strip() or "unknown"
-                )
                 current_text = _extract_comment_plain_text((item.get("content") or {}).get("elements", []))
                 if current_reply_id == reply_id:
                     reply_text = current_text
                     continue
-                if current_text:
-                    reply_chain_lines.append(f"[{reply_author}]: {current_text}")
 
         quoted_text = str(target_comment.get("quote", "") or "").strip()
         is_whole_comment = _infer_is_whole_comment(
@@ -3370,8 +3407,11 @@ class FeishuAdapter(BasePlatformAdapter):
         prompt_lines.extend(
             [
                 "This is a Feishu document comment-thread event, not a Feishu IM conversation. Your final text reply will be posted automatically to the current comment thread.",
+                "If you need to inspect the comment thread itself, prefer the Feishu Drive comment tools before answering from memory.",
                 "If the comment asks you to modify the document, first use the relevant Feishu document tools to make the change instead of replying with only a plan.",
                 "If the quoted content identifies a local section, treat it as the primary edit or reading anchor before falling back to broader document context.",
+                "For requests like summarize, explain, rewrite, continue, review, or translate this section, treat the quoted content as the primary local scope instead of defaulting to the whole document.",
+                "If the quoted content is not enough, read nearby context with Feishu document tools before answering, and do not guess document content from the comment alone.",
                 "When document edits fail or you cannot locate the anchor, explain the failure clearly in the comment thread.",
                 "If you already reply through a dedicated tool, end your final response with NO_REPLY.",
             ]
