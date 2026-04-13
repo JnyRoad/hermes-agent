@@ -569,6 +569,39 @@ def _classify_tool_progress_line(line: str) -> tuple[str, str]:
     return "running", normalized_line
 
 
+def _extract_tool_progress_name(line: str) -> str:
+    """Extract a stable tool name from one rendered progress line."""
+    normalized_line = str(line or "").strip()
+    if not normalized_line:
+        return ""
+
+    stripped_line = re.sub(r"^[^\w]+", "", normalized_line)
+    match = re.match(r"(?P<tool>[A-Za-z0-9_]+)", stripped_line)
+    if not match:
+        return ""
+    return str(match.group("tool") or "").strip()
+
+
+def _summarize_tool_progress_names(lines: List[str], *, limit: int = 3) -> str:
+    """Build a compact tool-name frequency summary for recent progress lines."""
+    counts: Dict[str, int] = {}
+    for line in lines:
+        tool_name = _extract_tool_progress_name(line)
+        if not tool_name:
+            continue
+        counts[tool_name] = counts.get(tool_name, 0) + 1
+
+    if not counts:
+        return ""
+
+    ranked_items = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    parts = [
+        f"{tool_name} ×{count}" if count > 1 else tool_name
+        for tool_name, count in ranked_items[:limit]
+    ]
+    return ", ".join(parts)
+
+
 def _is_style_enabled(style: Dict[str, Any] | None, key: str) -> bool:
     if not style:
         return False
@@ -5995,6 +6028,12 @@ class FeishuAdapter(BasePlatformAdapter):
                 f"{len(grouped_lines['failed'])} need attention._"
             )
         )
+        active_tool_summary = _summarize_tool_progress_names(grouped_lines["running"])
+        if active_tool_summary:
+            rendered_lines.append(f"_Active tools: {active_tool_summary}._")
+        attention_tool_summary = _summarize_tool_progress_names(grouped_lines["failed"])
+        if attention_tool_summary:
+            rendered_lines.append(f"_Needs attention: {attention_tool_summary}._")
         if total_steps > len(visible_lines):
             rendered_lines.append(f"_Showing the most recent {len(visible_lines)} steps._")
         rendered_lines.append("")

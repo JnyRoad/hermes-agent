@@ -4075,6 +4075,7 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertIn("**Tool Activity**", rendered)
         self.assertIn("_Status: active._", rendered)
         self.assertIn("_Summary: 2 steps, 2 running, 0 completed, 0 need attention._", rendered)
+        self.assertIn("_Active tools: feishu_calendar_event, feishu_fetch_doc._", rendered)
         self.assertIn("**Running**", rendered)
         self.assertIn('- 📄 feishu_fetch_doc: "spec.md"', rendered)
         self.assertIn('_Running tools for this request..._', rendered)
@@ -4099,6 +4100,8 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertIn("**Completed**", rendered)
         self.assertIn("**Needs Attention**", rendered)
         self.assertIn("_Summary: 3 steps, 1 running, 1 completed, 1 need attention._", rendered)
+        self.assertIn("_Active tools: feishu_fetch_doc._", rendered)
+        self.assertIn("_Needs attention: feishu_drive_reply_comment._", rendered)
         self.assertIn('- ✅ feishu_doc_update: "summary updated"', rendered)
         self.assertIn('- ❌ feishu_drive_reply_comment: "missing anchor"', rendered)
 
@@ -4148,9 +4151,30 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
         self.assertIn("_Summary: 15 steps, 12 running, 0 completed, 0 need attention._", rendered)
+        self.assertIn("_Active tools: tool_10, tool_11, tool_12._", rendered)
         self.assertIn("_Showing the most recent 12 steps._", rendered)
         self.assertNotIn('- ⏳ tool_0: "step"', rendered)
         self.assertIn('- ⏳ tool_14: "step"', rendered)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_feishu_tool_progress_groups_duplicate_tool_names(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        rendered = adapter.format_tool_progress_content(
+            [
+                '⏳ feishu_doc_read: "section 1"',
+                '⏳ feishu_doc_read: "section 2"',
+                '⏳ feishu_doc_update: "apply patch"',
+                '❌ feishu_drive_reply_comment: "missing anchor"',
+                '❌ feishu_drive_reply_comment: "reply failed"',
+            ]
+        )
+
+        self.assertIn("_Active tools: feishu_doc_read ×2, feishu_doc_update._", rendered)
+        self.assertIn("_Needs attention: feishu_drive_reply_comment ×2._", rendered)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_gateway_progress_renderer_uses_adapter_formatter(self):
