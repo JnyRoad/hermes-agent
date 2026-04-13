@@ -2032,6 +2032,14 @@ class FeishuAdapter(BasePlatformAdapter):
                             "request_id": state.request_id,
                         },
                     ),
+                    self._build_card_button(
+                        label="Decline Request",
+                        button_type="danger",
+                        value={
+                            "hermes_action": "decline_oauth",
+                            "request_id": state.request_id,
+                        },
+                    ),
                 ],
                 account_id=account_id or state.account_id or None,
             )
@@ -2080,6 +2088,14 @@ class FeishuAdapter(BasePlatformAdapter):
                             label="Cancel for Now",
                             value={
                                 "hermes_action": "cancel_oauth",
+                                "request_id": request_id,
+                            },
+                        ),
+                        self._build_card_button(
+                            label="Decline Request",
+                            button_type="danger",
+                            value={
+                                "hermes_action": "decline_oauth",
                                 "request_id": request_id,
                             },
                         ),
@@ -2229,6 +2245,14 @@ class FeishuAdapter(BasePlatformAdapter):
                                 "request_id": state.request_id,
                             },
                         ),
+                        self._build_card_button(
+                            label="Decline Request",
+                            button_type="danger",
+                            value={
+                                "hermes_action": "decline_app_scope_request",
+                                "request_id": state.request_id,
+                            },
+                        ),
                     ]
                     if actions
                     else None
@@ -2286,6 +2310,14 @@ class FeishuAdapter(BasePlatformAdapter):
                             label="Cancel for Now",
                             value={
                                 "hermes_action": "cancel_app_scope_request",
+                                "request_id": request_id,
+                            },
+                        ),
+                        self._build_card_button(
+                            label="Decline Request",
+                            button_type="danger",
+                            value={
+                                "hermes_action": "decline_app_scope_request",
                                 "request_id": request_id,
                             },
                         ),
@@ -3715,6 +3747,64 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
                 return
 
+            if hermes_action == "decline_oauth":
+                request_id = str(action_value.get("request_id", "") or "")
+                state = self._pending_oauth_requests.pop(request_id, None)
+                if not state:
+                    logger.debug("[Feishu] OAuth decline %s already resolved or unknown", request_id)
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=self._extract_event_account_id(data),
+                        text="This Feishu authorization card is already inactive.",
+                    )
+                    return
+                if state.requester_open_id and state.requester_open_id != open_id:
+                    logger.warning(
+                        "[Feishu] Ignoring OAuth decline from %s for request %s owned by %s",
+                        open_id,
+                        request_id,
+                        state.requester_open_id,
+                    )
+                    self._pending_oauth_requests[request_id] = state
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=state.account_id or self._extract_event_account_id(data),
+                        text="Only the original requester can decline this Feishu authorization card.",
+                    )
+                    return
+
+                account_id = self._extract_event_account_id(data)
+                resolved_account_id = account_id or state.account_id or None
+                if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                    await self._expire_auth_request_card(
+                        state=state,
+                        resolved_account_id=resolved_account_id,
+                        expired_by_label="30 minutes",
+                    )
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=resolved_account_id,
+                        text="This Feishu authorization card already expired.",
+                    )
+                    return
+                sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
+                user_name = sender_profile.get("user_name") or open_id
+                self._discard_pending_tool_replays(list(_merge_replay_ids(state.replay_ids, state.replay_id)))
+                await self._update_interactive_card(
+                    message_id=state.message_id,
+                    title=state.title,
+                    body_markdown=(
+                        f"{state.reason}\n\n"
+                        f"**Declined by:** {user_name}\n"
+                        f"**Authorized user:** {state.requester_open_id or open_id}\n"
+                        "**Status:** the authorization request was explicitly declined."
+                    ),
+                    template="red",
+                    account_id=resolved_account_id,
+                )
+                return
+
             if hermes_action == "complete_app_scope_request":
                 request_id = str(action_value.get("request_id", "") or "")
                 state = self._pending_app_scope_requests.pop(request_id, None)
@@ -3946,6 +4036,65 @@ class FeishuAdapter(BasePlatformAdapter):
                         "**Status:** app-scope handoff canceled for now."
                     ),
                     template="grey",
+                    account_id=resolved_account_id,
+                )
+                return
+
+            if hermes_action == "decline_app_scope_request":
+                request_id = str(action_value.get("request_id", "") or "")
+                state = self._pending_app_scope_requests.pop(request_id, None)
+                if not state:
+                    logger.debug("[Feishu] App scope decline %s already resolved or unknown", request_id)
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=self._extract_event_account_id(data),
+                        text="This Feishu app-scope card is already inactive.",
+                    )
+                    return
+
+                if state.owner_open_id and state.owner_open_id != open_id:
+                    logger.warning(
+                        "[Feishu] Ignoring app scope decline from %s for request %s owned by %s",
+                        open_id,
+                        request_id,
+                        state.owner_open_id,
+                    )
+                    self._pending_app_scope_requests[request_id] = state
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=state.account_id or self._extract_event_account_id(data),
+                        text="Only the Feishu app owner can decline this app-scope card.",
+                    )
+                    return
+
+                account_id = self._extract_event_account_id(data)
+                resolved_account_id = account_id or state.account_id or None
+                if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                    await self._expire_auth_request_card(
+                        state=state,
+                        resolved_account_id=resolved_account_id,
+                        expired_by_label="30 minutes",
+                    )
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=resolved_account_id,
+                        text="This Feishu app-scope card already expired.",
+                    )
+                    return
+                sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
+                user_name = sender_profile.get("user_name") or open_id
+                self._discard_pending_tool_replays(list(_merge_replay_ids(state.replay_ids, state.replay_id)))
+                await self._update_interactive_card(
+                    message_id=state.message_id,
+                    title=state.title,
+                    body_markdown=(
+                        f"{state.reason}\n\n"
+                        f"**Declined by owner:** {user_name}\n"
+                        f"**Requester:** {state.requester_open_id or 'unknown'}\n"
+                        "**Status:** the app-scope authorization handoff was explicitly declined."
+                    ),
+                    template="red",
                     account_id=resolved_account_id,
                 )
                 return

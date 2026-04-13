@@ -4392,6 +4392,52 @@ def test_feishu_adapter_cancels_oauth_request_and_clears_pending_replays(monkeyp
     assert "canceled for now" in adapter._update_interactive_card.await_args.kwargs["body_markdown"]
 
 
+def test_feishu_adapter_declines_oauth_request_and_clears_pending_replays(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingOAuthRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._pending_oauth_requests["fo_1"] = FeishuPendingOAuthRequest(
+        request_id="fo_1",
+        chat_id="oc_chat_1",
+        message_id="msg_auth_1",
+        scopes=["contact:user.base:readonly"],
+        reason="Need basic profile.",
+        title="Auth",
+        requester_open_id="ou_requester",
+        account_id="feishu-cn",
+        replay_id="fr_1",
+        replay_ids=["fr_1", "fr_2"],
+    )
+    adapter._pending_tool_replays = {
+        "fr_1": {"tool_name": "feishu_drive_file", "args": {}},
+        "fr_2": {"tool_name": "feishu_calendar_event", "args": {}},
+    }
+    adapter._resolve_sender_profile = AsyncMock(
+        return_value={"user_id": "ou_requester", "user_name": "Alice", "user_id_alt": "ou_requester"}
+    )
+    adapter._update_interactive_card = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg_notice"))
+
+    import asyncio
+
+    event = SimpleNamespace(
+        token="tok_decline_oauth",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_requester"),
+        action=SimpleNamespace(tag="button", value={"hermes_action": "decline_oauth", "request_id": "fo_1"}),
+    )
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+    assert "fo_1" not in adapter._pending_oauth_requests
+    assert adapter._pending_tool_replays == {}
+    assert adapter._update_interactive_card.await_args.kwargs["template"] == "red"
+    assert "explicitly declined" in adapter._update_interactive_card.await_args.kwargs["body_markdown"]
+
+
 def test_feishu_adapter_cancels_app_scope_request_and_clears_pending_replays(monkeypatch):
     from gateway.platforms.feishu import FeishuAdapter, FeishuPendingAppScopeRequest
 
@@ -4438,6 +4484,54 @@ def test_feishu_adapter_cancels_app_scope_request_and_clears_pending_replays(mon
     assert "canceled for now" in adapter._update_interactive_card.await_args.kwargs["body_markdown"]
 
 
+def test_feishu_adapter_declines_app_scope_request_and_clears_pending_replays(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingAppScopeRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._pending_app_scope_requests["fas_1"] = FeishuPendingAppScopeRequest(
+        request_id="fas_1",
+        chat_id="oc_chat_1",
+        message_id="msg_app_scope_1",
+        scopes=["calendar:calendar.event:delete"],
+        reason="Need app scopes.",
+        title="App Auth",
+        owner_open_id="ou_owner",
+        requester_open_id="ou_requester",
+        account_id="feishu-cn",
+        replay_id="fr_1",
+        replay_ids=["fr_1"],
+    )
+    adapter._pending_tool_replays = {
+        "fr_1": {"tool_name": "feishu_calendar_event", "args": {}},
+    }
+    adapter._resolve_sender_profile = AsyncMock(
+        return_value={"user_id": "ou_owner", "user_name": "Alice", "user_id_alt": "ou_owner"}
+    )
+    adapter._update_interactive_card = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg_notice"))
+
+    import asyncio
+
+    event = SimpleNamespace(
+        token="tok_decline_app_scope",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_owner"),
+        action=SimpleNamespace(
+            tag="button", value={"hermes_action": "decline_app_scope_request", "request_id": "fas_1"}
+        ),
+    )
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+    assert "fas_1" not in adapter._pending_app_scope_requests
+    assert adapter._pending_tool_replays == {}
+    assert adapter._update_interactive_card.await_args.kwargs["template"] == "red"
+    assert "explicitly declined" in adapter._update_interactive_card.await_args.kwargs["body_markdown"]
+
+
 def test_feishu_adapter_rejects_oauth_completion_from_other_user(monkeypatch):
     from gateway.platforms.feishu import FeishuAdapter, FeishuPendingOAuthRequest
 
@@ -4475,6 +4569,41 @@ def test_feishu_adapter_rejects_oauth_completion_from_other_user(monkeypatch):
     assert "Only the original requester" in adapter.send.await_args.args[1]
     adapter._update_interactive_card.assert_not_awaited()
     adapter._handle_message_with_guards.assert_not_awaited()
+
+
+def test_feishu_adapter_rejects_oauth_decline_from_other_user(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingOAuthRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._pending_oauth_requests["fo_1"] = FeishuPendingOAuthRequest(
+        request_id="fo_1",
+        chat_id="oc_chat_1",
+        message_id="msg_auth_1",
+        scopes=["contact:user.base:readonly"],
+        reason="Need basic profile.",
+        title="Auth",
+        requester_open_id="ou_requester",
+    )
+    adapter._update_interactive_card = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg_notice"))
+
+    event = SimpleNamespace(
+        token="tok_oauth_decline_other",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_other"),
+        action=SimpleNamespace(tag="button", value={"hermes_action": "decline_oauth", "request_id": "fo_1"}),
+    )
+
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+    assert "fo_1" in adapter._pending_oauth_requests
+    adapter.send.assert_awaited_once()
+    assert "Only the original requester can decline" in adapter.send.await_args.args[1]
+    adapter._update_interactive_card.assert_not_awaited()
 
 
 def test_feishu_adapter_notifies_when_oauth_request_is_stale(monkeypatch):
@@ -4584,6 +4713,45 @@ def test_feishu_adapter_rejects_app_scope_completion_from_non_owner_notifies(mon
     assert "fas_1" in adapter._pending_app_scope_requests
     adapter.send.assert_awaited_once()
     assert "Only the Feishu app owner" in adapter.send.await_args.args[1]
+    adapter._update_interactive_card.assert_not_awaited()
+
+
+def test_feishu_adapter_rejects_app_scope_decline_from_non_owner_notifies(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingAppScopeRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._pending_app_scope_requests["fas_1"] = FeishuPendingAppScopeRequest(
+        request_id="fas_1",
+        chat_id="oc_chat_1",
+        message_id="msg_app_scope_1",
+        scopes=["calendar:calendar.event:delete"],
+        reason="Need app scopes.",
+        title="App Auth",
+        owner_open_id="ou_owner",
+        requester_open_id="ou_requester",
+        account_id="feishu-cn",
+    )
+    adapter._update_interactive_card = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg_notice"))
+
+    event = SimpleNamespace(
+        token="tok_app_scope_decline_non_owner",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_other"),
+        action=SimpleNamespace(
+            tag="button", value={"hermes_action": "decline_app_scope_request", "request_id": "fas_1"}
+        ),
+    )
+
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+    assert "fas_1" in adapter._pending_app_scope_requests
+    adapter.send.assert_awaited_once()
+    assert "Only the Feishu app owner can decline" in adapter.send.await_args.args[1]
     adapter._update_interactive_card.assert_not_awaited()
 
 
