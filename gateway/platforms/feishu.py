@@ -2004,11 +2004,23 @@ class FeishuAdapter(BasePlatformAdapter):
                 title=state.title or title,
                 body_markdown=_build_oauth_body(merged_scopes, merged_reason),
                 template="orange",
-                button_label="I Finished Authorization",
-                button_value={
-                    "hermes_action": "complete_oauth",
-                    "request_id": state.request_id,
-                },
+                button_actions=[
+                    self._build_card_button(
+                        label="I Finished Authorization",
+                        button_type="primary",
+                        value={
+                            "hermes_action": "complete_oauth",
+                            "request_id": state.request_id,
+                        },
+                    ),
+                    self._build_card_button(
+                        label="Cancel for Now",
+                        value={
+                            "hermes_action": "cancel_oauth",
+                            "request_id": state.request_id,
+                        },
+                    ),
+                ],
                 account_id=account_id or state.account_id or None,
             )
             state.scopes = merged_scopes
@@ -2043,15 +2055,21 @@ class FeishuAdapter(BasePlatformAdapter):
                 {
                     "tag": "action",
                     "actions": [
-                        {
-                            "tag": "button",
-                            "text": {"tag": "plain_text", "content": "I Finished Authorization"},
-                            "type": "primary",
-                            "value": {
+                        self._build_card_button(
+                            label="I Finished Authorization",
+                            button_type="primary",
+                            value={
                                 "hermes_action": "complete_oauth",
                                 "request_id": request_id,
                             },
-                        }
+                        ),
+                        self._build_card_button(
+                            label="Cancel for Now",
+                            value={
+                                "hermes_action": "cancel_oauth",
+                                "request_id": request_id,
+                            },
+                        ),
                     ],
                 },
             ],
@@ -2176,8 +2194,27 @@ class FeishuAdapter(BasePlatformAdapter):
                     requester_id=requester_open_id or state.requester_open_id,
                 ),
                 template="orange",
-                button_label="I Granted App Scopes" if actions else None,
-                button_value=actions[0]["value"] if actions else None,
+                button_actions=(
+                    [
+                        self._build_card_button(
+                            label="I Granted App Scopes",
+                            button_type="primary",
+                            value={
+                                "hermes_action": "complete_app_scope_request",
+                                "request_id": state.request_id,
+                            },
+                        ),
+                        self._build_card_button(
+                            label="Cancel for Now",
+                            value={
+                                "hermes_action": "cancel_app_scope_request",
+                                "request_id": state.request_id,
+                            },
+                        ),
+                    ]
+                    if actions
+                    else None
+                ),
                 account_id=account_id or state.account_id or None,
             )
             state.scopes = merged_scopes
@@ -2218,15 +2255,21 @@ class FeishuAdapter(BasePlatformAdapter):
                 {
                     "tag": "action",
                     "actions": [
-                        {
-                            "tag": "button",
-                            "text": {"tag": "plain_text", "content": "I Granted App Scopes"},
-                            "type": "primary",
-                            "value": {
+                        self._build_card_button(
+                            label="I Granted App Scopes",
+                            button_type="primary",
+                            value={
                                 "hermes_action": "complete_app_scope_request",
                                 "request_id": request_id,
                             },
-                        }
+                        ),
+                        self._build_card_button(
+                            label="Cancel for Now",
+                            value={
+                                "hermes_action": "cancel_app_scope_request",
+                                "request_id": request_id,
+                            },
+                        ),
                     ],
                 }
             )
@@ -2282,11 +2325,12 @@ class FeishuAdapter(BasePlatformAdapter):
         template: str = "green",
         button_label: str = "",
         button_value: Optional[Dict[str, Any]] = None,
+        button_actions: Optional[List[Dict[str, Any]]] = None,
         account_id: Optional[str] = None,
     ) -> None:
         """更新交互卡片。
 
-        默认更新为只读状态；当传入按钮参数时保留一个可点击按钮。
+        默认更新为只读状态；当传入按钮参数时保留可点击按钮。
         """
         if not message_id:
             return
@@ -2296,18 +2340,27 @@ class FeishuAdapter(BasePlatformAdapter):
         elements: List[Dict[str, Any]] = [
             {"tag": "markdown", "content": body_markdown},
         ]
-        if button_label and isinstance(button_value, dict):
+        actions: List[Dict[str, Any]] = []
+        if isinstance(button_actions, list):
+            for action in button_actions:
+                if not isinstance(action, dict):
+                    continue
+                if action.get("tag") == "button" and isinstance(action.get("value"), dict):
+                    actions.append(action)
+        if not actions and button_label and isinstance(button_value, dict):
+            actions.append(
+                {
+                    "tag": "button",
+                    "text": {"content": button_label, "tag": "plain_text"},
+                    "type": "primary",
+                    "value": button_value,
+                }
+            )
+        if actions:
             elements.append(
                 {
                     "tag": "action",
-                    "actions": [
-                        {
-                            "tag": "button",
-                            "text": {"content": button_label, "tag": "plain_text"},
-                            "type": "primary",
-                            "value": button_value,
-                        }
-                    ],
+                    "actions": actions,
                 }
             )
         card = {
@@ -2322,6 +2375,32 @@ class FeishuAdapter(BasePlatformAdapter):
         body = self._build_update_message_body(msg_type="interactive", content=payload)
         request = self._build_update_message_request(message_id=message_id, request_body=body)
         await asyncio.to_thread(client.im.v1.message.update, request)
+
+    def _build_card_button(
+        self,
+        *,
+        label: str,
+        value: Dict[str, Any],
+        button_type: str = "default",
+    ) -> Dict[str, Any]:
+        """Create a stable interactive button payload."""
+        return {
+            "tag": "button",
+            "text": {"content": label, "tag": "plain_text"},
+            "type": button_type,
+            "value": value,
+        }
+
+    def _discard_pending_tool_replays(self, replay_ids: List[str]) -> None:
+        """Remove pending replay entries that are no longer intended to run."""
+        normalized = _merge_replay_ids(replay_ids)
+        if not normalized:
+            return
+        pending_replays = getattr(self, "_pending_tool_replays", None)
+        if not isinstance(pending_replays, dict):
+            return
+        for replay_id in normalized:
+            pending_replays.pop(replay_id, None)
 
     async def _update_approval_card(
         self,
@@ -3493,6 +3572,42 @@ class FeishuAdapter(BasePlatformAdapter):
                 await self._handle_message_with_guards(synthetic_event)
                 return
 
+            if hermes_action == "cancel_oauth":
+                request_id = str(action_value.get("request_id", "") or "")
+                state = self._pending_oauth_requests.pop(request_id, None)
+                if not state:
+                    logger.debug("[Feishu] OAuth cancel %s already resolved or unknown", request_id)
+                    return
+                if state.requester_open_id and state.requester_open_id != open_id:
+                    logger.warning(
+                        "[Feishu] Ignoring OAuth cancel from %s for request %s owned by %s",
+                        open_id,
+                        request_id,
+                        state.requester_open_id,
+                    )
+                    self._pending_oauth_requests[request_id] = state
+                    return
+
+                account_id = self._extract_event_account_id(data)
+                resolved_account_id = account_id or state.account_id or None
+                sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
+                user_name = sender_profile.get("user_name") or open_id
+                self._discard_pending_tool_replays(list(_merge_replay_ids(state.replay_ids, state.replay_id)))
+                await self._update_interactive_card(
+                    message_id=state.message_id,
+                    title=state.title,
+                    body_markdown=(
+                        f"{state.reason}\n\n"
+                        f"**Canceled by:** {user_name}\n"
+                        f"**Authorized user:** {state.requester_open_id or open_id}\n"
+                        "**Status:** authorization request canceled for now."
+                    ),
+                    template="grey",
+                    account_id=resolved_account_id,
+                )
+                return
+
             if hermes_action == "complete_app_scope_request":
                 request_id = str(action_value.get("request_id", "") or "")
                 state = self._pending_app_scope_requests.pop(request_id, None)
@@ -3641,6 +3756,43 @@ class FeishuAdapter(BasePlatformAdapter):
                     "[Feishu] Promoted app scope request %s to user authorization for %s",
                     request_id,
                     state.requester_open_id,
+                )
+                return
+
+            if hermes_action == "cancel_app_scope_request":
+                request_id = str(action_value.get("request_id", "") or "")
+                state = self._pending_app_scope_requests.pop(request_id, None)
+                if not state:
+                    logger.debug("[Feishu] App scope cancel %s already resolved or unknown", request_id)
+                    return
+
+                if state.owner_open_id and state.owner_open_id != open_id:
+                    logger.warning(
+                        "[Feishu] Ignoring app scope cancel from %s for request %s owned by %s",
+                        open_id,
+                        request_id,
+                        state.owner_open_id,
+                    )
+                    self._pending_app_scope_requests[request_id] = state
+                    return
+
+                account_id = self._extract_event_account_id(data)
+                resolved_account_id = account_id or state.account_id or None
+                sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
+                user_name = sender_profile.get("user_name") or open_id
+                self._discard_pending_tool_replays(list(_merge_replay_ids(state.replay_ids, state.replay_id)))
+                await self._update_interactive_card(
+                    message_id=state.message_id,
+                    title=state.title,
+                    body_markdown=(
+                        f"{state.reason}\n\n"
+                        f"**Canceled by owner:** {user_name}\n"
+                        f"**Requester:** {state.requester_open_id or 'unknown'}\n"
+                        "**Status:** app-scope handoff canceled for now."
+                    ),
+                    template="grey",
+                    account_id=resolved_account_id,
                 )
                 return
 
