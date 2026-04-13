@@ -4313,6 +4313,7 @@ def test_feishu_adapter_cancels_oauth_request_and_clears_pending_replays(monkeyp
         return_value={"user_id": "ou_requester", "user_name": "Alice", "user_id_alt": "ou_requester"}
     )
     adapter._update_interactive_card = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg_notice"))
 
     import asyncio
 
@@ -4358,6 +4359,7 @@ def test_feishu_adapter_cancels_app_scope_request_and_clears_pending_replays(mon
         return_value={"user_id": "ou_owner", "user_name": "Alice", "user_id_alt": "ou_owner"}
     )
     adapter._update_interactive_card = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg_notice"))
 
     import asyncio
 
@@ -4394,6 +4396,7 @@ def test_feishu_adapter_rejects_oauth_completion_from_other_user(monkeypatch):
     )
     adapter._update_interactive_card = AsyncMock()
     adapter._handle_message_with_guards = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg_notice"))
 
     event = SimpleNamespace(
         token="tok_auth_1",
@@ -4407,8 +4410,74 @@ def test_feishu_adapter_rejects_oauth_completion_from_other_user(monkeypatch):
     status = adapter.get_authorization_status("ou_requester", ["contact:user.base:readonly"])
     assert status["authorized"] is False
     assert "fo_1" in adapter._pending_oauth_requests
+    adapter.send.assert_awaited_once()
+    assert "Only the original requester" in adapter.send.await_args.args[1]
     adapter._update_interactive_card.assert_not_awaited()
     adapter._handle_message_with_guards.assert_not_awaited()
+
+
+def test_feishu_adapter_notifies_when_oauth_request_is_stale(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg_notice"))
+
+    import asyncio
+
+    event = SimpleNamespace(
+        token="tok_auth_stale",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_requester"),
+        action=SimpleNamespace(tag="button", value={"hermes_action": "complete_oauth", "request_id": "fo_missing"}),
+    )
+
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+    adapter.send.assert_awaited_once()
+    assert "no longer active" in adapter.send.await_args.args[1]
+
+
+def test_feishu_adapter_rejects_app_scope_completion_from_non_owner_notifies(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingAppScopeRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._pending_app_scope_requests["fas_1"] = FeishuPendingAppScopeRequest(
+        request_id="fas_1",
+        chat_id="oc_chat_1",
+        message_id="msg_app_scope_1",
+        scopes=["calendar:calendar.event:delete"],
+        reason="Need app scopes.",
+        title="App Auth",
+        owner_open_id="ou_owner",
+        requester_open_id="ou_requester",
+        account_id="feishu-cn",
+    )
+    adapter._update_interactive_card = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg_notice"))
+
+    import asyncio
+
+    event = SimpleNamespace(
+        token="tok_app_scope_non_owner",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_other"),
+        action=SimpleNamespace(tag="button", value={"hermes_action": "complete_app_scope_request", "request_id": "fas_1"}),
+    )
+
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+    assert "fas_1" in adapter._pending_app_scope_requests
+    adapter.send.assert_awaited_once()
+    assert "Only the Feishu app owner" in adapter.send.await_args.args[1]
+    adapter._update_interactive_card.assert_not_awaited()
 
 
 def test_feishu_adapter_authorization_status_is_scoped_by_account():

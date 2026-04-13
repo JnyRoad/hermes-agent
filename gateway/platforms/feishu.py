@@ -2402,6 +2402,25 @@ class FeishuAdapter(BasePlatformAdapter):
         for replay_id in normalized:
             pending_replays.pop(replay_id, None)
 
+    async def _send_card_action_notice(
+        self,
+        *,
+        chat_id: str,
+        text: str,
+        account_id: Optional[str] = None,
+    ) -> None:
+        """Send a lightweight follow-up notice for stale or invalid card actions."""
+        if not chat_id or not text:
+            return
+        try:
+            await self.send(
+                chat_id,
+                text,
+                metadata={"account_id": account_id or None},
+            )
+        except Exception:
+            logger.debug("[Feishu] Failed to send card action notice", exc_info=True)
+
     async def _update_approval_card(
         self,
         message_id: str,
@@ -3449,6 +3468,14 @@ class FeishuAdapter(BasePlatformAdapter):
                 state = self._pending_oauth_requests.pop(request_id, None)
                 if not state:
                     logger.debug("[Feishu] OAuth request %s already resolved or unknown", request_id)
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=self._extract_event_account_id(data),
+                        text=(
+                            "This Feishu authorization card is no longer active. "
+                            "Create a new authorization request if you still need to continue."
+                        ),
+                    )
                     return
                 if state.requester_open_id and state.requester_open_id != open_id:
                     logger.warning(
@@ -3458,6 +3485,11 @@ class FeishuAdapter(BasePlatformAdapter):
                         state.requester_open_id,
                     )
                     self._pending_oauth_requests[request_id] = state
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=state.account_id or self._extract_event_account_id(data),
+                        text="Only the original requester can complete this Feishu authorization card.",
+                    )
                     return
 
                 account_id = self._extract_event_account_id(data)
@@ -3577,6 +3609,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 state = self._pending_oauth_requests.pop(request_id, None)
                 if not state:
                     logger.debug("[Feishu] OAuth cancel %s already resolved or unknown", request_id)
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=self._extract_event_account_id(data),
+                        text="This Feishu authorization card is already inactive.",
+                    )
                     return
                 if state.requester_open_id and state.requester_open_id != open_id:
                     logger.warning(
@@ -3586,6 +3623,11 @@ class FeishuAdapter(BasePlatformAdapter):
                         state.requester_open_id,
                     )
                     self._pending_oauth_requests[request_id] = state
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=state.account_id or self._extract_event_account_id(data),
+                        text="Only the original requester can cancel this Feishu authorization card.",
+                    )
                     return
 
                 account_id = self._extract_event_account_id(data)
@@ -3613,6 +3655,14 @@ class FeishuAdapter(BasePlatformAdapter):
                 state = self._pending_app_scope_requests.pop(request_id, None)
                 if not state:
                     logger.debug("[Feishu] App scope request %s already resolved or unknown", request_id)
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=self._extract_event_account_id(data),
+                        text=(
+                            "This Feishu app-scope card is no longer active. "
+                            "Create a new request if the authorization handoff is still needed."
+                        ),
+                    )
                     return
 
                 if state.owner_open_id and state.owner_open_id != open_id:
@@ -3623,6 +3673,11 @@ class FeishuAdapter(BasePlatformAdapter):
                         state.owner_open_id,
                     )
                     self._pending_app_scope_requests[request_id] = state
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=state.account_id or self._extract_event_account_id(data),
+                        text="Only the Feishu app owner can complete this app-scope card.",
+                    )
                     return
 
                 account_id = self._extract_event_account_id(data)
@@ -3764,6 +3819,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 state = self._pending_app_scope_requests.pop(request_id, None)
                 if not state:
                     logger.debug("[Feishu] App scope cancel %s already resolved or unknown", request_id)
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=self._extract_event_account_id(data),
+                        text="This Feishu app-scope card is already inactive.",
+                    )
                     return
 
                 if state.owner_open_id and state.owner_open_id != open_id:
@@ -3774,6 +3834,11 @@ class FeishuAdapter(BasePlatformAdapter):
                         state.owner_open_id,
                     )
                     self._pending_app_scope_requests[request_id] = state
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=state.account_id or self._extract_event_account_id(data),
+                        text="Only the Feishu app owner can cancel this app-scope card.",
+                    )
                     return
 
                 account_id = self._extract_event_account_id(data)
