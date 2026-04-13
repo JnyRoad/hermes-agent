@@ -1718,6 +1718,11 @@ class FeishuAdapter(BasePlatformAdapter):
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()
+        if self._ws_futures_by_account:
+            logger.info(
+                "[Feishu] Disconnecting websocket transports for accounts: %s",
+                ", ".join(sorted(self._ws_futures_by_account.keys())),
+            )
         self._disable_websocket_auto_reconnect()
         await self._stop_webhook_server()
 
@@ -6309,6 +6314,10 @@ class FeishuAdapter(BasePlatformAdapter):
         websocket_accounts.sort(key=lambda account: (account.account_id != "default", account.account_id))
         if not websocket_accounts:
             raise RuntimeError("no enabled Feishu websocket accounts configured")
+        logger.info(
+            "[Feishu] Starting websocket transports for accounts: %s",
+            self._describe_transport_accounts(connection_mode="websocket"),
+        )
         for account in websocket_accounts:
             account_domain = FEISHU_DOMAIN if account.domain_name != "lark" else LARK_DOMAIN
             client = (
@@ -6350,6 +6359,10 @@ class FeishuAdapter(BasePlatformAdapter):
             self._event_handler = self._event_handlers_by_account.get(primary_account.account_id)
             self._ws_client = self._ws_clients_by_account.get(primary_account.account_id)
             self._ws_future = self._ws_futures_by_account.get(primary_account.account_id)
+        logger.info(
+            "[Feishu] Websocket transports ready for accounts: %s",
+            ", ".join(sorted(self._ws_futures_by_account.keys())) or "none",
+        )
 
     async def _connect_webhook(self) -> None:
         if not FEISHU_WEBHOOK_AVAILABLE:
@@ -6403,6 +6416,20 @@ class FeishuAdapter(BasePlatformAdapter):
             .log_level(lark.LogLevel.WARNING)
             .build()
         )
+
+    def _format_account_transport_label(self, account: FeishuAccountSettings) -> str:
+        """Build a compact runtime label for one Feishu account transport."""
+        domain_name = str(account.domain_name or self._domain_name or "feishu").strip().lower() or "feishu"
+        return f"{account.account_id}@{domain_name}({account.connection_mode})"
+
+    def _describe_transport_accounts(self, *, connection_mode: Optional[str] = None) -> str:
+        """Describe active Feishu accounts for logs and diagnostics."""
+        entries = [
+            self._format_account_transport_label(account)
+            for account in sorted(self._accounts.values(), key=lambda item: (item.account_id != "default", item.account_id))
+            if account.enabled and (connection_mode is None or account.connection_mode == connection_mode)
+        ]
+        return ", ".join(entries) if entries else "none"
 
     async def _feishu_send_with_retry(
         self,

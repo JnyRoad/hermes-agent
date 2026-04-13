@@ -705,6 +705,66 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertEqual(acquire_lock.call_args_list[1].args[:2], ("feishu-app-id", "cli_secondary"))
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_connect_websocket_mode_logs_account_summary(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "websocket",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "connection_mode": "websocket",
+                            "domain": "lark",
+                        }
+                    },
+                }
+            )
+        )
+
+        future = asyncio.Future()
+        future.set_result(None)
+
+        class _Loop:
+            def run_in_executor(self, executor, fn, *args):
+                return future
+
+            def is_closed(self):
+                return False
+
+        fake_loop = _Loop()
+
+        with (
+            patch("gateway.platforms.feishu.FEISHU_AVAILABLE", True),
+            patch("gateway.platforms.feishu.FEISHU_WEBSOCKET_AVAILABLE", True),
+            patch("gateway.platforms.feishu.lark", SimpleNamespace(LogLevel=SimpleNamespace(INFO="INFO", WARNING="WARNING"))),
+            patch("gateway.platforms.feishu.EventDispatcherHandler") as mock_handler_class,
+            patch("gateway.platforms.feishu.FeishuWSClient", side_effect=lambda **kwargs: SimpleNamespace(**kwargs)),
+            patch("gateway.platforms.feishu._run_official_feishu_ws_client"),
+            patch("gateway.platforms.feishu.acquire_scoped_lock", return_value=(True, None)),
+            patch("gateway.platforms.feishu.release_scoped_lock"),
+            patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
+            patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace(name="primary_client")),
+            patch.object(adapter, "_build_lark_client_for_account", return_value=SimpleNamespace(name="secondary_client")),
+            patch("gateway.platforms.feishu.asyncio.get_running_loop", return_value=fake_loop),
+            patch("gateway.platforms.feishu.logger.info") as info_log,
+        ):
+            _mock_event_dispatcher_builder(mock_handler_class)
+            connected = asyncio.run(adapter.connect())
+
+        self.assertTrue(connected)
+        logged_messages = [call.args[1] for call in info_log.call_args_list if call.args and call.args[0].startswith("[Feishu] Starting websocket transports")]
+        self.assertEqual(
+            logged_messages,
+            ["default@feishu(websocket), feishu-cn@lark(websocket)"],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_disconnect_waits_for_all_websocket_account_threads(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -771,6 +831,44 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertEqual(adapter._ws_futures_by_account, {})
         self.assertEqual(adapter._ws_thread_loops_by_account, {})
         self.assertEqual(adapter._ws_clients_by_account, {})
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_disconnect_logs_websocket_account_summary(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "websocket",
+                }
+            )
+        )
+        adapter._ws_futures_by_account = {
+            "default": asyncio.Future(),
+            "feishu-cn": asyncio.Future(),
+        }
+        adapter._ws_futures_by_account["default"].set_result(None)
+        adapter._ws_futures_by_account["feishu-cn"].set_result(None)
+        adapter._app_lock_identities = ["cli_primary", "cli_secondary"]
+        adapter._app_lock_identity = "cli_primary"
+
+        with (
+            patch("gateway.platforms.feishu.release_scoped_lock"),
+            patch("gateway.platforms.feishu.asyncio.all_tasks", return_value=[]),
+            patch.object(adapter, "_cancel_pending_tasks", new=AsyncMock()),
+            patch.object(adapter, "_stop_webhook_server", new=AsyncMock()),
+            patch.object(adapter, "_persist_seen_message_ids"),
+            patch.object(adapter, "_release_app_lock", new=AsyncMock()),
+            patch.object(adapter, "_mark_disconnected"),
+            patch("gateway.platforms.feishu.logger.info") as info_log,
+        ):
+            asyncio.run(adapter.disconnect())
+
+        logged_messages = [call.args[1] for call in info_log.call_args_list if call.args and call.args[0].startswith("[Feishu] Disconnecting websocket transports")]
+        self.assertEqual(logged_messages, ["default, feishu-cn"])
 
     @patch.dict(os.environ, {}, clear=True)
     def test_edit_message_updates_existing_feishu_message(self):
