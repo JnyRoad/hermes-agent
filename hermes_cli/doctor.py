@@ -253,6 +253,17 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
             f"coalesce_ms={block_streaming_coalesce_ms}"
         ),
     )
+    if streaming_enabled:
+        effective_delivery = "streaming in-place updates enabled"
+    elif reply_mode == "card":
+        effective_delivery = "static card-style replies without streaming updates"
+    elif reply_mode == "text":
+        effective_delivery = "static text replies without streaming updates"
+    else:
+        effective_delivery = "static auto-mode replies without streaming updates"
+    if block_streaming_enabled:
+        effective_delivery += f"; coalesced edits at {block_streaming_coalesce_ms}ms when progress updates are emitted"
+    _record("info", "Feishu effective delivery mode", effective_delivery)
 
     if enabled_accounts:
         total_accounts = 1 + len(enabled_accounts)

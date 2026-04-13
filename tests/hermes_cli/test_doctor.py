@@ -589,6 +589,12 @@ class TestFeishuDoctorChecks:
             and "reply_mode=card streaming=false block_streaming=true coalesce_ms=850" in item["detail"]
             for item in report["items"]
         )
+        assert any(
+            item["label"] == "Feishu effective delivery mode"
+            and "static card-style replies without streaming updates" in item["detail"]
+            and "coalesced edits at 850ms" in item["detail"]
+            for item in report["items"]
+        )
         assert any(item["label"] == "Feishu cached directory targets: 3" for item in report["items"])
         assert any(item["label"] == "Feishu cached directory accounts" for item in report["items"])
         assert any(item["label"] == "Feishu live directory search fallback available" for item in report["items"])
