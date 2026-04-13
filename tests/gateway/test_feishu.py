@@ -3824,6 +3824,147 @@ class TestAdapterBehavior(unittest.TestCase):
             context["prompt"],
         )
 
+    def test_resolve_comment_event_context_paginates_comments_until_target(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Paged Doc"}]}},
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_other",
+                            "quote": "Other",
+                            "reply_list": {"replies": []},
+                        }
+                    ],
+                    "has_more": True,
+                    "page_token": "next_comments",
+                }
+            },
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_123",
+                            "quote": "Anchor",
+                            "reply_list": {
+                                "replies": [
+                                    {
+                                        "content": {
+                                            "elements": [
+                                                {"type": "text_run", "text_run": {"text": "Please handle the second page"}},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                    "has_more": False,
+                    "page_token": "",
+                }
+            },
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses) as api_request:
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertIn("Please handle the second page", context["prompt"])
+        comment_calls = [
+            call for call in api_request.call_args_list if call.args[1].endswith("/comments")
+        ]
+        self.assertEqual(comment_calls[0].kwargs["params"]["page_token"], "")
+        self.assertEqual(comment_calls[1].kwargs["params"]["page_token"], "next_comments")
+
+    def test_resolve_comment_event_context_paginates_replies_until_target(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Paged Replies"}]}},
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_123",
+                            "quote": "Anchor",
+                            "reply_list": {
+                                "replies": [
+                                    {
+                                        "content": {
+                                            "elements": [
+                                                {"type": "text_run", "text_run": {"text": "Original root comment"}},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                    "has_more": False,
+                    "page_token": "",
+                }
+            },
+            {
+                "data": {
+                    "items": [
+                        {
+                            "reply_id": "reply_prev",
+                            "user_id": {"open_id": "ou_alice"},
+                            "content": {
+                                "elements": [
+                                    {"type": "text_run", "text_run": {"text": "Earlier reply"}},
+                                ]
+                            },
+                        }
+                    ],
+                    "has_more": True,
+                    "page_token": "next_replies",
+                }
+            },
+            {
+                "data": {
+                    "items": [
+                        {
+                            "reply_id": "reply_target",
+                            "user_id": {"open_id": "ou_bob"},
+                            "content": {
+                                "elements": [
+                                    {"type": "text_run", "text_run": {"text": "Target reply on second page"}},
+                                ]
+                            },
+                        }
+                    ],
+                    "has_more": False,
+                    "page_token": "",
+                }
+            },
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses) as api_request:
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+                reply_id="reply_target",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertIn("Target reply on second page", context["prompt"])
+        self.assertIn("[ou_alice]: Earlier reply", context["prompt"])
+        reply_calls = [
+            call for call in api_request.call_args_list if call.args[1].endswith("/replies")
+        ]
+        self.assertEqual(reply_calls[0].kwargs["params"]["page_token"], "")
+        self.assertEqual(reply_calls[1].kwargs["params"]["page_token"], "next_replies")
+
     @patch.dict(os.environ, {}, clear=True)
     def test_resolve_comment_event_context_degrades_when_meta_lookup_fails(self):
         from gateway.platforms.feishu import FeishuAdapter

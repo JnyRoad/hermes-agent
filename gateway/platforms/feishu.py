@@ -171,6 +171,9 @@ _FEISHU_AUTH_REQUEST_TTL_SECONDS = 30 * 60         # authorization/app-scope car
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 _FEISHU_ACK_EMOJI = "OK"
+_FEISHU_COMMENT_SCAN_MAX_PAGES = 5
+_FEISHU_COMMENT_PAGE_SIZE = 100
+_FEISHU_COMMENT_REPLY_PAGE_SIZE = 50
 # ---------------------------------------------------------------------------
 # Fallback display strings
 # ---------------------------------------------------------------------------
@@ -3303,22 +3306,38 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[Feishu] Failed to fetch document title for %s", file_token, exc_info=True)
 
-        try:
-            comment_payload = feishu_api_request(
-                "GET",
-                f"/open-apis/drive/v1/files/{file_token}/comments",
-                params={"file_type": file_type, "page_size": 100},
-                account_id=account_id,
-            )
-        except Exception:
-            logger.debug("[Feishu] Failed to list comments for %s", file_token, exc_info=True)
-            return None
-
-        comment_items = (comment_payload.get("data") or {}).get("items") or []
         target_comment = None
-        for item in comment_items:
-            if isinstance(item, dict) and str(item.get("comment_id", "")).strip() == comment_id:
-                target_comment = item
+        comment_page_token = ""
+        comment_pages = 0
+        while comment_pages < _FEISHU_COMMENT_SCAN_MAX_PAGES and target_comment is None:
+            comment_pages += 1
+            try:
+                comment_payload = feishu_api_request(
+                    "GET",
+                    f"/open-apis/drive/v1/files/{file_token}/comments",
+                    params={
+                        "file_type": file_type,
+                        "page_size": _FEISHU_COMMENT_PAGE_SIZE,
+                        "page_token": comment_page_token,
+                    },
+                    account_id=account_id,
+                )
+            except Exception:
+                logger.debug("[Feishu] Failed to list comments for %s", file_token, exc_info=True)
+                return None
+
+            comment_data = comment_payload.get("data") or {}
+            comment_items = comment_data.get("items") or []
+            for item in comment_items:
+                if isinstance(item, dict) and str(item.get("comment_id", "")).strip() == comment_id:
+                    target_comment = item
+                    break
+            if target_comment is not None:
+                break
+            if not comment_data.get("has_more"):
+                break
+            comment_page_token = str(comment_data.get("page_token", "") or "").strip()
+            if not comment_page_token:
                 break
         if not isinstance(target_comment, dict):
             document_label = f'"{document_title}"' if document_title else f"{file_type} document {file_token}"
@@ -3348,17 +3367,34 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_text = ""
         reply_chain_lines: List[str] = []
         if reply_id:
-            try:
-                reply_payload = feishu_api_request(
-                    "GET",
-                    f"/open-apis/drive/v1/files/{file_token}/comments/{comment_id}/replies",
-                    params={"file_type": file_type, "page_size": 100},
-                    account_id=account_id,
-                )
-            except Exception:
-                logger.debug("[Feishu] Failed to list comment replies for %s", comment_id, exc_info=True)
-                reply_payload = {}
-            reply_items = (reply_payload.get("data") or {}).get("items") or []
+            reply_items: List[Dict[str, Any]] = []
+            reply_page_token = ""
+            reply_pages = 0
+            while reply_pages < _FEISHU_COMMENT_SCAN_MAX_PAGES:
+                reply_pages += 1
+                try:
+                    reply_payload = feishu_api_request(
+                        "GET",
+                        f"/open-apis/drive/v1/files/{file_token}/comments/{comment_id}/replies",
+                        params={
+                            "file_type": file_type,
+                            "page_size": _FEISHU_COMMENT_REPLY_PAGE_SIZE,
+                            "page_token": reply_page_token,
+                        },
+                        account_id=account_id,
+                    )
+                except Exception:
+                    logger.debug("[Feishu] Failed to list comment replies for %s", comment_id, exc_info=True)
+                    break
+                reply_data = reply_payload.get("data") or {}
+                for item in reply_data.get("items") or []:
+                    if isinstance(item, dict):
+                        reply_items.append(item)
+                if not reply_data.get("has_more"):
+                    break
+                reply_page_token = str(reply_data.get("page_token", "") or "").strip()
+                if not reply_page_token:
+                    break
             reply_chain_lines = _build_comment_reply_chain_lines(reply_items, reply_id)
             for item in reply_items:
                 if not isinstance(item, dict):
