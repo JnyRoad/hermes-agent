@@ -239,6 +239,21 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
         _record("warn", f"Unknown connection mode: {connection_mode}", "expected websocket or webhook")
         issues.append("Set gateway.feishu.extra.connection_mode to websocket or webhook")
 
+    reply_mode = str(feishu_config.extra.get("reply_mode", "auto") or "auto").strip().lower() or "auto"
+    streaming_enabled = bool(feishu_config.extra.get("streaming", True))
+    block_streaming_enabled = bool(feishu_config.extra.get("block_streaming", True))
+    block_streaming_coalesce_ms = int(feishu_config.extra.get("block_streaming_coalesce_ms", 600) or 600)
+    _record(
+        "info",
+        "Feishu reply and streaming settings",
+        (
+            f"reply_mode={reply_mode} "
+            f"streaming={str(streaming_enabled).lower()} "
+            f"block_streaming={str(block_streaming_enabled).lower()} "
+            f"coalesce_ms={block_streaming_coalesce_ms}"
+        ),
+    )
+
     if enabled_accounts:
         total_accounts = 1 + len(enabled_accounts)
         _record("ok", f"Feishu accounts configured: {total_accounts}", "primary + enabled secondary accounts")
