@@ -4219,7 +4219,11 @@ class GatewayRunner:
                 label = str(item.get("label", "") or item.get("id", "")).strip() or "unknown"
                 candidate_source = str(item.get("source", "") or "unknown").strip() or "unknown"
                 account_id = str(item.get("account_id", "") or "default").strip() or "default"
-                lines.append(f"  - `{label}` ({candidate_source}, account={account_id})")
+                reason = str(item.get("reason", "") or "").strip()
+                detail = f"{candidate_source}, account={account_id}"
+                if reason:
+                    detail += f", {reason}"
+                lines.append(f"  - `{label}` ({detail})")
             return "\n".join(lines)
 
         lines.append("- Status: not found in cached directory or live search")

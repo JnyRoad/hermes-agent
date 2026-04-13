@@ -252,8 +252,20 @@ async def test_feishu_directory_lookup_reports_ambiguous_candidates(monkeypatch)
             "source": "cache",
             "preferred_account_id": preferred_account_id,
             "suggestions": [
-                {"id": "oc_1", "label": "Backend Guild (group)", "source": "config", "account_id": "default"},
-                {"id": "feishu-cn::oc_2", "label": "feishu-cn/Backend Ops (group)", "source": "live", "account_id": "feishu-cn"},
+                {
+                    "id": "oc_1",
+                    "label": "Backend Guild (group)",
+                    "source": "config",
+                    "account_id": "default",
+                    "reason": "exact name match, config-backed",
+                },
+                {
+                    "id": "feishu-cn::oc_2",
+                    "label": "feishu-cn/Backend Ops (group)",
+                    "source": "live",
+                    "account_id": "feishu-cn",
+                    "reason": "prefix name match, preferred account, live directory",
+                },
             ],
         },
     )
@@ -263,6 +275,7 @@ async def test_feishu_directory_lookup_reports_ambiguous_candidates(monkeypatch)
     assert "Status: ambiguous" in result
     assert "Backend Guild (group)" in result
     assert "feishu-cn/Backend Ops (group)" in result
+    assert "exact name match, config-backed" in result
 
 
 @pytest.mark.asyncio

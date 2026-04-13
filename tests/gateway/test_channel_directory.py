@@ -190,6 +190,40 @@ class TestResolveChannelName:
         assert result["status"] == "ambiguous"
         assert result["resolved_id"] is None
 
+    def test_feishu_ambiguity_suggestions_rank_preferred_account_first(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "oc_default", "name": "Backend", "type": "group", "account_id": "default", "source": "config"},
+                {"id": "feishu-cn::oc_cn", "name": "Backend", "type": "group", "account_id": "feishu-cn", "source": "live"},
+                {"id": "feishu-cn::oc_prefix", "name": "Backend Ops", "type": "group", "account_id": "feishu-cn", "source": "live"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            result = explain_channel_name_resolution("feishu", "Backend", preferred_account_id="feishu-cn")
+
+        assert result["status"] == "resolved"
+        assert result["resolved_id"] == "feishu-cn::oc_cn"
+
+    def test_feishu_ambiguity_suggestions_include_reason_and_sorting(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "oc_default", "name": "Backend", "type": "group", "account_id": "default", "source": "config"},
+                {"id": "feishu-cn::oc_1", "name": "Backend", "type": "group", "account_id": "feishu-cn", "source": "live"},
+                {"id": "feishu-cn::oc_2", "name": "Backend", "type": "group", "account_id": "feishu-cn", "source": "live_search"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            result = explain_channel_name_resolution("feishu", "Backend", preferred_account_id="feishu-cn")
+
+        assert result["status"] == "ambiguous"
+        assert [item["id"] for item in result["suggestions"]] == [
+            "feishu-cn::oc_1",
+            "feishu-cn::oc_2",
+            "oc_default",
+        ]
+        assert result["suggestions"][0]["reason"] == "exact name match, preferred account, live directory"
+        assert result["suggestions"][2]["reason"] == "exact name match, config-backed"
+
     def test_no_channels_returns_none(self, tmp_path):
         with self._setup(tmp_path, {}):
             assert resolve_channel_name("telegram", "someone") is None

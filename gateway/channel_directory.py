@@ -126,6 +126,95 @@ def _select_preferred_feishu_candidate(
     return None
 
 
+def _rank_resolution_candidate(
+    platform_name: str,
+    channel: Dict[str, Any],
+    *,
+    match_type: str,
+    preferred_account_id: Optional[str],
+) -> tuple:
+    """Return a stable sort key for ambiguity suggestions.
+
+    The ranking keeps exact matches ahead of prefixes, then prefers the current
+    Feishu account, then cached/config-backed entries, and finally sorts by
+    human-facing label for determinism.
+    """
+    normalized_match_type = "exact" if match_type == "exact" else "prefix"
+    match_rank = 0 if normalized_match_type == "exact" else 1
+    normalized_account_id = str(channel.get("account_id", "") or "default").strip() or "default"
+    preferred_account = str(preferred_account_id or "").strip() or ""
+    account_rank = 0 if preferred_account and normalized_account_id == preferred_account else 1
+    source = str(channel.get("source", "") or "unknown").strip() or "unknown"
+    source_rank = {
+        "config": 0,
+        "live": 1,
+        "live_search": 2,
+        "session": 3,
+        "unknown": 4,
+    }.get(source, 5)
+    label = _channel_target_name(platform_name, channel).lower()
+    return (match_rank, account_rank, source_rank, label, str(channel.get("id", "")).strip())
+
+
+def _build_resolution_suggestions(
+    platform_name: str,
+    exact_matches: List[Dict[str, Any]],
+    prefix_matches: List[Dict[str, Any]],
+    *,
+    preferred_account_id: Optional[str],
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """Build ranked ambiguity suggestions with ranking explanations."""
+    ranked_candidates: List[tuple[tuple, Dict[str, Any], str]] = []
+    seen_ids: set[str] = set()
+
+    for match_type, candidates in (("exact", exact_matches), ("prefix", prefix_matches)):
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id", "")).strip()
+            if not item_id or item_id in seen_ids:
+                continue
+            seen_ids.add(item_id)
+            ranked_candidates.append(
+                (
+                    _rank_resolution_candidate(
+                        platform_name,
+                        item,
+                        match_type=match_type,
+                        preferred_account_id=preferred_account_id,
+                    ),
+                    item,
+                    match_type,
+                )
+            )
+
+    suggestions: List[Dict[str, Any]] = []
+    for _, item, match_type in sorted(ranked_candidates)[:limit]:
+        account_id = str(item.get("account_id", "") or "default").strip() or "default"
+        reason_parts = [f"{match_type} name match"]
+        if preferred_account_id and account_id == (str(preferred_account_id).strip() or "default"):
+            reason_parts.append("preferred account")
+        source = str(item.get("source", "") or "unknown").strip() or "unknown"
+        if source == "config":
+            reason_parts.append("config-backed")
+        elif source == "live":
+            reason_parts.append("live directory")
+        elif source == "live_search":
+            reason_parts.append("live search")
+        suggestions.append(
+            {
+                "id": item["id"],
+                "label": _channel_target_name(platform_name, item),
+                "source": source,
+                "account_id": account_id,
+                "match_type": match_type,
+                "reason": ", ".join(reason_parts),
+            }
+        )
+    return suggestions
+
+
 def _select_resolved_channel(
     platform_name: str,
     channels: List[Dict[str, Any]],
@@ -233,16 +322,12 @@ def explain_channel_name_resolution(
         candidate_entries = prefix_matches
     else:
         candidate_entries = []
-    suggestions = [
-        {
-            "id": item["id"],
-            "label": _channel_target_name(platform_name, item),
-            "source": item.get("source"),
-            "account_id": item.get("account_id"),
-        }
-        for item in candidate_entries[:5]
-        if isinstance(item, dict)
-    ]
+    suggestions = _build_resolution_suggestions(
+        platform_name,
+        exact_matches,
+        prefix_matches if not exact_matches else [],
+        preferred_account_id=preferred_account_id,
+    )
     status = "resolved" if resolved_id else ("ambiguous" if len(candidate_entries) > 1 else "not_found")
     return {
         "status": status,
