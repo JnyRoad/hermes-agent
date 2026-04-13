@@ -53,6 +53,64 @@ def _channel_target_name(platform_name: str, channel: Dict[str, Any]) -> str:
     return name
 
 
+def _select_resolved_channel_id(platform_name: str, channels: List[Dict[str, Any]], query: str) -> Optional[str]:
+    """Resolve a normalized query against a channel list using display-aware matching."""
+    if not channels:
+        return None
+
+    # 1. Exact name match, including the display labels shown by send_message(action="list")
+    for ch in channels:
+        if _normalize_channel_query(ch["name"]) == query:
+            return ch["id"]
+        if _normalize_channel_query(_channel_target_name(platform_name, ch)) == query:
+            return ch["id"]
+
+    # 2. Guild-qualified match for Discord ("GuildName/channel")
+    if platform_name == "discord" and "/" in query:
+        guild_part, ch_part = query.rsplit("/", 1)
+        for ch in channels:
+            guild = ch.get("guild", "").strip().lower()
+            if guild == guild_part and _normalize_channel_query(ch["name"]) == ch_part:
+                return ch["id"]
+
+    # 3. Partial prefix match (only if unambiguous)
+    matches = [ch for ch in channels if _normalize_channel_query(ch["name"]).startswith(query)]
+    if len(matches) == 1:
+        return matches[0]["id"]
+
+    display_matches = [ch for ch in channels if _normalize_channel_query(_channel_target_name(platform_name, ch)).startswith(query)]
+    if len(display_matches) == 1:
+        return display_matches[0]["id"]
+
+    return None
+
+
+def _resolve_feishu_live_channel_name(query: str) -> Optional[str]:
+    """Best-effort Feishu live lookup when the cached directory does not contain a match."""
+    try:
+        from gateway.config import Platform, load_gateway_config
+        from gateway.platforms.feishu import FeishuAdapter
+    except Exception:
+        return None
+
+    try:
+        config = load_gateway_config()
+    except Exception:
+        return None
+
+    platform_config = (config.platforms or {}).get(Platform.FEISHU)
+    if not platform_config or not getattr(platform_config, "enabled", False):
+        return None
+
+    try:
+        adapter = FeishuAdapter(platform_config)
+        live_entries = adapter.search_channel_directory_entries(query, limit_per_account=10)
+    except Exception:
+        logger.debug("Channel directory: failed live Feishu search for %s", query, exc_info=True)
+        return None
+    return _select_resolved_channel_id("feishu", live_entries, query)
+
+
 def _session_entry_id(origin: Dict[str, Any]) -> Optional[str]:
     chat_id = origin.get("chat_id")
     if not chat_id:
@@ -250,30 +308,14 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
     """
     directory = load_directory()
     channels = directory.get("platforms", {}).get(platform_name, [])
-    if not channels:
-        return None
-
     query = _normalize_channel_query(name)
 
-    # 1. Exact name match, including the display labels shown by send_message(action="list")
-    for ch in channels:
-        if _normalize_channel_query(ch["name"]) == query:
-            return ch["id"]
-        if _normalize_channel_query(_channel_target_name(platform_name, ch)) == query:
-            return ch["id"]
+    resolved = _select_resolved_channel_id(platform_name, channels, query)
+    if resolved:
+        return resolved
 
-    # 2. Guild-qualified match for Discord ("GuildName/channel")
-    if "/" in query:
-        guild_part, ch_part = query.rsplit("/", 1)
-        for ch in channels:
-            guild = ch.get("guild", "").strip().lower()
-            if guild == guild_part and _normalize_channel_query(ch["name"]) == ch_part:
-                return ch["id"]
-
-    # 3. Partial prefix match (only if unambiguous)
-    matches = [ch for ch in channels if _normalize_channel_query(ch["name"]).startswith(query)]
-    if len(matches) == 1:
-        return matches[0]["id"]
+    if platform_name == "feishu":
+        return _resolve_feishu_live_channel_name(query)
 
     return None
 

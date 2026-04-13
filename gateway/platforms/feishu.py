@@ -3021,6 +3021,83 @@ class FeishuAdapter(BasePlatformAdapter):
                 entries.extend(self._list_live_directory_entries_for_account(account_id, limit=effective_limit))
         return self._normalize_directory_entries(entries)
 
+    def search_channel_directory_entries(self, query: str, *, limit_per_account: int = 10) -> List[Dict[str, str]]:
+        """Search Feishu users and chats on demand for directory resolution.
+
+        This path complements the periodic cached directory refresh. It is used
+        when Hermes needs to resolve a Feishu target by name but the local cache
+        does not contain a match yet.
+        """
+        from tools.feishu.client import feishu_api_request
+
+        normalized_query = str(query or "").strip()
+        if not normalized_query:
+            return []
+
+        entries: List[FeishuDirectoryEntry] = []
+        account_ids = [
+            account.account_id
+            for account in sorted(self._accounts.values(), key=lambda account: (account.account_id != "default", account.account_id))
+            if account.enabled
+        ] or ["default"]
+        for account_id in account_ids:
+            settings = self._get_account_live_directory_settings(account_id)
+            per_account_limit = min(max(limit_per_account, 1), int(settings["live_limit"]))
+            if settings["include_live_users"] is not False:
+                try:
+                    user_payload = feishu_api_request(
+                        "GET",
+                        "/open-apis/search/v1/user",
+                        params={"query": normalized_query, "page_size": str(min(per_account_limit, 50))},
+                        account_id=account_id,
+                    )
+                    for item in ((user_payload.get("data") or {}).get("users") or []):
+                        if not isinstance(item, dict):
+                            continue
+                        user = item.get("user_info") if isinstance(item.get("user_info"), dict) else item
+                        open_id = str((user or {}).get("open_id", "") or "").strip()
+                        if not open_id:
+                            continue
+                        entries.append(
+                            FeishuDirectoryEntry(
+                                id=open_id,
+                                name=str((user or {}).get("name", "") or open_id).strip() or open_id,
+                                type="dm",
+                                source="live_search",
+                                account_id=account_id,
+                            )
+                        )
+                except Exception:
+                    logger.debug("[Feishu] Failed to search live user directory for account %s", account_id, exc_info=True)
+
+            if settings["include_live_groups"] is not False:
+                try:
+                    chat_payload = feishu_api_request(
+                        "GET",
+                        "/open-apis/im/v1/chats/search",
+                        params={"query": normalized_query, "page_size": str(min(per_account_limit, 50)), "user_id_type": "open_id"},
+                        account_id=account_id,
+                    )
+                    for item in ((chat_payload.get("data") or {}).get("items") or []):
+                        if not isinstance(item, dict):
+                            continue
+                        chat_id = str(item.get("chat_id", "") or "").strip()
+                        if not chat_id:
+                            continue
+                        entries.append(
+                            FeishuDirectoryEntry(
+                                id=chat_id,
+                                name=str(item.get("name", "") or chat_id).strip() or chat_id,
+                                type="group",
+                                source="live_search",
+                                account_id=account_id,
+                            )
+                        )
+                except Exception:
+                    logger.debug("[Feishu] Failed to search live chat directory for account %s", account_id, exc_info=True)
+
+        return self._normalize_directory_entries(entries)
+
     def format_message(self, content: str) -> str:
         """Feishu text messages are plain text by default."""
         return content.strip()

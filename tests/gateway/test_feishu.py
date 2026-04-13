@@ -325,6 +325,52 @@ class TestFeishuDirectoryDiscovery(unittest.TestCase):
         )
         self.assertEqual(calls, ["/open-apis/im/v1/chats"])
 
+    def test_search_channel_directory_entries_queries_users_and_chats(self):
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+            )
+        )
+
+        calls = []
+
+        def _fake_request(method, path, params=None, account_id=None, **_kwargs):
+            calls.append((path, dict(params or {}), account_id))
+            if path == "/open-apis/search/v1/user":
+                return {
+                    "data": {
+                        "users": [
+                            {"user_info": {"open_id": "ou_alice", "name": "Alice"}},
+                        ]
+                    }
+                }
+            if path == "/open-apis/im/v1/chats/search":
+                return {
+                    "data": {
+                        "items": [
+                            {"chat_id": "oc_backend", "name": "Backend Guild"},
+                        ]
+                    }
+                }
+            raise AssertionError(f"unexpected path {path}")
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=_fake_request):
+            entries = adapter.search_channel_directory_entries("backend", limit_per_account=5)
+
+        self.assertEqual(
+            entries,
+            [
+                {"id": "ou_alice", "name": "Alice", "type": "dm", "source": "live_search", "account_id": "default"},
+                {"id": "oc_backend", "name": "Backend Guild", "type": "group", "source": "live_search", "account_id": "default"},
+            ],
+        )
+        self.assertEqual(calls[0][1]["query"], "backend")
+        self.assertEqual(calls[1][1]["query"], "backend")
+
     def test_normalize_interactive_card_preserves_title_body_and_actions(self):
         from gateway.platforms.feishu import normalize_feishu_message
 

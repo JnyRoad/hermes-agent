@@ -310,6 +310,43 @@ class TestSendMessageTool:
             media_files=[],
         )
 
+    def test_feishu_target_resolves_via_live_directory_search_when_cache_misses(self, tmp_path):
+        feishu_cfg = SimpleNamespace(enabled=True, token="", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.FEISHU: feishu_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({"updated_at": "2026-01-01T00:00:00", "platforms": {"feishu": []}}))
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.channel_directory._resolve_feishu_live_channel_name", return_value="feishu-cn::oc_backend"), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "feishu:Backend Guild (group)",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.FEISHU,
+            feishu_cfg,
+            "oc_backend",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            account_id="feishu-cn",
+        )
+
     def test_media_only_message_uses_placeholder_for_mirroring(self):
         config, telegram_cfg = _make_config()
 
