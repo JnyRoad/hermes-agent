@@ -916,6 +916,102 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_get_transport_account_status_prefers_recorded_runtime_states_and_errors(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "websocket",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "connection_mode": "webhook",
+                            "domain": "lark",
+                        }
+                    },
+                }
+            )
+        )
+
+        adapter._set_transport_runtime_state("default", "connecting")
+        adapter._set_transport_runtime_state("feishu-cn", "error", error="webhook bind failed")
+
+        statuses = adapter.get_transport_account_status()
+
+        self.assertEqual(
+            statuses,
+            [
+                {
+                    "account_id": "default",
+                    "connection_mode": "websocket",
+                    "domain": "feishu",
+                    "runtime_state": "connecting",
+                },
+                {
+                    "account_id": "feishu-cn",
+                    "connection_mode": "webhook",
+                    "domain": "lark",
+                    "runtime_state": "error",
+                    "last_error": "webhook bind failed",
+                },
+            ],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_disconnect_marks_transport_runtime_state_disconnected(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "websocket",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "connection_mode": "webhook",
+                        }
+                    },
+                }
+            )
+        )
+        adapter._set_transport_runtime_state("default", "connected")
+        adapter._set_transport_runtime_state("feishu-cn", "connected")
+        adapter._ws_futures_by_account = {"default": asyncio.Future()}
+        adapter._webhook_runner = object()
+
+        with patch.object(adapter, "_stop_webhook_server", new=AsyncMock()), patch(
+            "gateway.platforms.feishu.release_scoped_lock"
+        ):
+            asyncio.run(adapter.disconnect())
+
+        self.assertEqual(
+            adapter.get_transport_account_status(),
+            [
+                {
+                    "account_id": "default",
+                    "connection_mode": "websocket",
+                    "domain": "feishu",
+                    "runtime_state": "disconnected",
+                },
+                {
+                    "account_id": "feishu-cn",
+                    "connection_mode": "webhook",
+                    "domain": "feishu",
+                    "runtime_state": "disconnected",
+                },
+            ],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_edit_message_updates_existing_feishu_message(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -1166,6 +1262,8 @@ class TestAdapterModule(unittest.TestCase):
             _ws_reconnect_interval=3,
             _ws_ping_interval=4,
             _ws_ping_timeout=5,
+            _transport_runtime_state_by_account={},
+            _set_transport_runtime_state=Mock(),
         )
         fake_client_module = ModuleType("lark_oapi.ws.client")
         fake_client_module.loop = None
@@ -1191,6 +1289,49 @@ class TestAdapterModule(unittest.TestCase):
         self.assertEqual(fake_client._reconnect_nonce, 2)
         self.assertEqual(fake_client._reconnect_interval, 3)
         self.assertEqual(fake_client._ping_interval, 4)
+        fake_adapter._set_transport_runtime_state.assert_any_call("default", "connecting")
+        fake_adapter._set_transport_runtime_state.assert_any_call("default", "error", error="stop test client")
+
+    def test_runtime_ws_overrides_record_runtime_error(self):
+        import sys
+        from types import ModuleType
+
+        class _FailingWSClient:
+            def start(self):
+                raise RuntimeError("boom")
+
+        fake_client = _FailingWSClient()
+        fake_adapter = SimpleNamespace(
+            _ws_thread_loop=None,
+            _ws_reconnect_nonce=2,
+            _ws_reconnect_interval=3,
+            _ws_ping_interval=4,
+            _ws_ping_timeout=5,
+            _transport_runtime_state_by_account={},
+            _set_transport_runtime_state=Mock(),
+        )
+        fake_client_module = ModuleType("lark_oapi.ws.client")
+        fake_client_module.loop = None
+        fake_client_module.websockets = SimpleNamespace(connect=AsyncMock())
+        fake_ws_module = ModuleType("lark_oapi.ws")
+        fake_ws_module.client = fake_client_module
+        fake_root_module = ModuleType("lark_oapi")
+        fake_root_module.ws = fake_ws_module
+
+        original_modules = sys.modules.copy()
+        sys.modules["lark_oapi"] = fake_root_module
+        sys.modules["lark_oapi.ws"] = fake_ws_module
+        sys.modules["lark_oapi.ws.client"] = fake_client_module
+        try:
+            from gateway.platforms.feishu import _run_official_feishu_ws_client
+
+            _run_official_feishu_ws_client(fake_client, fake_adapter, "feishu-cn")
+        finally:
+            sys.modules.clear()
+            sys.modules.update(original_modules)
+
+        fake_adapter._set_transport_runtime_state.assert_any_call("feishu-cn", "connecting")
+        fake_adapter._set_transport_runtime_state.assert_any_call("feishu-cn", "error", error="boom")
 
 
 class TestAdapterBehavior(unittest.TestCase):

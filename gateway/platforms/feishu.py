@@ -1249,6 +1249,9 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any, account_id: str
         ws_thread_loops[account_id] = loop
     if account_id == "default" or getattr(adapter, "_ws_thread_loop", None) is None:
         adapter._ws_thread_loop = loop
+    report_state = getattr(adapter, "_set_transport_runtime_state", None)
+    if callable(report_state):
+        report_state(account_id, "connecting")
 
     original_connect = ws_client_module.websockets.connect
     original_configure = getattr(ws_client, "_configure", None)
@@ -1282,8 +1285,15 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any, account_id: str
     _apply_runtime_ws_overrides()
     try:
         ws_client.start()
-    except Exception:
-        pass
+    except Exception as exc:
+        if callable(report_state):
+            report_state(account_id, "error", error=str(exc))
+        logger.warning(
+            "[Feishu] Websocket transport for account %s exited with error: %s",
+            account_id,
+            exc,
+            exc_info=True,
+        )
     finally:
         ws_client_module.websockets.connect = original_connect
         if original_configure is not None:
@@ -1306,6 +1316,14 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any, account_id: str
             ws_thread_loops.pop(account_id, None)
         if getattr(adapter, "_ws_thread_loop", None) is loop:
             adapter._ws_thread_loop = None
+        if callable(report_state):
+            active_states = {"error", "disconnecting"}
+            current_state = None
+            get_state = getattr(adapter, "_transport_runtime_state_by_account", None)
+            if isinstance(get_state, dict):
+                current_state = str(get_state.get(account_id) or "").strip().lower() or None
+            if current_state not in active_states:
+                report_state(account_id, "disconnected")
 
 
 def check_feishu_requirements() -> bool:
@@ -1339,6 +1357,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_clients_by_account: Dict[str, Any] = {}
         self._ws_futures_by_account: Dict[str, asyncio.Future] = {}
         self._ws_thread_loops_by_account: Dict[str, asyncio.AbstractEventLoop] = {}
+        self._transport_runtime_state_by_account: Dict[str, str] = {}
+        self._transport_runtime_error_by_account: Dict[str, str] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._webhook_runner: Optional[Any] = None
         self._webhook_site: Optional[Any] = None
@@ -1723,7 +1743,12 @@ class FeishuAdapter(BasePlatformAdapter):
                 "[Feishu] Disconnecting websocket transports for accounts: %s",
                 ", ".join(sorted(self._ws_futures_by_account.keys())),
             )
+            for account_id in list(self._ws_futures_by_account.keys()):
+                self._set_transport_runtime_state(account_id, "disconnecting")
         self._disable_websocket_auto_reconnect()
+        for account in self._accounts.values():
+            if account.enabled and account.connection_mode == "webhook":
+                self._set_transport_runtime_state(account.account_id, "disconnecting")
         await self._stop_webhook_server()
 
         for account_id, ws_thread_loop in list(self._ws_thread_loops_by_account.items()):
@@ -1770,6 +1795,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._event_handler = None
         self._event_handlers_by_account.clear()
         self._clients_by_account.clear()
+        for account in self._accounts.values():
+            if account.enabled:
+                self._set_transport_runtime_state(account.account_id, "disconnected")
         self._persist_seen_message_ids()
         await self._release_app_lock()
 
@@ -6319,6 +6347,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._describe_transport_accounts(connection_mode="websocket"),
         )
         for account in websocket_accounts:
+            self._set_transport_runtime_state(account.account_id, "connecting")
             account_domain = FEISHU_DOMAIN if account.domain_name != "lark" else LARK_DOMAIN
             client = (
                 self._build_lark_client(account_domain)
@@ -6350,6 +6379,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 account.account_id,
             )
             self._ws_futures_by_account[account.account_id] = ws_future
+            self._set_transport_runtime_state(account.account_id, "connected")
             if account.account_id == "default":
                 self._ws_client = ws_client
                 self._ws_future = ws_future
@@ -6395,6 +6425,9 @@ class FeishuAdapter(BasePlatformAdapter):
         await self._webhook_runner.setup()
         self._webhook_site = web.TCPSite(self._webhook_runner, self._webhook_host, self._webhook_port)
         await self._webhook_site.start()
+        for account in self._accounts.values():
+            if account.enabled and account.connection_mode == "webhook":
+                self._set_transport_runtime_state(account.account_id, "connected")
 
     def _build_lark_client(self, domain: Any) -> Any:
         return (
@@ -6422,6 +6455,16 @@ class FeishuAdapter(BasePlatformAdapter):
         domain_name = str(account.domain_name or self._domain_name or "feishu").strip().lower() or "feishu"
         return f"{account.account_id}@{domain_name}({account.connection_mode})"
 
+    def _set_transport_runtime_state(self, account_id: str, runtime_state: str, *, error: Optional[str] = None) -> None:
+        """Track per-account transport lifecycle state for diagnostics and runtime health checks."""
+        normalized_account_id = str(account_id or "default").strip() or "default"
+        normalized_state = str(runtime_state or "configured").strip().lower() or "configured"
+        self._transport_runtime_state_by_account[normalized_account_id] = normalized_state
+        if error:
+            self._transport_runtime_error_by_account[normalized_account_id] = str(error).strip()
+        elif normalized_state not in {"error", "connected"}:
+            self._transport_runtime_error_by_account.pop(normalized_account_id, None)
+
     def _describe_transport_accounts(self, *, connection_mode: Optional[str] = None) -> str:
         """Describe active Feishu accounts for logs and diagnostics."""
         entries = [
@@ -6437,19 +6480,27 @@ class FeishuAdapter(BasePlatformAdapter):
         for account in sorted(self._accounts.values(), key=lambda item: (item.account_id != "default", item.account_id)):
             if not account.enabled:
                 continue
-            runtime_state = "configured"
-            if account.connection_mode == "websocket":
-                runtime_state = "connected" if account.account_id in self._ws_futures_by_account else "configured"
-            elif account.connection_mode == "webhook":
-                runtime_state = "connected" if self._webhook_runner is not None else "configured"
-            statuses.append(
-                {
-                    "account_id": account.account_id,
-                    "connection_mode": account.connection_mode,
-                    "domain": str(account.domain_name or self._domain_name or "feishu").strip().lower() or "feishu",
-                    "runtime_state": runtime_state,
-                }
-            )
+            runtime_state = str(
+                self._transport_runtime_state_by_account.get(account.account_id)
+                or ""
+            ).strip().lower()
+            if not runtime_state:
+                if account.connection_mode == "websocket":
+                    runtime_state = "connected" if account.account_id in self._ws_futures_by_account else "configured"
+                elif account.connection_mode == "webhook":
+                    runtime_state = "connected" if self._webhook_runner is not None else "configured"
+                else:
+                    runtime_state = "configured"
+            item = {
+                "account_id": account.account_id,
+                "connection_mode": account.connection_mode,
+                "domain": str(account.domain_name or self._domain_name or "feishu").strip().lower() or "feishu",
+                "runtime_state": runtime_state,
+            }
+            last_error = str(self._transport_runtime_error_by_account.get(account.account_id) or "").strip()
+            if last_error:
+                item["last_error"] = last_error
+            statuses.append(item)
         return statuses
 
     async def _feishu_send_with_retry(
