@@ -4136,6 +4136,87 @@ class GatewayRunner:
             lines.extend(["", "No actionable Feishu issues detected."])
         return "\n".join(lines)
 
+    async def _handle_feishu_directory_command(self, event: MessageEvent, query: str) -> str:
+        """Handle `/feishu directory` for cache and live directory diagnostics."""
+        from gateway.config import Platform
+        from gateway.channel_directory import explain_channel_name_resolution, load_directory
+
+        if event.source.platform != Platform.FEISHU:
+            return "This command is only available inside a Feishu chat."
+
+        adapter = self.adapters.get(Platform.FEISHU)
+        if adapter is None:
+            return "Feishu adapter is not connected."
+
+        normalized_query = str(query or "").strip()
+        if not normalized_query:
+            directory = load_directory()
+            feishu_entries = directory.get("platforms", {}).get("feishu", []) or []
+            source_counts: dict[str, int] = {}
+            account_counts: dict[str, int] = {}
+            for item in feishu_entries:
+                if not isinstance(item, dict):
+                    continue
+                source = str(item.get("source", "") or "unknown").strip() or "unknown"
+                account_key = str(item.get("account_id", "") or "default").strip() or "default"
+                source_counts[source] = source_counts.get(source, 0) + 1
+                account_counts[account_key] = account_counts.get(account_key, 0) + 1
+
+            lines = ["📚 **Feishu Directory**", ""]
+            updated_at = str(directory.get("updated_at", "") or "").strip()
+            if updated_at:
+                lines.append(f"- Cache updated at: `{updated_at}`")
+            lines.append(f"- Cached targets: {len(feishu_entries)}")
+            if source_counts:
+                source_detail = ", ".join(f"{key}={value}" for key, value in sorted(source_counts.items()))
+                lines.append(f"- Sources: {source_detail}")
+            if account_counts:
+                account_detail = ", ".join(f"{key}={value}" for key, value in sorted(account_counts.items()))
+                lines.append(f"- Accounts: {account_detail}")
+            if hasattr(adapter, "search_channel_directory_entries"):
+                lines.append("- Live search fallback: available")
+            else:
+                lines.append("- Live search fallback: unavailable")
+            lines.extend(
+                [
+                    "",
+                    "Use `/feishu directory <name>` to inspect resolution or live search candidates.",
+                ]
+            )
+            return "\n".join(lines)
+
+        resolution = explain_channel_name_resolution("feishu", normalized_query)
+        status = resolution.get("status", "not_found")
+        source = str(resolution.get("source", "") or "none").strip() or "none"
+        suggestions = resolution.get("suggestions", []) or []
+        lines = [f"📚 **Feishu Directory Lookup** — `{normalized_query}`", ""]
+
+        if status == "resolved":
+            resolved_id = str(resolution.get("resolved_id", "") or "").strip()
+            lines.append(f"- Status: resolved via `{source}`")
+            if suggestions:
+                top = suggestions[0]
+                label = str(top.get("label", "") or resolved_id).strip() or resolved_id
+                account_id = str(top.get("account_id", "") or "default").strip() or "default"
+                lines.append(f"- Target: `{label}`")
+                lines.append(f"- Account: `{account_id}`")
+            lines.append(f"- Resolved ID: `{resolved_id}`")
+            return "\n".join(lines)
+
+        if status == "ambiguous":
+            lines.append(f"- Status: ambiguous after `{source if source != 'none' else 'cache/live_search'}` lookup")
+            lines.append("- Candidates:")
+            for item in suggestions:
+                label = str(item.get("label", "") or item.get("id", "")).strip() or "unknown"
+                candidate_source = str(item.get("source", "") or "unknown").strip() or "unknown"
+                account_id = str(item.get("account_id", "") or "default").strip() or "default"
+                lines.append(f"  - `{label}` ({candidate_source}, account={account_id})")
+            return "\n".join(lines)
+
+        lines.append("- Status: not found in cached directory or live search")
+        lines.append("- Try a more specific display label such as `feishu-cn/Backend (group)`.")
+        return "\n".join(lines)
+
     async def _handle_feishu_command(self, event: MessageEvent) -> str:
         """Handle `/feishu` unified subcommands inside Feishu chats."""
         from gateway.config import Platform
@@ -4157,6 +4238,7 @@ class GatewayRunner:
                 "📘 **Feishu Commands**\n"
                 "- `/feishu start` — validate Feishu gateway readiness\n"
                 "- `/feishu doctor` — show Feishu diagnostics in chat\n"
+                "- `/feishu directory [query]` — inspect cached targets or resolve a Feishu target name\n"
                 "- `/feishu auth ...` — inspect or request Feishu user authorization\n"
                 "- `/feishu auth batch` — owner-only batch authorization for all granted user scopes\n"
                 "- `/feishu help` — show this help"
@@ -4164,6 +4246,9 @@ class GatewayRunner:
 
         if subcommand == "doctor":
             return await self._handle_feishu_doctor_command(event)
+
+        if subcommand == "directory":
+            return await self._handle_feishu_directory_command(event, remaining)
 
         if subcommand in {"auth", "onboarding"}:
             forwarded_event = MessageEvent(
@@ -4208,7 +4293,7 @@ class GatewayRunner:
             return "✅ **Feishu Start Check Passed**\n- Feishu gateway configuration looks healthy."
 
         return (
-            "Usage: `/feishu [start|auth|doctor|help]`\n"
+            "Usage: `/feishu [start|auth|doctor|directory|help]`\n"
             "Example: `/feishu auth feishu_calendar_event delete`"
         )
 
