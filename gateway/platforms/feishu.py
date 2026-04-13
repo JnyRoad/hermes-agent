@@ -554,6 +554,21 @@ def _build_comment_reply_chain_lines(replies: List[Dict[str, Any]], target_reply
     return fallback_lines
 
 
+def _classify_tool_progress_line(line: str) -> tuple[str, str]:
+    """Classify gateway tool-progress lines into Feishu-friendly status buckets."""
+    normalized_line = str(line or "").strip()
+    if not normalized_line:
+        return "other", ""
+
+    if normalized_line.startswith(("✅", "✔️", "☑️")):
+        return "completed", normalized_line
+    if normalized_line.startswith(("❌", "⚠️", "🛑")):
+        return "failed", normalized_line
+    if normalized_line.startswith(("⏳", "🔄", "🟡")):
+        return "running", normalized_line
+    return "running", normalized_line
+
+
 def _is_style_enabled(style: Dict[str, Any] | None, key: str) -> bool:
     if not style:
         return False
@@ -5951,10 +5966,34 @@ class FeishuAdapter(BasePlatformAdapter):
         cleaned_lines = [str(line).strip() for line in progress_lines if str(line).strip()]
         if not cleaned_lines:
             return ""
+        grouped_lines: Dict[str, List[str]] = {
+            "running": [],
+            "completed": [],
+            "failed": [],
+        }
+        for line in cleaned_lines[-12:]:
+            status, normalized_line = _classify_tool_progress_line(line)
+            grouped_lines.setdefault(status, []).append(normalized_line)
+
         rendered_lines = ["**Tool Activity**", ""]
-        rendered_lines.extend(f"- {line}" for line in cleaned_lines)
-        rendered_lines.append("")
-        rendered_lines.append("_Running tools for this request..._")
+        if grouped_lines["running"]:
+            rendered_lines.append("**Running**")
+            rendered_lines.extend(f"- {line}" for line in grouped_lines["running"])
+            rendered_lines.append("")
+        if grouped_lines["completed"]:
+            rendered_lines.append("**Completed**")
+            rendered_lines.extend(f"- {line}" for line in grouped_lines["completed"])
+            rendered_lines.append("")
+        if grouped_lines["failed"]:
+            rendered_lines.append("**Needs Attention**")
+            rendered_lines.extend(f"- {line}" for line in grouped_lines["failed"])
+            rendered_lines.append("")
+        if grouped_lines["running"]:
+            rendered_lines.append("_Running tools for this request..._")
+        elif grouped_lines["failed"]:
+            rendered_lines.append("_Some tool steps need attention before the request is fully complete._")
+        else:
+            rendered_lines.append("_Recent tool activity for this request._")
         return "\n".join(rendered_lines)
 
     async def _send_uploaded_file_message(

@@ -4073,8 +4073,30 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
         self.assertIn("**Tool Activity**", rendered)
+        self.assertIn("**Running**", rendered)
         self.assertIn('- 📄 feishu_fetch_doc: "spec.md"', rendered)
         self.assertIn('_Running tools for this request..._', rendered)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_feishu_formats_tool_progress_status_sections(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        rendered = adapter.format_tool_progress_content(
+            [
+                '⏳ feishu_fetch_doc: "spec.md"',
+                '✅ feishu_doc_update: "summary updated"',
+                '❌ feishu_drive_reply_comment: "missing anchor"',
+            ]
+        )
+
+        self.assertIn("**Running**", rendered)
+        self.assertIn("**Completed**", rendered)
+        self.assertIn("**Needs Attention**", rendered)
+        self.assertIn('- ✅ feishu_doc_update: "summary updated"', rendered)
+        self.assertIn('- ❌ feishu_drive_reply_comment: "missing anchor"', rendered)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_gateway_progress_renderer_uses_adapter_formatter(self):
