@@ -31,6 +31,7 @@ class TestTerminalRequirements:
         monkeypatch.setenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", "1")
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setenv("TERMINAL_MODAL_MODE", "managed")
         monkeypatch.delenv("MODAL_TOKEN_ID", raising=False)
         monkeypatch.delenv("MODAL_TOKEN_SECRET", raising=False)
         monkeypatch.setattr(
