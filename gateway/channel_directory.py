@@ -17,6 +17,7 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 
 DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
+RECENT_SEND_TARGETS_PATH = get_hermes_home() / "recent_send_targets.json"
 
 # 会话发现只适用于消息平台。这里显式维护平台清单，避免基础设施型平台
 # 被隐式带入目录，也让新增平台的行为更清晰可审查。
@@ -133,6 +134,7 @@ def _rank_resolution_candidate(
     match_type: str,
     preferred_account_id: Optional[str],
     preferred_target_ranks: Dict[str, int],
+    recent_successful_target_ranks: Dict[str, int],
     recent_target_ranks: Dict[str, int],
 ) -> tuple:
     """Return a stable sort key for ambiguity suggestions.
@@ -145,6 +147,10 @@ def _rank_resolution_candidate(
     match_rank = 0 if normalized_match_type == "exact" else 1
     channel_id = str(channel.get("id", "")).strip()
     target_rank = preferred_target_ranks.get(channel_id, len(preferred_target_ranks) + 1)
+    recent_success_rank = recent_successful_target_ranks.get(
+        channel_id,
+        len(recent_successful_target_ranks) + 1,
+    )
     recent_rank = recent_target_ranks.get(channel_id, len(recent_target_ranks) + 1)
     normalized_account_id = str(channel.get("account_id", "") or "default").strip() or "default"
     preferred_account = str(preferred_account_id or "").strip() or ""
@@ -169,7 +175,56 @@ def _rank_resolution_candidate(
         "unknown": 4,
     }.get(source, 5)
     label = _channel_target_name(platform_name, channel).lower()
-    return (match_rank, target_rank, recent_rank, account_rank, type_rank, source_rank, label, channel_id)
+    return (
+        match_rank,
+        target_rank,
+        recent_success_rank,
+        recent_rank,
+        account_rank,
+        type_rank,
+        source_rank,
+        label,
+        channel_id,
+    )
+
+
+def _load_recent_successful_target_ids(platform_name: str, *, limit: int = 10) -> List[str]:
+    """Return recently successful send targets for one platform."""
+    if not RECENT_SEND_TARGETS_PATH.exists():
+        return []
+
+    ranked_entries: List[tuple[datetime, str]] = []
+    try:
+        with open(RECENT_SEND_TARGETS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        platform_entries = data.get("platforms", {}).get(platform_name, [])
+        if not isinstance(platform_entries, list):
+            return []
+        for item in platform_entries:
+            if not isinstance(item, dict):
+                continue
+            entry_id = str(item.get("id", "") or "").strip()
+            updated_at_raw = str(item.get("updated_at", "") or "").strip()
+            if not entry_id or not updated_at_raw:
+                continue
+            try:
+                ranked_entries.append((datetime.fromisoformat(updated_at_raw), entry_id))
+            except ValueError:
+                continue
+    except Exception as exc:
+        logger.debug("Channel directory: failed to load recent send targets for %s: %s", platform_name, exc)
+        return []
+
+    seen_ids: set[str] = set()
+    recent_ids: List[str] = []
+    for _, entry_id in sorted(ranked_entries, reverse=True):
+        if entry_id in seen_ids:
+            continue
+        seen_ids.add(entry_id)
+        recent_ids.append(entry_id)
+        if len(recent_ids) >= limit:
+            break
+    return recent_ids
 
 
 def _load_recent_session_target_ids(platform_name: str, *, limit: int = 10) -> List[str]:
@@ -219,6 +274,7 @@ def _build_resolution_suggestions(
     *,
     preferred_account_id: Optional[str],
     preferred_target_ranks: Dict[str, int],
+    recent_successful_target_ranks: Dict[str, int],
     recent_target_ranks: Dict[str, int],
     limit: int = 5,
 ) -> List[Dict[str, Any]]:
@@ -242,6 +298,7 @@ def _build_resolution_suggestions(
                         match_type=match_type,
                         preferred_account_id=preferred_account_id,
                         preferred_target_ranks=preferred_target_ranks,
+                        recent_successful_target_ranks=recent_successful_target_ranks,
                         recent_target_ranks=recent_target_ranks,
                     ),
                     item,
@@ -256,6 +313,8 @@ def _build_resolution_suggestions(
         reason_parts = [f"{match_type} name match"]
         if item_id and item_id in preferred_target_ranks:
             reason_parts.append("preferred target")
+        elif item_id and item_id in recent_successful_target_ranks:
+            reason_parts.append("recent successful send")
         elif item_id and item_id in recent_target_ranks:
             reason_parts.append("recent session")
         if preferred_account_id and account_id == (str(preferred_account_id).strip() or "default"):
@@ -401,6 +460,11 @@ def explain_channel_name_resolution(
         target_id: index
         for index, target_id in enumerate(normalized_preferred_targets)
     }
+    recent_successful_target_ids = _load_recent_successful_target_ids(platform_name) if platform_name == "feishu" else []
+    recent_successful_target_ranks = {
+        target_id: index
+        for index, target_id in enumerate(recent_successful_target_ids)
+    }
     recent_target_ids = _load_recent_session_target_ids(platform_name) if platform_name == "feishu" else []
     recent_target_ranks = {
         target_id: index
@@ -412,6 +476,7 @@ def explain_channel_name_resolution(
         prefix_matches if not exact_matches else [],
         preferred_account_id=preferred_account_id,
         preferred_target_ranks=preferred_target_ranks,
+        recent_successful_target_ranks=recent_successful_target_ranks,
         recent_target_ranks=recent_target_ranks,
     )
     status = "resolved" if resolved_id else ("ambiguous" if len(candidate_entries) > 1 else "not_found")

@@ -11,8 +11,11 @@ import os
 import re
 import ssl
 import time
+from datetime import datetime, timezone
 
 from agent.redact import redact_sensitive_text
+from hermes_cli.config import get_hermes_home
+from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +38,8 @@ _GENERIC_SECRET_ASSIGN_RE = re.compile(
     r"\b(access_token|api[_-]?key|auth[_-]?token|signature|sig)\s*=\s*([^\s,;]+)",
     re.IGNORECASE,
 )
+_RECENT_SEND_TARGETS_PATH = get_hermes_home() / "recent_send_targets.json"
+_RECENT_SEND_TARGET_LIMIT = 20
 
 
 def _sanitize_error_text(text) -> str:
@@ -245,6 +250,13 @@ def _handle_send(args):
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
+        if isinstance(result, dict) and result.get("success"):
+            _record_recent_successful_send(
+                platform_name,
+                chat_id,
+                thread_id=thread_id,
+                account_id=account_id,
+            )
 
         # Mirror the sent message into the target's gateway session
         if isinstance(result, dict) and result.get("success") and mirror_text:
@@ -293,12 +305,130 @@ def _get_preferred_resolution_target_ids(platform_name: str, *, config, platform
 
     from gateway.config import Platform as GatewayPlatform
 
+    preferred_target_ids: list[str] = []
     home_channel = config.get_home_channel(GatewayPlatform.FEISHU)
     if home_channel and getattr(home_channel, "chat_id", None):
         target_id = str(home_channel.chat_id or "").strip()
         if target_id:
-            return [target_id]
-    return []
+            preferred_target_ids.append(target_id)
+
+    for target_id in _load_recent_successful_target_ids(platform_name):
+        if target_id not in preferred_target_ids:
+            preferred_target_ids.append(target_id)
+    return preferred_target_ids
+
+
+def _normalize_recent_send_target_id(
+    platform_name: str,
+    chat_id: str,
+    *,
+    thread_id: str | None = None,
+    account_id: str | None = None,
+) -> str:
+    """Build a stable directory target ID for recently successful sends."""
+    normalized_chat_id = str(chat_id or "").strip()
+    normalized_account_id = str(account_id or "").strip()
+    normalized_thread_id = str(thread_id or "").strip()
+
+    if platform_name == "feishu" and "::" in normalized_chat_id and not normalized_account_id:
+        normalized_chat_id, normalized_account_id = _split_feishu_account_target(normalized_chat_id)
+        normalized_account_id = normalized_account_id or ""
+
+    if platform_name == "feishu" and normalized_account_id and normalized_account_id != "default":
+        normalized_chat_id = f"{normalized_account_id}::{normalized_chat_id}"
+    if normalized_thread_id:
+        return f"{normalized_chat_id}:{normalized_thread_id}"
+    return normalized_chat_id
+
+
+def _load_recent_successful_target_ids(platform_name: str, *, limit: int = 10) -> list[str]:
+    """Return the most recent successfully delivered targets for one platform."""
+    if not _RECENT_SEND_TARGETS_PATH.exists():
+        return []
+
+    try:
+        with open(_RECENT_SEND_TARGETS_PATH, encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:
+        logger.debug("send_message: failed to load recent target history: %s", exc)
+        return []
+
+    platform_entries = payload.get("platforms", {}).get(platform_name, [])
+    if not isinstance(platform_entries, list):
+        return []
+
+    ranked_entries: list[tuple[datetime, str]] = []
+    for item in platform_entries:
+        if not isinstance(item, dict):
+            continue
+        target_id = str(item.get("id", "") or "").strip()
+        updated_at_raw = str(item.get("updated_at", "") or "").strip()
+        if not target_id or not updated_at_raw:
+            continue
+        try:
+            ranked_entries.append((datetime.fromisoformat(updated_at_raw), target_id))
+        except ValueError:
+            continue
+
+    seen_ids: set[str] = set()
+    recent_ids: list[str] = []
+    for _, target_id in sorted(ranked_entries, reverse=True):
+        if target_id in seen_ids:
+            continue
+        seen_ids.add(target_id)
+        recent_ids.append(target_id)
+        if len(recent_ids) >= limit:
+            break
+    return recent_ids
+
+
+def _record_recent_successful_send(
+    platform_name: str,
+    chat_id: str,
+    *,
+    thread_id: str | None = None,
+    account_id: str | None = None,
+) -> None:
+    """Persist a stable recency signal for later channel-name resolution."""
+    target_id = _normalize_recent_send_target_id(
+        platform_name,
+        chat_id,
+        thread_id=thread_id,
+        account_id=account_id,
+    )
+    if not target_id:
+        return
+
+    try:
+        payload: dict[str, object] = {"platforms": {}}
+        if _RECENT_SEND_TARGETS_PATH.exists():
+            with open(_RECENT_SEND_TARGETS_PATH, encoding="utf-8") as f:
+                existing_payload = json.load(f)
+            if isinstance(existing_payload, dict):
+                payload = existing_payload
+
+        platforms = payload.setdefault("platforms", {})
+        if not isinstance(platforms, dict):
+            platforms = {}
+            payload["platforms"] = platforms
+
+        current_entries = platforms.get(platform_name, [])
+        normalized_entries = [
+            item
+            for item in current_entries
+            if isinstance(item, dict) and str(item.get("id", "") or "").strip() != target_id
+        ]
+        normalized_entries.append(
+            {
+                "id": target_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        normalized_entries.sort(key=lambda item: str(item.get("updated_at", "") or ""), reverse=True)
+        platforms[platform_name] = normalized_entries[:_RECENT_SEND_TARGET_LIMIT]
+        atomic_json_write(_RECENT_SEND_TARGETS_PATH, payload)
+    except Exception as exc:
+        logger.debug("send_message: failed to persist recent target history: %s", exc)
 
 
 def _format_resolution_suggestions_for_error(suggestions: list[dict]) -> str:

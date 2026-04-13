@@ -274,6 +274,26 @@ class TestResolveChannelName:
         assert [item["id"] for item in result["suggestions"]] == ["oc_recent", "oc_other"]
         assert result["suggestions"][0]["reason"] == "exact name match, recent session, live directory, group target"
 
+    def test_feishu_recent_successful_send_ranks_ahead_of_recent_session(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "oc_sent", "name": "Backend", "type": "group", "account_id": "default", "source": "live"},
+                {"id": "oc_recent", "name": "Backend", "type": "group", "account_id": "default", "source": "live"},
+            ]
+        }
+        with self._setup(tmp_path, platforms), patch(
+            "gateway.channel_directory._load_recent_successful_target_ids",
+            return_value=["oc_sent"],
+        ), patch(
+            "gateway.channel_directory._load_recent_session_target_ids",
+            return_value=["oc_recent"],
+        ):
+            result = explain_channel_name_resolution("feishu", "Backend")
+
+        assert result["status"] == "ambiguous"
+        assert [item["id"] for item in result["suggestions"]] == ["oc_sent", "oc_recent"]
+        assert result["suggestions"][0]["reason"] == "exact name match, recent successful send, live directory, group target"
+
     def test_no_channels_returns_none(self, tmp_path):
         with self._setup(tmp_path, {}):
             assert resolve_channel_name("telegram", "someone") is None
