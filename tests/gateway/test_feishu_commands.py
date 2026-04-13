@@ -447,6 +447,7 @@ async def test_feishu_auth_batch_requests_missing_scopes(monkeypatch):
     monkeypatch.setattr(
         "tools.feishu.client.get_app_granted_scopes_by_token_type",
         lambda token_type, account_id=None: [
+            "offline_access",
             "task:task:read",
             "calendar:calendar.event:read",
             "im:message.send_as_user",
@@ -463,6 +464,65 @@ async def test_feishu_auth_batch_requests_missing_scopes(monkeypatch):
     assert kwargs["metadata"]["tool_name"] == "feishu_oauth_batch_auth"
     assert kwargs["metadata"]["action"] == "batch"
     assert kwargs["metadata"]["account_id"] == "feishu-cn"
+
+
+@pytest.mark.asyncio
+async def test_feishu_auth_batch_reports_missing_self_manage(monkeypatch):
+    adapter = SimpleNamespace(_normalize_scope_list=lambda scopes: list(dict.fromkeys(scopes)))
+    runner = _make_runner()
+    runner.adapters[Platform.FEISHU] = adapter
+    monkeypatch.setattr(
+        "tools.feishu.client.get_app_info",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("scope check failed")),
+    )
+
+    result = await runner._handle_feishu_auth_command(_make_event("/feishu-auth batch"))
+
+    assert "application:application:self_manage" in result
+    assert "batch authorization unavailable" in result
+
+
+@pytest.mark.asyncio
+async def test_feishu_auth_batch_reports_missing_offline_access(monkeypatch):
+    adapter = SimpleNamespace(_normalize_scope_list=lambda scopes: list(dict.fromkeys(scopes)))
+    runner = _make_runner()
+    runner.adapters[Platform.FEISHU] = adapter
+    monkeypatch.setattr(
+        "tools.feishu.client.get_app_info",
+        lambda **kwargs: {"effective_owner_open_id": "ou_user_1"},
+    )
+    monkeypatch.setattr(
+        "tools.feishu.client.get_app_granted_scopes_by_token_type",
+        lambda token_type, account_id=None: ["im:chat:read"] if token_type is None else ["im:chat:read"],
+    )
+
+    result = await runner._handle_feishu_auth_command(_make_event("/feishu-auth batch"))
+
+    assert "offline_access" in result
+    assert "batch authorization unavailable" in result
+
+
+@pytest.mark.asyncio
+async def test_feishu_auth_batch_reports_missing_user_scopes(monkeypatch):
+    adapter = SimpleNamespace(_normalize_scope_list=lambda scopes: list(dict.fromkeys(scopes)))
+    runner = _make_runner()
+    runner.adapters[Platform.FEISHU] = adapter
+    monkeypatch.setattr(
+        "tools.feishu.client.get_app_info",
+        lambda **kwargs: {"effective_owner_open_id": "ou_user_1"},
+    )
+
+    def _scopes(token_type, account_id=None):
+        if token_type is None:
+            return ["offline_access"]
+        return []
+
+    monkeypatch.setattr("tools.feishu.client.get_app_granted_scopes_by_token_type", _scopes)
+
+    result = await runner._handle_feishu_auth_command(_make_event("/feishu-auth batch"))
+
+    assert "no granted user scopes yet" in result
+    assert "Grant the required Feishu user scopes first" in result
 
 
 @pytest.mark.asyncio

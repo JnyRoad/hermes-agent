@@ -113,5 +113,6 @@ def test_maybe_notify_feishu_onboarding_sends_owner_message():
     assert kwargs["account_id"] == "feishu-cn"
     assert kwargs["json_body"]["receive_id"] == "ou_notice"
     assert "/feishu auth batch" in kwargs["json_body"]["content"]
+    assert "/feishu onboarding" in kwargs["json_body"]["content"]
     assert "3 granted user scopes" in kwargs["json_body"]["content"]
     assert "(2 safe, 1 sensitive)" in kwargs["json_body"]["content"]

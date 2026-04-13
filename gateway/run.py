@@ -4438,7 +4438,14 @@ class GatewayRunner:
 
         if subcommand == "batch":
             account_id = getattr(event.source, "account_id", None)
-            app_info = get_app_info(account_id=account_id)
+            try:
+                app_info = get_app_info(account_id=account_id)
+            except Exception:
+                return (
+                    "❌ **Feishu batch authorization unavailable**\n"
+                    "- Hermes could not inspect app ownership or granted scopes.\n"
+                    "- Ask a Feishu app admin to grant `application:application:self_manage`, then retry `/feishu auth batch`."
+                )
             owner_open_id = str(app_info.get("effective_owner_open_id", "") or "").strip()
             if not owner_open_id:
                 return (
@@ -4451,12 +4458,22 @@ class GatewayRunner:
                     "- Ask the Feishu app owner to run `/feishu auth batch` in chat."
                 )
 
+            all_scopes = get_app_granted_scopes_by_token_type(None, account_id=account_id)
+            all_scopes = adapter._normalize_scope_list(all_scopes)
+            if all_scopes and "offline_access" not in all_scopes:
+                return (
+                    "❌ **Feishu batch authorization unavailable**\n"
+                    "- The Feishu app is missing `offline_access`, which is required for OAuth-based user authorization.\n"
+                    "- Ask a Feishu app admin to grant `offline_access`, then retry `/feishu auth batch`."
+                )
+
             app_scopes = get_app_granted_scopes_by_token_type("user", account_id=account_id)
             app_scopes = adapter._normalize_scope_list(app_scopes)
             if not app_scopes:
                 return (
                     "ℹ️ **Feishu batch authorization skipped**\n"
-                    "- This app has no granted user scopes yet."
+                    "- This app has no granted user scopes yet.\n"
+                    "- Grant the required Feishu user scopes first, then retry `/feishu auth batch`."
                 )
 
             if account_id:

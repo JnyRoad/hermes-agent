@@ -60,7 +60,9 @@ def _maybe_notify_feishu_onboarding(user_open_id: str, account_id: str | None = 
     content = (
         "You are the Feishu app owner.\n\n"
         "To finish Hermes onboarding, run this command in the current Feishu chat:\n"
-        "/feishu auth batch\n\n"
+        "/feishu auth batch\n"
+        "You can also use the alias:\n"
+        "/feishu onboarding\n\n"
         f"Hermes detected {len(all_scopes)} granted user scopes for this app "
         f"({len(safe_scopes)} safe, {len(sensitive_scopes)} sensitive). "
         "The batch command will request the missing scopes in one owner-only flow."
