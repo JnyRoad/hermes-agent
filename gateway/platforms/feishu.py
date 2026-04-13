@@ -5966,16 +5966,29 @@ class FeishuAdapter(BasePlatformAdapter):
         cleaned_lines = [str(line).strip() for line in progress_lines if str(line).strip()]
         if not cleaned_lines:
             return ""
+        total_steps = len(cleaned_lines)
         grouped_lines: Dict[str, List[str]] = {
             "running": [],
             "completed": [],
             "failed": [],
         }
-        for line in cleaned_lines[-12:]:
+        visible_lines = cleaned_lines[-12:]
+        for line in visible_lines:
             status, normalized_line = _classify_tool_progress_line(line)
             grouped_lines.setdefault(status, []).append(normalized_line)
 
         rendered_lines = ["**Tool Activity**", ""]
+        rendered_lines.append(
+            (
+                f"_Summary: {total_steps} steps, "
+                f"{len(grouped_lines['running'])} running, "
+                f"{len(grouped_lines['completed'])} completed, "
+                f"{len(grouped_lines['failed'])} need attention._"
+            )
+        )
+        if total_steps > len(visible_lines):
+            rendered_lines.append(f"_Showing the most recent {len(visible_lines)} steps._")
+        rendered_lines.append("")
         if grouped_lines["running"]:
             rendered_lines.append("**Running**")
             rendered_lines.extend(f"- {line}" for line in grouped_lines["running"])

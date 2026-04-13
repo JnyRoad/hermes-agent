@@ -4073,6 +4073,7 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
         self.assertIn("**Tool Activity**", rendered)
+        self.assertIn("_Summary: 2 steps, 2 running, 0 completed, 0 need attention._", rendered)
         self.assertIn("**Running**", rendered)
         self.assertIn('- 📄 feishu_fetch_doc: "spec.md"', rendered)
         self.assertIn('_Running tools for this request..._', rendered)
@@ -4095,8 +4096,25 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertIn("**Running**", rendered)
         self.assertIn("**Completed**", rendered)
         self.assertIn("**Needs Attention**", rendered)
+        self.assertIn("_Summary: 3 steps, 1 running, 1 completed, 1 need attention._", rendered)
         self.assertIn('- ✅ feishu_doc_update: "summary updated"', rendered)
         self.assertIn('- ❌ feishu_drive_reply_comment: "missing anchor"', rendered)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_feishu_tool_progress_summary_mentions_recent_window(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        rendered = adapter.format_tool_progress_content(
+            [f'⏳ tool_{index}: "step"' for index in range(15)]
+        )
+
+        self.assertIn("_Summary: 15 steps, 12 running, 0 completed, 0 need attention._", rendered)
+        self.assertIn("_Showing the most recent 12 steps._", rendered)
+        self.assertNotIn('- ⏳ tool_0: "step"', rendered)
+        self.assertIn('- ⏳ tool_14: "step"', rendered)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_gateway_progress_renderer_uses_adapter_formatter(self):
