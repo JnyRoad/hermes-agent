@@ -273,15 +273,22 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
             if item["webhook_path"]:
                 detail += f" path={item['webhook_path']}"
             _record("info", f"Account `{item['account_id']}`", detail)
-        if total_accounts > 1 and connection_mode == "websocket":
-            _record(
-                "warn",
-                "Multi-account websocket support incomplete",
-                "secondary accounts are configured, but websocket mode still uses only the primary account",
-            )
-            issues.append("Use webhook mode for multi-account Feishu until websocket multi-account support is implemented")
-        elif total_accounts > 1 and connection_mode == "webhook":
-            _record("ok", "Multi-account webhook routing enabled", f"{total_accounts} accounts")
+        if total_accounts > 1:
+            secondary_modes = {
+                str(item.get("connection_mode", "") or connection_mode).strip().lower() or connection_mode
+                for item in enabled_accounts
+            }
+            if connection_mode == "websocket" and secondary_modes == {"websocket"}:
+                _record("ok", "Multi-account websocket routing enabled", f"{total_accounts} accounts")
+            elif connection_mode == "webhook" and secondary_modes == {"webhook"}:
+                _record("ok", "Multi-account webhook routing enabled", f"{total_accounts} accounts")
+            else:
+                mixed_modes = ", ".join(sorted({connection_mode, *secondary_modes}))
+                _record(
+                    "info",
+                    "Feishu multi-account mixed transport",
+                    f"configured modes: {mixed_modes}",
+                )
 
     if domain in {"feishu", "lark"}:
         _record("ok", f"Feishu domain: {domain}")

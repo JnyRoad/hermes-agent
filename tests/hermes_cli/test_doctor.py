@@ -201,8 +201,8 @@ class TestFeishuDoctorChecks:
         doctor._check_feishu_integration(issues)
 
         out = capsys.readouterr().out
-        assert "Multi-account websocket support incomplete" in out
-        assert any("webhook mode for multi-account Feishu" in item for item in issues)
+        assert "Multi-account websocket routing enabled" in out
+        assert not any("webhook mode for multi-account Feishu" in item for item in issues)
 
     def test_webhook_mode_warns_when_tokens_missing(self, monkeypatch, capsys):
         cfg = GatewayConfig(
@@ -598,6 +598,49 @@ class TestFeishuDoctorChecks:
         assert any(item["label"] == "Feishu cached directory targets: 3" for item in report["items"])
         assert any(item["label"] == "Feishu cached directory accounts" for item in report["items"])
         assert any(item["label"] == "Feishu live directory search fallback available" for item in report["items"])
+
+    def test_collect_report_marks_multi_account_websocket_as_enabled(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_primary",
+                        "app_secret": "sec_primary",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                        "accounts": {
+                            "feishu-cn": {
+                                "app_id": "cli_secondary",
+                                "app_secret": "sec_secondary",
+                                "connection_mode": "websocket",
+                            }
+                        },
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr("tools.feishu.client.get_app_granted_scopes", lambda: ["application:application:self_manage"])
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_info",
+            lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes_by_token_type",
+            lambda token_type, account_id=None: [],
+        )
+        monkeypatch.setattr(
+            "gateway.channel_directory.load_directory",
+            lambda: {"updated_at": "2026-01-01T00:00:00", "platforms": {"feishu": []}},
+        )
+
+        report = doctor.collect_feishu_doctor_report(user_open_id="ou_owner", account_id="feishu-cn")
+
+        assert any(item["label"] == "Multi-account websocket routing enabled" for item in report["items"])
+        assert not any(item["label"] == "Multi-account websocket support incomplete" for item in report["items"])
+        assert not any("Use webhook mode for multi-account Feishu" in issue for issue in report["issues"])
 
 
 def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):
