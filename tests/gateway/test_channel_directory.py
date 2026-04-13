@@ -162,6 +162,34 @@ class TestResolveChannelName:
             "feishu-cn/Backend Ops (group)",
         ]
 
+    def test_feishu_preferred_account_resolves_duplicate_name(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "oc_default", "name": "Backend", "type": "group", "account_id": "default"},
+                {"id": "feishu-cn::oc_cn", "name": "Backend", "type": "group", "account_id": "feishu-cn"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            result = explain_channel_name_resolution("feishu", "Backend", preferred_account_id="feishu-cn")
+
+        assert result["status"] == "resolved"
+        assert result["resolved_id"] == "feishu-cn::oc_cn"
+        assert result["preferred_account_id"] == "feishu-cn"
+
+    def test_feishu_preferred_account_keeps_ambiguous_without_unique_match(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "feishu-cn::oc_1", "name": "Backend", "type": "group", "account_id": "feishu-cn"},
+                {"id": "feishu-cn::oc_2", "name": "Backend", "type": "group", "account_id": "feishu-cn"},
+                {"id": "oc_default", "name": "Backend", "type": "group", "account_id": "default"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            result = explain_channel_name_resolution("feishu", "Backend", preferred_account_id="feishu-cn")
+
+        assert result["status"] == "ambiguous"
+        assert result["resolved_id"] is None
+
     def test_no_channels_returns_none(self, tmp_path):
         with self._setup(tmp_path, {}):
             assert resolve_channel_name("telegram", "someone") is None

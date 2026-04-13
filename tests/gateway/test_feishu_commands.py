@@ -202,12 +202,17 @@ async def test_feishu_directory_summary_reports_cache_and_live_search(monkeypatc
 async def test_feishu_directory_lookup_reports_resolved_target(monkeypatch):
     runner = _make_runner()
     runner.adapters[Platform.FEISHU] = SimpleNamespace(search_channel_directory_entries=lambda *args, **kwargs: [])
-    monkeypatch.setattr(
-        "gateway.channel_directory.explain_channel_name_resolution",
-        lambda platform_name, name: {
+    captured = {}
+
+    def _explain(platform_name, name, preferred_account_id=None):
+        captured["platform_name"] = platform_name
+        captured["name"] = name
+        captured["preferred_account_id"] = preferred_account_id
+        return {
             "status": "resolved",
             "resolved_id": "feishu-cn::oc_target",
             "source": "live_search",
+            "preferred_account_id": preferred_account_id,
             "suggestions": [
                 {
                     "id": "feishu-cn::oc_target",
@@ -216,14 +221,23 @@ async def test_feishu_directory_lookup_reports_resolved_target(monkeypatch):
                     "account_id": "feishu-cn",
                 }
             ],
-        },
+        }
+
+    monkeypatch.setattr(
+        "gateway.channel_directory.explain_channel_name_resolution",
+        _explain,
     )
 
-    result = await runner._handle_feishu_directory_command(_make_event("/feishu directory Backend"), "Backend")
+    result = await runner._handle_feishu_directory_command(
+        _make_event("/feishu directory Backend", account_id="feishu-cn"),
+        "Backend",
+    )
 
     assert "resolved via `live_search`" in result
+    assert "Preferred account: `feishu-cn`" in result
     assert "feishu-cn/Backend (group)" in result
     assert "Resolved ID: `feishu-cn::oc_target`" in result
+    assert captured["preferred_account_id"] == "feishu-cn"
 
 
 @pytest.mark.asyncio
@@ -232,10 +246,11 @@ async def test_feishu_directory_lookup_reports_ambiguous_candidates(monkeypatch)
     runner.adapters[Platform.FEISHU] = SimpleNamespace(search_channel_directory_entries=lambda *args, **kwargs: [])
     monkeypatch.setattr(
         "gateway.channel_directory.explain_channel_name_resolution",
-        lambda platform_name, name: {
+        lambda platform_name, name, preferred_account_id=None: {
             "status": "ambiguous",
             "resolved_id": None,
             "source": "cache",
+            "preferred_account_id": preferred_account_id,
             "suggestions": [
                 {"id": "oc_1", "label": "Backend Guild (group)", "source": "config", "account_id": "default"},
                 {"id": "feishu-cn::oc_2", "label": "feishu-cn/Backend Ops (group)", "source": "live", "account_id": "feishu-cn"},
@@ -256,10 +271,11 @@ async def test_feishu_directory_lookup_reports_not_found(monkeypatch):
     runner.adapters[Platform.FEISHU] = SimpleNamespace(search_channel_directory_entries=lambda *args, **kwargs: [])
     monkeypatch.setattr(
         "gateway.channel_directory.explain_channel_name_resolution",
-        lambda platform_name, name: {
+        lambda platform_name, name, preferred_account_id=None: {
             "status": "not_found",
             "resolved_id": None,
             "source": None,
+            "preferred_account_id": preferred_account_id,
             "suggestions": [],
         },
     )

@@ -4185,15 +4185,22 @@ class GatewayRunner:
             )
             return "\n".join(lines)
 
-        resolution = explain_channel_name_resolution("feishu", normalized_query)
+        resolution = explain_channel_name_resolution(
+            "feishu",
+            normalized_query,
+            preferred_account_id=getattr(event.source, "account_id", None),
+        )
         status = resolution.get("status", "not_found")
         source = str(resolution.get("source", "") or "none").strip() or "none"
         suggestions = resolution.get("suggestions", []) or []
+        preferred_account_id = str(resolution.get("preferred_account_id", "") or "").strip()
         lines = [f"📚 **Feishu Directory Lookup** — `{normalized_query}`", ""]
 
         if status == "resolved":
             resolved_id = str(resolution.get("resolved_id", "") or "").strip()
             lines.append(f"- Status: resolved via `{source}`")
+            if preferred_account_id:
+                lines.append(f"- Preferred account: `{preferred_account_id}`")
             if suggestions:
                 top = suggestions[0]
                 label = str(top.get("label", "") or resolved_id).strip() or resolved_id
@@ -4205,6 +4212,8 @@ class GatewayRunner:
 
         if status == "ambiguous":
             lines.append(f"- Status: ambiguous after `{source if source != 'none' else 'cache/live_search'}` lookup")
+            if preferred_account_id:
+                lines.append(f"- Preferred account: `{preferred_account_id}`")
             lines.append("- Candidates:")
             for item in suggestions:
                 label = str(item.get("label", "") or item.get("id", "")).strip() or "unknown"

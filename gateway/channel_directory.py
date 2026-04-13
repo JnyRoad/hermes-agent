@@ -107,15 +107,48 @@ def _collect_channel_resolution_candidates(
     return {"exact": exact_matches, "prefix": prefix_matches}
 
 
-def _select_resolved_channel_id(platform_name: str, channels: List[Dict[str, Any]], query: str) -> Optional[str]:
+def _select_preferred_feishu_candidate(
+    matches: List[Dict[str, Any]],
+    preferred_account_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Select one unique match from the caller's preferred Feishu account."""
+    if not preferred_account_id or not matches:
+        return None
+
+    normalized_account_id = str(preferred_account_id or "").strip() or "default"
+    preferred_matches = [
+        item
+        for item in matches
+        if str(item.get("account_id", "") or "default").strip() == normalized_account_id
+    ]
+    if len(preferred_matches) == 1:
+        return preferred_matches[0]
+    return None
+
+
+def _select_resolved_channel(
+    platform_name: str,
+    channels: List[Dict[str, Any]],
+    query: str,
+    *,
+    preferred_account_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Resolve a normalized query against a channel list using display-aware matching."""
     candidates = _collect_channel_resolution_candidates(platform_name, channels, query)
     exact_matches = candidates["exact"]
     if len(exact_matches) == 1:
-        return exact_matches[0]["id"]
+        return exact_matches[0]
+    if platform_name == "feishu":
+        preferred_exact = _select_preferred_feishu_candidate(exact_matches, preferred_account_id)
+        if preferred_exact is not None:
+            return preferred_exact
     prefix_matches = candidates["prefix"]
     if not exact_matches and len(prefix_matches) == 1:
-        return prefix_matches[0]["id"]
+        return prefix_matches[0]
+    if platform_name == "feishu" and not exact_matches:
+        preferred_prefix = _select_preferred_feishu_candidate(prefix_matches, preferred_account_id)
+        if preferred_prefix is not None:
+            return preferred_prefix
     return None
 
 
@@ -142,16 +175,28 @@ def _resolve_feishu_live_channel_name(query: str) -> Optional[str]:
     except Exception:
         logger.debug("Channel directory: failed live Feishu search for %s", query, exc_info=True)
         return None
-    return _select_resolved_channel_id("feishu", live_entries, query)
+    resolved = _select_resolved_channel("feishu", live_entries, query)
+    return str(resolved.get("id", "")).strip() if resolved else None
 
 
-def explain_channel_name_resolution(platform_name: str, name: str) -> Dict[str, Any]:
+def explain_channel_name_resolution(
+    platform_name: str,
+    name: str,
+    *,
+    preferred_account_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """Explain how a channel target would resolve, including ambiguity details."""
     query = _normalize_channel_query(name)
     directory = load_directory()
     cached_channels = directory.get("platforms", {}).get(platform_name, [])
     cached_candidates = _collect_channel_resolution_candidates(platform_name, cached_channels, query)
-    resolved_id = _select_resolved_channel_id(platform_name, cached_channels, query)
+    resolved_entry = _select_resolved_channel(
+        platform_name,
+        cached_channels,
+        query,
+        preferred_account_id=preferred_account_id,
+    )
+    resolved_id = str(resolved_entry.get("id", "")).strip() if resolved_entry else None
     source = "cache" if resolved_id else None
     live_candidates: Dict[str, List[Dict[str, Any]]] | None = None
     live_channels: List[Dict[str, Any]] = []
@@ -167,7 +212,13 @@ def explain_channel_name_resolution(platform_name: str, name: str) -> Dict[str, 
                 adapter = FeishuAdapter(platform_config)
                 live_channels = adapter.search_channel_directory_entries(query, limit_per_account=10)
                 live_candidates = _collect_channel_resolution_candidates(platform_name, live_channels, query)
-                resolved_id = _select_resolved_channel_id(platform_name, live_channels, query)
+                resolved_entry = _select_resolved_channel(
+                    platform_name,
+                    live_channels,
+                    query,
+                    preferred_account_id=preferred_account_id,
+                )
+                resolved_id = str(resolved_entry.get("id", "")).strip() if resolved_entry else None
                 if resolved_id:
                     source = "live_search"
         except Exception:
@@ -198,6 +249,7 @@ def explain_channel_name_resolution(platform_name: str, name: str) -> Dict[str, 
         "resolved_id": resolved_id,
         "source": source,
         "suggestions": suggestions,
+        "preferred_account_id": preferred_account_id,
     }
 
 
@@ -387,7 +439,12 @@ def load_directory() -> Dict[str, Any]:
         return {"updated_at": None, "platforms": {}}
 
 
-def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
+def resolve_channel_name(
+    platform_name: str,
+    name: str,
+    *,
+    preferred_account_id: Optional[str] = None,
+) -> Optional[str]:
     """
     Resolve a human-friendly channel name to a numeric ID.
 
@@ -396,7 +453,11 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
     - Telegram: display name or group name
     - Slack: "engineering", "#engineering"
     """
-    return explain_channel_name_resolution(platform_name, name).get("resolved_id")
+    return explain_channel_name_resolution(
+        platform_name,
+        name,
+        preferred_account_id=preferred_account_id,
+    ).get("resolved_id")
 
 
 def format_directory_for_display() -> str:
