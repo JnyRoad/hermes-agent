@@ -1987,8 +1987,6 @@ class FeishuAdapter(BasePlatformAdapter):
         tool_action = str(metadata.get("action", "") or "").strip().lower() or "default"
         replay_id = str(metadata.get("replay_id", "") or "").strip()
         replay_ids = _merge_replay_ids(metadata.get("replay_ids"), replay_id)
-        replay_ids = _merge_replay_ids(metadata.get("replay_ids"), replay_id)
-        replay_ids = _merge_replay_ids(metadata.get("replay_ids"), replay_id)
 
         for state in self._pending_oauth_requests.values():
             if state.chat_id != chat_id:
@@ -3192,7 +3190,7 @@ class FeishuAdapter(BasePlatformAdapter):
         *,
         state: FeishuPendingOAuthRequest,
         requester_open_id: str,
-    ) -> bool:
+    ) -> Dict[str, Any]:
         """授权完成后直接重放原始工具调用，并把结果回发到当前会话。
 
         这里走工具注册表的同步 dispatch，避免重新进入完整 agent 循环。
@@ -3201,10 +3199,10 @@ class FeishuAdapter(BasePlatformAdapter):
         """
         replay_ids = _merge_replay_ids(getattr(state, "replay_ids", []), getattr(state, "replay_id", ""))
         if not replay_ids:
-            return False
+            return {"replayed": False, "had_failure": False, "results": []}
         pending_replays = getattr(self, "_pending_tool_replays", None)
         if not isinstance(pending_replays, dict):
-            return False
+            return {"replayed": False, "had_failure": False, "results": []}
 
         from tools.registry import registry
 
@@ -3259,7 +3257,7 @@ class FeishuAdapter(BasePlatformAdapter):
             replayed_any = True
 
         if not replay_results:
-            return False
+            return {"replayed": False, "had_failure": had_failure, "results": []}
 
         body_header = "Feishu authorized tool replay completed."
         if had_failure:
@@ -3277,7 +3275,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 "account_id": state.account_id or None,
             },
         )
-        return bool(send_result.success and replayed_any)
+        return {
+            "replayed": bool(send_result.success and replayed_any),
+            "had_failure": had_failure,
+            "results": replay_results,
+        }
 
     def _is_card_action_duplicate(self, token: str) -> bool:
         """Return True if this card action token was already processed within the dedup window."""
@@ -3391,6 +3393,32 @@ class FeishuAdapter(BasePlatformAdapter):
                     source="interactive_confirm",
                     account_id=resolved_account_id,
                 )
+                replay_status = await self._execute_pending_tool_replay(
+                    state=state,
+                    requester_open_id=authorized_open_id,
+                )
+                replay_results = replay_status.get("results") if isinstance(replay_status, dict) else []
+                replayed = bool(replay_status.get("replayed")) if isinstance(replay_status, dict) else False
+                replay_had_failure = bool(replay_status.get("had_failure")) if isinstance(replay_status, dict) else False
+                replay_count = len(replay_results) if isinstance(replay_results, list) else 0
+                success_count = sum(
+                    1
+                    for item in replay_results
+                    if isinstance(item, dict) and str(item.get("status", "")).strip().lower() == "ok"
+                )
+                failed_count = sum(
+                    1
+                    for item in replay_results
+                    if isinstance(item, dict) and str(item.get("status", "")).strip().lower() != "ok"
+                )
+                card_template = "green"
+                card_status_line = f"**Replay status:** {success_count}/{replay_count or success_count} actions completed"
+                if replay_had_failure:
+                    card_template = "orange"
+                    card_status_line = f"**Replay status:** {success_count} succeeded, {failed_count} need attention"
+                elif replay_count == 0:
+                    card_template = "blue"
+                    card_status_line = "**Replay status:** no pending actions were waiting for replay"
                 await self._update_interactive_card(
                     message_id=state.message_id,
                     title=state.title,
@@ -3398,14 +3426,11 @@ class FeishuAdapter(BasePlatformAdapter):
                         f"{state.reason}\n\n"
                         f"**Confirmed by:** {user_name}\n"
                         f"**Authorized user:** {authorized_open_id}\n"
-                        f"**Scopes:** {', '.join(state.scopes)}"
+                        f"**Scopes:** {', '.join(state.scopes)}\n"
+                        f"{card_status_line}"
                     ),
-                    template="green",
+                    template=card_template,
                     account_id=resolved_account_id,
-                )
-                replayed = await self._execute_pending_tool_replay(
-                    state=state,
-                    requester_open_id=authorized_open_id,
                 )
                 if replayed:
                     logger.info(
