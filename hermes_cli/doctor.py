@@ -262,6 +262,50 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
     else:
         _record("warn", f"Unknown Feishu domain: {domain}", "expected feishu or lark")
 
+    try:
+        from gateway.channel_directory import load_directory
+
+        raw_directory_settings = feishu_config.extra.get("directory") if isinstance(feishu_config.extra.get("directory"), dict) else {}
+        include_live_users = raw_directory_settings.get("include_live_users")
+        include_live_groups = raw_directory_settings.get("include_live_groups")
+        live_limit = raw_directory_settings.get("live_limit", 50)
+        live_page_size = raw_directory_settings.get("live_page_size", 50)
+        _record(
+            "info",
+            "Feishu live directory settings",
+            (
+                f"users={include_live_users if include_live_users is not None else 'default'} "
+                f"groups={include_live_groups if include_live_groups is not None else 'default'} "
+                f"limit={live_limit} page_size={live_page_size}"
+            ),
+        )
+
+        directory = load_directory()
+        feishu_entries = directory.get("platforms", {}).get("feishu", []) or []
+        if feishu_entries:
+            source_counts: dict[str, int] = {}
+            account_counts: dict[str, int] = {}
+            for item in feishu_entries:
+                if not isinstance(item, dict):
+                    continue
+                source = str(item.get("source", "") or "unknown").strip() or "unknown"
+                account_key = str(item.get("account_id", "") or "default").strip() or "default"
+                source_counts[source] = source_counts.get(source, 0) + 1
+                account_counts[account_key] = account_counts.get(account_key, 0) + 1
+            source_detail = ", ".join(f"{key}={value}" for key, value in sorted(source_counts.items()))
+            account_detail = ", ".join(f"{key}={value}" for key, value in sorted(account_counts.items()))
+            _record("ok", f"Feishu cached directory targets: {len(feishu_entries)}", source_detail)
+            _record("info", "Feishu cached directory accounts", account_detail)
+        else:
+            _record("warn", "Feishu cached directory is empty", "directory refresh has not discovered any Feishu targets yet")
+
+        if adapter is not None and hasattr(adapter, "search_channel_directory_entries"):
+            _record("ok", "Feishu live directory search fallback available")
+        else:
+            _record("info", "Feishu live directory search fallback unavailable", "chat doctor can only inspect cached directory entries")
+    except Exception as exc:
+        _record("warn", "Feishu directory diagnostics unavailable", str(exc))
+
     if connection_mode == "webhook":
         verification_token = str(feishu_config.extra.get("verification_token", "")).strip()
         encrypt_key = str(feishu_config.extra.get("encrypt_key", "")).strip()
