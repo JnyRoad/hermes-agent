@@ -591,8 +591,9 @@ class TestFeishuDoctorChecks:
                     {
                         "account_id": "feishu-cn",
                         "connection_mode": "webhook",
-                        "runtime_state": "connected",
+                        "runtime_state": "error",
                         "domain": "feishu",
+                        "last_error": "ws worker failed",
                     },
                 ],
             ),
@@ -613,7 +614,12 @@ class TestFeishuDoctorChecks:
         )
         assert any(
             item["label"] == "Feishu runtime transport status"
-            and "default=connected/webhook, feishu-cn=connected/webhook" in item["detail"]
+            and "default=connected/webhook, feishu-cn=error/webhook" in item["detail"]
+            for item in report["items"]
+        )
+        assert any(
+            item["label"] == "Feishu runtime transport errors"
+            and "feishu-cn=ws worker failed" in item["detail"]
             for item in report["items"]
         )
         assert any(item["label"] == "Feishu cached directory targets: 3" for item in report["items"])

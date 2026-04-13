@@ -303,6 +303,20 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
                     for item in transport_statuses
                 )
                 _record("info", "Feishu runtime transport status", detail)
+                transport_errors = [
+                    (
+                        f"{str(item.get('account_id', '') or 'default')}="
+                        f"{str(item.get('last_error', '') or '').strip()}"
+                    )
+                    for item in transport_statuses
+                    if str(item.get("last_error", "") or "").strip()
+                ]
+                if transport_errors:
+                    _record(
+                        "warn",
+                        "Feishu runtime transport errors",
+                        "; ".join(transport_errors),
+                    )
         except Exception as exc:
             _record("warn", "Feishu runtime transport status unavailable", str(exc))
 
