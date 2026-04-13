@@ -4452,6 +4452,121 @@ class TestAdapterBehavior(unittest.TestCase):
             self.assertEqual(call.kwargs["account_id"], "feishu-cn")
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_build_comment_event_context_returns_structured_fields(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Project Spec"}]}},
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_123",
+                            "quote": "Current paragraph",
+                            "reply_list": {
+                                "replies": [
+                                    {
+                                        "content": {
+                                            "elements": [
+                                                {"type": "text_run", "text_run": {"text": "Please refine this section"}},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            },
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses):
+            context = FeishuAdapter._build_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context.document_title, "Project Spec")
+        self.assertEqual(context.quoted_text, "Current paragraph")
+        self.assertEqual(context.root_comment_text, "Please refine this section")
+        self.assertEqual(context.active_text, "Please refine this section")
+        self.assertEqual(context.event_type, "add_comment")
+        self.assertIn("Project Spec", context.preview)
+        self.assertIn("Please refine this section", context.preview)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_build_comment_event_context_tracks_reply_fields(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Review Notes"}]}},
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_123",
+                            "quote": "Anchor line",
+                            "reply_list": {
+                                "replies": [
+                                    {
+                                        "content": {
+                                            "elements": [
+                                                {"type": "text_run", "text_run": {"text": "Please review this block"}},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            },
+            {
+                "data": {
+                    "items": [
+                        {
+                            "reply_id": "reply_prev",
+                            "user_id": {"open_id": "ou_alice"},
+                            "content": {
+                                "elements": [
+                                    {"type": "text_run", "text_run": {"text": "I think this can be shorter"}},
+                                ]
+                            },
+                        },
+                        {
+                            "reply_id": "reply_target",
+                            "user_id": {"open_id": "ou_bob"},
+                            "content": {
+                                "elements": [
+                                    {"type": "text_run", "text_run": {"text": "Please rewrite the summary"}},
+                                ]
+                            },
+                        },
+                    ]
+                }
+            },
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses):
+            context = FeishuAdapter._build_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+                reply_id="reply_target",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context.reply_id, "reply_target")
+        self.assertEqual(context.event_type, "add_reply")
+        self.assertEqual(context.root_comment_text, "Please review this block")
+        self.assertEqual(context.active_text, "Please rewrite the summary")
+        self.assertEqual(context.reply_chain_lines, ["[ou_alice]: I think this can be shorter"])
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_stream_consumer_config_respects_feishu_block_streaming_settings(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter

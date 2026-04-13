@@ -434,6 +434,43 @@ class FeishuDirectoryEntry:
     account_id: str = "default"
 
 
+@dataclass(frozen=True)
+class FeishuCommentEventContext:
+    """Resolved context for one Feishu document comment-thread event."""
+
+    file_token: str
+    file_type: str
+    comment_id: str
+    reply_id: str = ""
+    document_title: str = ""
+    quoted_text: str = ""
+    root_comment_text: str = ""
+    active_text: str = ""
+    event_type: str = "add_comment"
+    reply_chain_lines: List[str] = field(default_factory=list)
+    is_mentioned: bool = False
+    is_whole_comment: bool = False
+    prompt: str = ""
+    preview: str = ""
+
+    def to_payload(self) -> Dict[str, str]:
+        return {
+            "file_token": self.file_token,
+            "file_type": self.file_type,
+            "comment_id": self.comment_id,
+            "reply_id": self.reply_id,
+            "document_title": self.document_title,
+            "quoted_text": self.quoted_text,
+            "root_comment_text": self.root_comment_text,
+            "active_text": self.active_text,
+            "event_type": self.event_type,
+            "preview": self.preview,
+            "is_mentioned": "true" if self.is_mentioned else "false",
+            "is_whole_comment": "true" if self.is_whole_comment else "false",
+            "prompt": self.prompt,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Markdown rendering helpers
 # ---------------------------------------------------------------------------
@@ -3362,15 +3399,15 @@ class FeishuAdapter(BasePlatformAdapter):
         return P2CardActionTriggerResponse()
 
     @staticmethod
-    def _resolve_comment_event_context(
+    def _build_comment_event_context(
         file_token: str,
         file_type: str,
         comment_id: str,
         reply_id: Optional[str] = None,
         account_id: Optional[str] = None,
         is_mentioned: bool = False,
-    ) -> Optional[Dict[str, str]]:
-        """读取评论线程上下文，构造更贴近文档评论场景的提示词。"""
+    ) -> Optional[FeishuCommentEventContext]:
+        """Resolve structured context for one document comment-thread event."""
         from tools.feishu.client import feishu_api_request
 
         document_title = ""
@@ -3427,21 +3464,30 @@ class FeishuAdapter(BasePlatformAdapter):
                 break
         if not isinstance(target_comment, dict):
             document_label = f'"{document_title}"' if document_title else f"{file_type} document {file_token}"
-            return {
-                "file_token": file_token,
-                "file_type": file_type,
-                "comment_id": comment_id,
-                "document_title": document_title,
-                "prompt": (
-                    f"The user added a comment in {document_label}.\n"
-                    "This is a Feishu document comment-thread event, not a Feishu IM conversation.\n"
-                    f"file_token: {file_token}\n"
-                    f"file_type: {file_type}\n"
-                    f"comment_id: {comment_id}\n"
-                    "Reply in the current comment thread.\n"
-                    "If you already reply through a dedicated tool, end your final response with NO_REPLY."
-                ),
-            }
+            fallback_prompt = (
+                f"The user added a comment in {document_label}.\n"
+                "This is a Feishu document comment-thread event, not a Feishu IM conversation.\n"
+                f"file_token: {file_token}\n"
+                f"file_type: {file_type}\n"
+                f"comment_id: {comment_id}\n"
+                "Reply in the current comment thread.\n"
+                "If you already reply through a dedicated tool, end your final response with NO_REPLY."
+            )
+            return FeishuCommentEventContext(
+                file_token=file_token,
+                file_type=file_type,
+                comment_id=comment_id,
+                document_title=document_title,
+                quoted_text="",
+                root_comment_text="",
+                active_text="",
+                event_type="add_comment",
+                reply_chain_lines=[],
+                is_mentioned=is_mentioned,
+                is_whole_comment=True,
+                prompt=fallback_prompt,
+                preview=f"comment in {document_label}",
+            )
 
         root_replies = (((target_comment.get("reply_list") or {}).get("replies")) or [])
         root_comment_text = (
@@ -3498,6 +3544,7 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         active_text = reply_text or root_comment_text
         action_label = "reply" if reply_id else "comment"
+        event_type = "add_reply" if reply_id else "add_comment"
         document_label = f'"{document_title}"' if document_title else f"{file_type} document {file_token}"
         first_line = (
             f"The user added a {action_label} in {document_label}: {active_text}"
@@ -3518,7 +3565,7 @@ class FeishuAdapter(BasePlatformAdapter):
             prompt_lines.extend(reply_chain_lines)
         prompt_lines.extend(
             [
-                f"Event type: {'add_reply' if reply_id else 'add_comment'}",
+                f"Event type: {event_type}",
                 f"file_token: {file_token}",
                 f"file_type: {file_type}",
                 f"comment_id: {comment_id}",
@@ -3538,15 +3585,45 @@ class FeishuAdapter(BasePlatformAdapter):
                 "If you already reply through a dedicated tool, end your final response with NO_REPLY.",
             ]
         )
-        return {
-            "file_token": file_token,
-            "file_type": file_type,
-            "comment_id": comment_id,
-            "document_title": document_title,
-            "is_mentioned": "true" if is_mentioned else "false",
-            "is_whole_comment": "true" if is_whole_comment else "false",
-            "prompt": "\n".join(prompt_lines),
-        }
+        preview_document_label = document_title or f"{file_type}:{file_token}"
+        preview_subject = active_text or quoted_text or root_comment_text or "comment event"
+        preview = f"{event_type} in {preview_document_label}: {preview_subject[:120]}"
+        return FeishuCommentEventContext(
+            file_token=file_token,
+            file_type=file_type,
+            comment_id=comment_id,
+            reply_id=reply_id or "",
+            document_title=document_title,
+            quoted_text=quoted_text,
+            root_comment_text=root_comment_text,
+            active_text=active_text,
+            event_type=event_type,
+            reply_chain_lines=reply_chain_lines,
+            is_mentioned=is_mentioned,
+            is_whole_comment=is_whole_comment,
+            prompt="\n".join(prompt_lines),
+            preview=preview,
+        )
+
+    @staticmethod
+    def _resolve_comment_event_context(
+        file_token: str,
+        file_type: str,
+        comment_id: str,
+        reply_id: Optional[str] = None,
+        account_id: Optional[str] = None,
+        is_mentioned: bool = False,
+    ) -> Optional[Dict[str, str]]:
+        """Backward-compatible wrapper for legacy tests and callers."""
+        context = FeishuAdapter._build_comment_event_context(
+            file_token=file_token,
+            file_type=file_type,
+            comment_id=comment_id,
+            reply_id=reply_id,
+            account_id=account_id,
+            is_mentioned=is_mentioned,
+        )
+        return context.to_payload() if context is not None else None
 
     async def _handle_reaction_event(self, event_type: str, data: Any) -> None:
         """Fetch the reacted-to message; if it was sent by this bot, emit a synthetic text event."""
@@ -3649,7 +3726,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         account_id = self._extract_event_account_id(data)
         context = await asyncio.to_thread(
-            self._resolve_comment_event_context,
+            self._build_comment_event_context,
             file_token,
             file_type,
             comment_id,
@@ -3667,20 +3744,20 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         source = self.build_source(
             chat_id=_build_feishu_comment_target(
-                file_type=context["file_type"],
-                file_token=context["file_token"],
-                comment_id=context["comment_id"],
+                file_type=context.file_type,
+                file_token=context.file_token,
+                comment_id=context.comment_id,
             ),
-            chat_name=context.get("document_title") or f"Feishu Comment {context['file_token']}",
+            chat_name=context.document_title or f"Feishu Comment {context.file_token}",
             chat_type="dm",
             user_id=sender_profile["user_id"] or sender_open_id,
             user_name=sender_profile["user_name"],
-            thread_id=context["comment_id"],
+            thread_id=context.comment_id,
             user_id_alt=sender_profile["user_id_alt"],
             account_id=account_id,
         )
         synthetic_event = MessageEvent(
-            text=context["prompt"],
+            text=context.prompt,
             message_type=MessageType.TEXT,
             source=source,
             raw_message=data,
@@ -3689,8 +3766,8 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         logger.info(
             "[Feishu] Routing document comment %s on %s as synthetic event",
-            context["comment_id"],
-            context["file_token"],
+            context.comment_id,
+            context.file_token,
         )
         await self._handle_message_with_guards(synthetic_event)
 
