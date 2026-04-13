@@ -445,6 +445,13 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
 
         granted_user_scopes = list(get_app_granted_scopes_by_token_type("user", account_id=resolved_account_id))
         _record("info", f"Feishu user scopes granted: {len(granted_user_scopes)}")
+        if granted_scopes and "offline_access" not in set(granted_scopes):
+            _record(
+                "warn",
+                "Feishu OAuth prerequisite missing",
+                "offline_access is not granted, so user authorization flows cannot complete",
+            )
+            issues.append("Grant offline_access so `/feishu auth batch` and automatic OAuth flows can complete")
     except Exception as exc:
         if isinstance(exc, Exception) and exc.__class__.__name__ == "FeishuAPIError" and getattr(exc, "code", None) == 99991672:
             _record("warn", "Unable to query Feishu app scopes", "application:application:self_manage is missing")
