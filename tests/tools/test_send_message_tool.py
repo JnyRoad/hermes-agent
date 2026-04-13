@@ -369,10 +369,11 @@ class TestSendMessageTool:
         cache_file.write_text(json.dumps({"updated_at": "2026-01-01T00:00:00", "platforms": {"feishu": []}}))
         captured = {}
 
-        def _explain(platform_name, name, preferred_account_id=None):
+        def _explain(platform_name, name, preferred_account_id=None, preferred_target_ids=None):
             captured["platform_name"] = platform_name
             captured["name"] = name
             captured["preferred_account_id"] = preferred_account_id
+            captured["preferred_target_ids"] = preferred_target_ids
             return {
                 "status": "resolved",
                 "resolved_id": "feishu-cn::oc_backend",
@@ -400,6 +401,7 @@ class TestSendMessageTool:
 
         assert result["success"] is True
         assert captured["preferred_account_id"] == "feishu-cn"
+        assert captured["preferred_target_ids"] == ["feishu-cn::oc_home"]
         send_mock.assert_awaited_once_with(
             Platform.FEISHU,
             feishu_cfg,
@@ -420,8 +422,9 @@ class TestSendMessageTool:
         cache_file.write_text(json.dumps({"updated_at": "2026-01-01T00:00:00", "platforms": {"feishu": []}}))
         captured = {}
 
-        def _explain(platform_name, name, preferred_account_id=None):
+        def _explain(platform_name, name, preferred_account_id=None, preferred_target_ids=None):
             captured["preferred_account_id"] = preferred_account_id
+            captured["preferred_target_ids"] = preferred_target_ids
             return {
                 "status": "resolved",
                 "resolved_id": "oc_backend",
@@ -449,6 +452,7 @@ class TestSendMessageTool:
 
         assert result["success"] is True
         assert captured["preferred_account_id"] == "default"
+        assert captured["preferred_target_ids"] == []
         send_mock.assert_awaited_once_with(
             Platform.FEISHU,
             feishu_cfg,

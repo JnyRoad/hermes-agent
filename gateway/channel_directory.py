@@ -132,6 +132,8 @@ def _rank_resolution_candidate(
     *,
     match_type: str,
     preferred_account_id: Optional[str],
+    preferred_target_ranks: Dict[str, int],
+    recent_target_ranks: Dict[str, int],
 ) -> tuple:
     """Return a stable sort key for ambiguity suggestions.
 
@@ -141,6 +143,9 @@ def _rank_resolution_candidate(
     """
     normalized_match_type = "exact" if match_type == "exact" else "prefix"
     match_rank = 0 if normalized_match_type == "exact" else 1
+    channel_id = str(channel.get("id", "")).strip()
+    target_rank = preferred_target_ranks.get(channel_id, len(preferred_target_ranks) + 1)
+    recent_rank = recent_target_ranks.get(channel_id, len(recent_target_ranks) + 1)
     normalized_account_id = str(channel.get("account_id", "") or "default").strip() or "default"
     preferred_account = str(preferred_account_id or "").strip() or ""
     account_rank = 0 if preferred_account and normalized_account_id == preferred_account else 1
@@ -164,7 +169,47 @@ def _rank_resolution_candidate(
         "unknown": 4,
     }.get(source, 5)
     label = _channel_target_name(platform_name, channel).lower()
-    return (match_rank, account_rank, type_rank, source_rank, label, str(channel.get("id", "")).strip())
+    return (match_rank, target_rank, recent_rank, account_rank, type_rank, source_rank, label, channel_id)
+
+
+def _load_recent_session_target_ids(platform_name: str, *, limit: int = 10) -> List[str]:
+    """Return recently active session target IDs for one platform."""
+    sessions_path = get_hermes_home() / "sessions" / "sessions.json"
+    if not sessions_path.exists():
+        return []
+
+    ranked_entries: List[tuple[datetime, str]] = []
+    try:
+        with open(sessions_path, encoding="utf-8") as f:
+            data = json.load(f)
+        for session in data.values():
+            if not isinstance(session, dict):
+                continue
+            origin = session.get("origin") or {}
+            if origin.get("platform") != platform_name:
+                continue
+            entry_id = _session_entry_id(origin)
+            updated_at_raw = str(session.get("updated_at", "") or "").strip()
+            if not entry_id or not updated_at_raw:
+                continue
+            try:
+                ranked_entries.append((datetime.fromisoformat(updated_at_raw), entry_id))
+            except ValueError:
+                continue
+    except Exception as exc:
+        logger.debug("Channel directory: failed to load recent session targets for %s: %s", platform_name, exc)
+        return []
+
+    seen_ids: set[str] = set()
+    recent_ids: List[str] = []
+    for _, entry_id in sorted(ranked_entries, reverse=True):
+        if entry_id in seen_ids:
+            continue
+        seen_ids.add(entry_id)
+        recent_ids.append(entry_id)
+        if len(recent_ids) >= limit:
+            break
+    return recent_ids
 
 
 def _build_resolution_suggestions(
@@ -173,6 +218,8 @@ def _build_resolution_suggestions(
     prefix_matches: List[Dict[str, Any]],
     *,
     preferred_account_id: Optional[str],
+    preferred_target_ranks: Dict[str, int],
+    recent_target_ranks: Dict[str, int],
     limit: int = 5,
 ) -> List[Dict[str, Any]]:
     """Build ranked ambiguity suggestions with ranking explanations."""
@@ -194,6 +241,8 @@ def _build_resolution_suggestions(
                         item,
                         match_type=match_type,
                         preferred_account_id=preferred_account_id,
+                        preferred_target_ranks=preferred_target_ranks,
+                        recent_target_ranks=recent_target_ranks,
                     ),
                     item,
                     match_type,
@@ -203,7 +252,12 @@ def _build_resolution_suggestions(
     suggestions: List[Dict[str, Any]] = []
     for _, item, match_type in sorted(ranked_candidates)[:limit]:
         account_id = str(item.get("account_id", "") or "default").strip() or "default"
+        item_id = str(item.get("id", "")).strip()
         reason_parts = [f"{match_type} name match"]
+        if item_id and item_id in preferred_target_ranks:
+            reason_parts.append("preferred target")
+        elif item_id and item_id in recent_target_ranks:
+            reason_parts.append("recent session")
         if preferred_account_id and account_id == (str(preferred_account_id).strip() or "default"):
             reason_parts.append("preferred account")
         source = str(item.get("source", "") or "unknown").strip() or "unknown"
@@ -288,6 +342,7 @@ def explain_channel_name_resolution(
     name: str,
     *,
     preferred_account_id: Optional[str] = None,
+    preferred_target_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Explain how a channel target would resolve, including ambiguity details."""
     query = _normalize_channel_query(name)
@@ -337,11 +392,27 @@ def explain_channel_name_resolution(
         candidate_entries = prefix_matches
     else:
         candidate_entries = []
+    normalized_preferred_targets = [
+        str(item or "").strip()
+        for item in (preferred_target_ids or [])
+        if str(item or "").strip()
+    ]
+    preferred_target_ranks = {
+        target_id: index
+        for index, target_id in enumerate(normalized_preferred_targets)
+    }
+    recent_target_ids = _load_recent_session_target_ids(platform_name) if platform_name == "feishu" else []
+    recent_target_ranks = {
+        target_id: index
+        for index, target_id in enumerate(recent_target_ids)
+    }
     suggestions = _build_resolution_suggestions(
         platform_name,
         exact_matches,
         prefix_matches if not exact_matches else [],
         preferred_account_id=preferred_account_id,
+        preferred_target_ranks=preferred_target_ranks,
+        recent_target_ranks=recent_target_ranks,
     )
     status = "resolved" if resolved_id else ("ambiguous" if len(candidate_entries) > 1 else "not_found")
     return {
@@ -350,6 +421,7 @@ def explain_channel_name_resolution(
         "source": source,
         "suggestions": suggestions,
         "preferred_account_id": preferred_account_id,
+        "preferred_target_ids": normalized_preferred_targets,
     }
 
 
@@ -544,6 +616,7 @@ def resolve_channel_name(
     name: str,
     *,
     preferred_account_id: Optional[str] = None,
+    preferred_target_ids: Optional[List[str]] = None,
 ) -> Optional[str]:
     """
     Resolve a human-friendly channel name to a numeric ID.
@@ -557,6 +630,7 @@ def resolve_channel_name(
         platform_name,
         name,
         preferred_account_id=preferred_account_id,
+        preferred_target_ids=preferred_target_ids,
     ).get("resolved_id")
 
 

@@ -204,10 +204,11 @@ async def test_feishu_directory_lookup_reports_resolved_target(monkeypatch):
     runner.adapters[Platform.FEISHU] = SimpleNamespace(search_channel_directory_entries=lambda *args, **kwargs: [])
     captured = {}
 
-    def _explain(platform_name, name, preferred_account_id=None):
+    def _explain(platform_name, name, preferred_account_id=None, preferred_target_ids=None):
         captured["platform_name"] = platform_name
         captured["name"] = name
         captured["preferred_account_id"] = preferred_account_id
+        captured["preferred_target_ids"] = preferred_target_ids
         return {
             "status": "resolved",
             "resolved_id": "feishu-cn::oc_target",
@@ -223,10 +224,7 @@ async def test_feishu_directory_lookup_reports_resolved_target(monkeypatch):
             ],
         }
 
-    monkeypatch.setattr(
-        "gateway.channel_directory.explain_channel_name_resolution",
-        _explain,
-    )
+    monkeypatch.setattr("gateway.channel_directory.explain_channel_name_resolution", _explain)
 
     result = await runner._handle_feishu_directory_command(
         _make_event("/feishu directory Backend", account_id="feishu-cn"),
@@ -238,6 +236,7 @@ async def test_feishu_directory_lookup_reports_resolved_target(monkeypatch):
     assert "feishu-cn/Backend (group)" in result
     assert "Resolved ID: `feishu-cn::oc_target`" in result
     assert captured["preferred_account_id"] == "feishu-cn"
+    assert captured["preferred_target_ids"] == ["feishu-cn::oc_chat_1"]
 
 
 @pytest.mark.asyncio
@@ -246,11 +245,12 @@ async def test_feishu_directory_lookup_reports_ambiguous_candidates(monkeypatch)
     runner.adapters[Platform.FEISHU] = SimpleNamespace(search_channel_directory_entries=lambda *args, **kwargs: [])
     monkeypatch.setattr(
         "gateway.channel_directory.explain_channel_name_resolution",
-        lambda platform_name, name, preferred_account_id=None: {
+        lambda platform_name, name, preferred_account_id=None, preferred_target_ids=None: {
             "status": "ambiguous",
             "resolved_id": None,
             "source": "cache",
             "preferred_account_id": preferred_account_id,
+            "preferred_target_ids": preferred_target_ids,
             "suggestions": [
                 {
                     "id": "oc_1",
@@ -284,11 +284,12 @@ async def test_feishu_directory_lookup_reports_not_found(monkeypatch):
     runner.adapters[Platform.FEISHU] = SimpleNamespace(search_channel_directory_entries=lambda *args, **kwargs: [])
     monkeypatch.setattr(
         "gateway.channel_directory.explain_channel_name_resolution",
-        lambda platform_name, name, preferred_account_id=None: {
+        lambda platform_name, name, preferred_account_id=None, preferred_target_ids=None: {
             "status": "not_found",
             "resolved_id": None,
             "source": None,
             "preferred_account_id": preferred_account_id,
+            "preferred_target_ids": preferred_target_ids,
             "suggestions": [],
         },
     )

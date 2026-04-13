@@ -239,6 +239,41 @@ class TestResolveChannelName:
         assert result["suggestions"][0]["reason"] == "exact name match, config-backed, group target"
         assert result["suggestions"][1]["reason"] == "exact name match, config-backed, dm target"
 
+    def test_feishu_preferred_target_ranks_first_in_ambiguity(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "oc_home", "name": "Backend", "type": "group", "account_id": "default", "source": "config"},
+                {"id": "oc_other", "name": "Backend", "type": "group", "account_id": "default", "source": "config"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            result = explain_channel_name_resolution(
+                "feishu",
+                "Backend",
+                preferred_target_ids=["oc_other"],
+            )
+
+        assert result["status"] == "ambiguous"
+        assert [item["id"] for item in result["suggestions"]] == ["oc_other", "oc_home"]
+        assert result["suggestions"][0]["reason"] == "exact name match, preferred target, config-backed, group target"
+
+    def test_feishu_recent_session_ranks_ahead_of_non_recent_target(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "oc_recent", "name": "Backend", "type": "group", "account_id": "default", "source": "live"},
+                {"id": "oc_other", "name": "Backend", "type": "group", "account_id": "default", "source": "live"},
+            ]
+        }
+        with self._setup(tmp_path, platforms), patch(
+            "gateway.channel_directory._load_recent_session_target_ids",
+            return_value=["oc_recent", "oc_other"],
+        ):
+            result = explain_channel_name_resolution("feishu", "Backend")
+
+        assert result["status"] == "ambiguous"
+        assert [item["id"] for item in result["suggestions"]] == ["oc_recent", "oc_other"]
+        assert result["suggestions"][0]["reason"] == "exact name match, recent session, live directory, group target"
+
     def test_no_channels_returns_none(self, tmp_path):
         with self._setup(tmp_path, {}):
             assert resolve_channel_name("telegram", "someone") is None

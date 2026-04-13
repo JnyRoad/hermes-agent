@@ -4189,6 +4189,14 @@ class GatewayRunner:
             "feishu",
             normalized_query,
             preferred_account_id=getattr(event.source, "account_id", None),
+            preferred_target_ids=[
+                (
+                    f"{getattr(event.source, 'account_id', None)}::{event.source.chat_id}"
+                    if getattr(event.source, "account_id", None)
+                    and getattr(event.source, "account_id", None) != "default"
+                    else str(event.source.chat_id or "")
+                )
+            ],
         )
         status = resolution.get("status", "not_found")
         source = str(resolution.get("source", "") or "none").strip() or "none"

@@ -171,6 +171,11 @@ def _handle_send(args):
                 platform_name,
                 target_ref,
                 preferred_account_id=preferred_account_id,
+                preferred_target_ids=_get_preferred_resolution_target_ids(
+                    platform_name,
+                    config=config,
+                    platform_config=pconfig,
+                ),
             )
             resolved = resolution.get("resolved_id")
             if resolved:
@@ -279,6 +284,21 @@ def _get_preferred_resolution_account_id(platform_name: str, *, config, platform
         if preferred_account_id:
             return preferred_account_id
     return "default"
+
+
+def _get_preferred_resolution_target_ids(platform_name: str, *, config, platform_config) -> list[str]:
+    """Return explicit target IDs that should rank first during resolution."""
+    if platform_name != "feishu" or config is None or platform_config is None:
+        return []
+
+    from gateway.config import Platform as GatewayPlatform
+
+    home_channel = config.get_home_channel(GatewayPlatform.FEISHU)
+    if home_channel and getattr(home_channel, "chat_id", None):
+        target_id = str(home_channel.chat_id or "").strip()
+        if target_id:
+            return [target_id]
+    return []
 
 
 def _format_resolution_suggestions_for_error(suggestions: list[dict]) -> str:
