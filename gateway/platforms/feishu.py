@@ -2842,6 +2842,22 @@ class FeishuAdapter(BasePlatformAdapter):
             extra = dict((((getattr(self.config, "extra", {}) or {}).get("accounts") or {}).get(account_id)) or {})
         return extra
 
+    def _get_account_live_directory_settings(self, account_id: str) -> Dict[str, Any]:
+        """Return normalized live directory settings for one account.
+
+        The gateway keeps config-based directory entries as the stable fallback.
+        Live discovery is optional per account so operators can disable user or
+        group scans when a tenant is very large or when a scope is unavailable.
+        """
+        cfg = self._get_account_directory_config(account_id)
+        raw_settings = cfg.get("directory") if isinstance(cfg.get("directory"), dict) else {}
+        return {
+            "include_live_users": _coerce_optional_bool(raw_settings.get("include_live_users")),
+            "include_live_groups": _coerce_optional_bool(raw_settings.get("include_live_groups")),
+            "live_limit": _coerce_required_int(raw_settings.get("live_limit"), default=50, min_value=1),
+            "live_page_size": _coerce_required_int(raw_settings.get("live_page_size"), default=50, min_value=1),
+        }
+
     def _list_config_directory_entries_for_account(self, account_id: str) -> List[FeishuDirectoryEntry]:
         """Enumerate users and groups from static Feishu config for one account."""
         cfg = self._get_account_directory_config(account_id)
@@ -2902,56 +2918,86 @@ class FeishuAdapter(BasePlatformAdapter):
         entries: List[FeishuDirectoryEntry] = []
         if limit <= 0:
             return entries
+        settings = self._get_account_live_directory_settings(account_id)
+        include_live_users = settings["include_live_users"] is not False
+        include_live_groups = settings["include_live_groups"] is not False
+        effective_limit = min(limit, int(settings["live_limit"]))
+        page_size = min(int(settings["live_page_size"]), effective_limit, 100)
+        if page_size <= 0:
+            return entries
 
-        try:
-            user_payload = feishu_api_request(
-                "GET",
-                "/open-apis/contact/v3/users",
-                params={"page_size": min(limit, 50), "user_id_type": "open_id"},
-                account_id=account_id,
-            )
-            for item in ((user_payload.get("data") or {}).get("items") or []):
-                if not isinstance(item, dict):
-                    continue
-                open_id = str(item.get("open_id", "") or "").strip()
-                if not open_id:
-                    continue
-                entries.append(
-                    FeishuDirectoryEntry(
-                        id=open_id,
-                        name=str(item.get("name", "") or open_id).strip() or open_id,
-                        type="dm",
-                        source="live",
-                        account_id=account_id,
-                    )
+        def _collect_paginated_items(path: str, *, params: Dict[str, Any], page_limit: int) -> List[Dict[str, Any]]:
+            """Fetch paginated Feishu directory resources up to the requested limit."""
+            items: List[Dict[str, Any]] = []
+            page_token = ""
+            while len(items) < page_limit:
+                request_params = dict(params)
+                remaining = page_limit - len(items)
+                request_params["page_size"] = min(int(request_params.get("page_size") or page_size), remaining, 100)
+                if page_token:
+                    request_params["page_token"] = page_token
+                payload = feishu_api_request(
+                    "GET",
+                    path,
+                    params=request_params,
+                    account_id=account_id,
                 )
-        except Exception:
-            logger.debug("[Feishu] Failed to list live user directory for account %s", account_id, exc_info=True)
+                data = payload.get("data") or {}
+                raw_items = data.get("items") or []
+                for item in raw_items:
+                    if isinstance(item, dict):
+                        items.append(item)
+                    if len(items) >= page_limit:
+                        break
+                has_more = bool(data.get("has_more"))
+                page_token = str(data.get("page_token", "") or "").strip()
+                if not has_more or not page_token:
+                    break
+            return items[:page_limit]
 
-        try:
-            chat_payload = feishu_api_request(
-                "GET",
-                "/open-apis/im/v1/chats",
-                params={"page_size": min(limit, 100)},
-                account_id=account_id,
-            )
-            for item in ((chat_payload.get("data") or {}).get("items") or []):
-                if not isinstance(item, dict):
-                    continue
-                chat_id = str(item.get("chat_id", "") or "").strip()
-                if not chat_id:
-                    continue
-                entries.append(
-                    FeishuDirectoryEntry(
-                        id=chat_id,
-                        name=str(item.get("name", "") or chat_id).strip() or chat_id,
-                        type="group",
-                        source="live",
-                        account_id=account_id,
+        if include_live_users:
+            try:
+                for item in _collect_paginated_items(
+                    "/open-apis/contact/v3/users",
+                    params={"user_id_type": "open_id", "page_size": page_size},
+                    page_limit=effective_limit,
+                ):
+                    open_id = str(item.get("open_id", "") or "").strip()
+                    if not open_id:
+                        continue
+                    entries.append(
+                        FeishuDirectoryEntry(
+                            id=open_id,
+                            name=str(item.get("name", "") or open_id).strip() or open_id,
+                            type="dm",
+                            source="live",
+                            account_id=account_id,
+                        )
                     )
-                )
-        except Exception:
-            logger.debug("[Feishu] Failed to list live group directory for account %s", account_id, exc_info=True)
+            except Exception:
+                logger.debug("[Feishu] Failed to list live user directory for account %s", account_id, exc_info=True)
+
+        if include_live_groups:
+            try:
+                for item in _collect_paginated_items(
+                    "/open-apis/im/v1/chats",
+                    params={"page_size": page_size},
+                    page_limit=effective_limit,
+                ):
+                    chat_id = str(item.get("chat_id", "") or "").strip()
+                    if not chat_id:
+                        continue
+                    entries.append(
+                        FeishuDirectoryEntry(
+                            id=chat_id,
+                            name=str(item.get("name", "") or chat_id).strip() or chat_id,
+                            type="group",
+                            source="live",
+                            account_id=account_id,
+                        )
+                    )
+            except Exception:
+                logger.debug("[Feishu] Failed to list live group directory for account %s", account_id, exc_info=True)
 
         return entries
 
@@ -2970,7 +3016,9 @@ class FeishuAdapter(BasePlatformAdapter):
         for account_id in account_ids:
             entries.extend(self._list_config_directory_entries_for_account(account_id))
             if include_live:
-                entries.extend(self._list_live_directory_entries_for_account(account_id, limit=limit_per_account))
+                live_settings = self._get_account_live_directory_settings(account_id)
+                effective_limit = min(limit_per_account, int(live_settings["live_limit"]))
+                entries.extend(self._list_live_directory_entries_for_account(account_id, limit=effective_limit))
         return self._normalize_directory_entries(entries)
 
     def format_message(self, content: str) -> str:

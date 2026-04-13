@@ -218,6 +218,113 @@ class TestFeishuMessageNormalization(unittest.TestCase):
         self.assertEqual(normalized.metadata["chat_id"], "oc_chat_shared")
         self.assertEqual(normalized.metadata["chat_name"], "Backend Guild")
 
+
+class TestFeishuDirectoryDiscovery(unittest.TestCase):
+    def test_live_directory_paginates_users_and_groups(self):
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"app_id": "cli_xxx", "app_secret": "secret_xxx", "directory": {"live_page_size": 1}},
+            )
+        )
+
+        calls = []
+
+        def _fake_request(method, path, params=None, account_id=None, **_kwargs):
+            calls.append((path, dict(params or {}), account_id))
+            page_token = str((params or {}).get("page_token", "") or "")
+            if path == "/open-apis/contact/v3/users":
+                if not page_token:
+                    return {
+                        "data": {
+                            "items": [{"open_id": "ou_1", "name": "Alice"}],
+                            "has_more": True,
+                            "page_token": "user_next",
+                        }
+                    }
+                return {
+                    "data": {
+                        "items": [{"open_id": "ou_2", "name": "Bob"}],
+                        "has_more": False,
+                        "page_token": "",
+                    }
+                }
+            if path == "/open-apis/im/v1/chats":
+                if not page_token:
+                    return {
+                        "data": {
+                            "items": [{"chat_id": "oc_1", "name": "Backend"}],
+                            "has_more": True,
+                            "page_token": "chat_next",
+                        }
+                    }
+                return {
+                    "data": {
+                        "items": [{"chat_id": "oc_2", "name": "Ops"}],
+                        "has_more": False,
+                        "page_token": "",
+                    }
+                }
+            raise AssertionError(f"unexpected path {path}")
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=_fake_request):
+            entries = adapter.build_channel_directory_entries(include_live=True, limit_per_account=2)
+
+        self.assertEqual(
+            entries,
+            [
+                {"id": "ou_1", "name": "Alice", "type": "dm", "source": "live", "account_id": "default"},
+                {"id": "ou_2", "name": "Bob", "type": "dm", "source": "live", "account_id": "default"},
+                {"id": "oc_1", "name": "Backend", "type": "group", "source": "live", "account_id": "default"},
+                {"id": "oc_2", "name": "Ops", "type": "group", "source": "live", "account_id": "default"},
+            ],
+        )
+        self.assertEqual(
+            [item[1].get("page_size") for item in calls],
+            [1, 1, 1, 1],
+        )
+
+    def test_live_directory_respects_account_settings(self):
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_id": "cli_xxx",
+                    "app_secret": "secret_xxx",
+                    "directory": {"include_live_users": False, "live_limit": 1},
+                },
+            )
+        )
+
+        calls = []
+
+        def _fake_request(method, path, params=None, account_id=None, **_kwargs):
+            calls.append(path)
+            if path == "/open-apis/im/v1/chats":
+                return {
+                    "data": {
+                        "items": [{"chat_id": "oc_1", "name": "Backend"}],
+                        "has_more": False,
+                        "page_token": "",
+                    }
+                }
+            raise AssertionError(f"unexpected path {path}")
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=_fake_request):
+            entries = adapter.build_channel_directory_entries(include_live=True, limit_per_account=50)
+
+        self.assertEqual(
+            entries,
+            [{"id": "oc_1", "name": "Backend", "type": "group", "source": "live", "account_id": "default"}],
+        )
+        self.assertEqual(calls, ["/open-apis/im/v1/chats"])
+
     def test_normalize_interactive_card_preserves_title_body_and_actions(self):
         from gateway.platforms.feishu import normalize_feishu_message
 
