@@ -3900,6 +3900,67 @@ def test_feishu_adapter_merges_pending_app_scope_request_replay_ids(monkeypatch)
     adapter._update_interactive_card.assert_awaited_once()
 
 
+def test_feishu_adapter_does_not_merge_expired_oauth_request(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingOAuthRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._client = object()
+    adapter._pending_oauth_requests["fo_existing"] = FeishuPendingOAuthRequest(
+        request_id="fo_existing",
+        chat_id="oc_chat_1",
+        message_id="msg_auth_old",
+        scopes=["contact:user.base:readonly"],
+        reason="Need basic profile.",
+        title="Auth",
+        thread_id="omt_1",
+        requester_open_id="ou_user_1",
+        account_id="feishu-cn",
+        replay_id="fr_existing",
+        replay_ids=["fr_existing"],
+        expires_at=90.0,
+    )
+    adapter._pending_tool_replays = {
+        "fr_existing": {"tool_name": "feishu_get_user", "args": {}},
+    }
+    adapter._update_interactive_card = AsyncMock()
+    adapter._feishu_send_with_retry = AsyncMock(
+        return_value=SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="msg_auth_new"))
+    )
+    monkeypatch.setattr("gateway.platforms.feishu.time.time", lambda: 100.0)
+
+    import asyncio
+
+    result = asyncio.run(
+        adapter.send_oauth_request_card(
+            chat_id="oc_chat_1",
+            scopes=["calendar:calendar.readonly"],
+            reason="Need calendar too.",
+            title="Auth",
+            metadata={
+                "thread_id": "omt_1",
+                "account_id": "feishu-cn",
+                "requester_open_id": "ou_user_1",
+                "replay_id": "fr_later",
+            },
+        )
+    )
+
+    assert result.success is True
+    assert result.raw_response["request_id"] != "fo_existing"
+    assert result.raw_response.get("merged") is None
+    assert "fo_existing" not in adapter._pending_oauth_requests
+    assert "fr_existing" not in adapter._pending_tool_replays
+    assert adapter._update_interactive_card.await_count == 0
+    created_state = adapter._pending_oauth_requests[result.raw_response["request_id"]]
+    assert created_state.message_id == "msg_auth_new"
+    assert created_state.replay_ids == ["fr_later"]
+    assert created_state.expires_at == 100.0 + (30 * 60)
+
+
 def test_feishu_adapter_rejects_app_scope_completion_before_scopes_exist(monkeypatch):
     from gateway.platforms.feishu import FeishuAdapter, FeishuPendingAppScopeRequest
 
@@ -4441,6 +4502,52 @@ def test_feishu_adapter_notifies_when_oauth_request_is_stale(monkeypatch):
     assert "no longer active" in adapter.send.await_args.args[1]
 
 
+def test_feishu_adapter_expires_oauth_request_card_and_clears_replays(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingOAuthRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._pending_oauth_requests["fo_1"] = FeishuPendingOAuthRequest(
+        request_id="fo_1",
+        chat_id="oc_chat_1",
+        message_id="msg_auth_1",
+        scopes=["contact:user.base:readonly"],
+        reason="Need basic profile.",
+        title="Auth",
+        requester_open_id="ou_requester",
+        account_id="feishu-cn",
+        replay_id="fr_1",
+        replay_ids=["fr_1", "fr_2"],
+        expires_at=90.0,
+    )
+    adapter._pending_tool_replays = {
+        "fr_1": {"tool_name": "feishu_drive_file", "args": {}},
+        "fr_2": {"tool_name": "feishu_calendar_event", "args": {}},
+    }
+    adapter._update_interactive_card = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg_notice"))
+    monkeypatch.setattr("gateway.platforms.feishu.time.time", lambda: 100.0)
+
+    event = SimpleNamespace(
+        token="tok_auth_expired",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_requester"),
+        action=SimpleNamespace(tag="button", value={"hermes_action": "complete_oauth", "request_id": "fo_1"}),
+    )
+
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+    assert "fo_1" not in adapter._pending_oauth_requests
+    assert adapter._pending_tool_replays == {}
+    assert adapter._update_interactive_card.await_args.kwargs["template"] == "grey"
+    assert "Expired after" in adapter._update_interactive_card.await_args.kwargs["body_markdown"]
+    adapter.send.assert_awaited_once()
+    assert "expired" in adapter.send.await_args.args[1]
+
+
 def test_feishu_adapter_rejects_app_scope_completion_from_non_owner_notifies(monkeypatch):
     from gateway.platforms.feishu import FeishuAdapter, FeishuPendingAppScopeRequest
 
@@ -4478,6 +4585,52 @@ def test_feishu_adapter_rejects_app_scope_completion_from_non_owner_notifies(mon
     adapter.send.assert_awaited_once()
     assert "Only the Feishu app owner" in adapter.send.await_args.args[1]
     adapter._update_interactive_card.assert_not_awaited()
+
+
+def test_feishu_adapter_expires_app_scope_request_card_and_clears_replays(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingAppScopeRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._pending_app_scope_requests["fas_1"] = FeishuPendingAppScopeRequest(
+        request_id="fas_1",
+        chat_id="oc_chat_1",
+        message_id="msg_app_scope_1",
+        scopes=["calendar:calendar.event:delete"],
+        reason="Need app scopes.",
+        title="App Auth",
+        owner_open_id="ou_owner",
+        requester_open_id="ou_requester",
+        account_id="feishu-cn",
+        replay_id="fr_1",
+        replay_ids=["fr_1"],
+        expires_at=90.0,
+    )
+    adapter._pending_tool_replays = {
+        "fr_1": {"tool_name": "feishu_calendar_event", "args": {}},
+    }
+    adapter._update_interactive_card = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg_notice"))
+    monkeypatch.setattr("gateway.platforms.feishu.time.time", lambda: 100.0)
+
+    event = SimpleNamespace(
+        token="tok_app_scope_expired",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_owner"),
+        action=SimpleNamespace(tag="button", value={"hermes_action": "complete_app_scope_request", "request_id": "fas_1"}),
+    )
+
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+    assert "fas_1" not in adapter._pending_app_scope_requests
+    assert adapter._pending_tool_replays == {}
+    assert adapter._update_interactive_card.await_args.kwargs["template"] == "grey"
+    assert "Expired after" in adapter._update_interactive_card.await_args.kwargs["body_markdown"]
+    adapter.send.assert_awaited_once()
+    assert "expired" in adapter.send.await_args.args[1]
 
 
 def test_feishu_adapter_authorization_status_is_scoped_by_account():

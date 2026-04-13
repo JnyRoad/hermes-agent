@@ -167,6 +167,7 @@ _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30          # max seconds to read request
 _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses before WARNING log
 _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
 _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup window (15 min)
+_FEISHU_AUTH_REQUEST_TTL_SECONDS = 30 * 60         # authorization/app-scope card lifetime (30 min)
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 _FEISHU_ACK_EMOJI = "OK"
@@ -364,6 +365,7 @@ class FeishuPendingOAuthRequest:
     tool_action: str = "default"
     replay_id: str = ""
     replay_ids: List[str] = field(default_factory=list)
+    expires_at: float = 0.0
 
 
 @dataclass
@@ -384,6 +386,7 @@ class FeishuPendingAppScopeRequest:
     tool_action: str = "default"
     replay_id: str = ""
     replay_ids: List[str] = field(default_factory=list)
+    expires_at: float = 0.0
 
 
 @dataclass
@@ -410,6 +413,11 @@ def _merge_replay_ids(*values: Any) -> List[str]:
             seen.add(replay_id)
             result.append(replay_id)
     return result
+
+
+def _new_auth_request_expire_at() -> float:
+    """Return the absolute expiry time for a new pending authorization request."""
+    return time.time() + _FEISHU_AUTH_REQUEST_TTL_SECONDS
 
 
 @dataclass(frozen=True)
@@ -1988,7 +1996,11 @@ class FeishuAdapter(BasePlatformAdapter):
         replay_id = str(metadata.get("replay_id", "") or "").strip()
         replay_ids = _merge_replay_ids(metadata.get("replay_ids"), replay_id)
 
-        for state in self._pending_oauth_requests.values():
+        for state in list(self._pending_oauth_requests.values()):
+            if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                self._discard_pending_tool_replays(list(_merge_replay_ids(state.replay_ids, state.replay_id)))
+                self._pending_oauth_requests.pop(state.request_id, None)
+                continue
             if state.chat_id != chat_id:
                 continue
             if (state.thread_id or "") != thread_id:
@@ -2035,6 +2047,7 @@ class FeishuAdapter(BasePlatformAdapter):
             merged_replay_ids = _merge_replay_ids(state.replay_ids, state.replay_id, replay_ids)
             state.replay_ids = merged_replay_ids
             state.replay_id = merged_replay_ids[0] if merged_replay_ids else ""
+            state.expires_at = _new_auth_request_expire_at()
             return SendResult(
                 success=True,
                 message_id=state.message_id,
@@ -2098,6 +2111,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     tool_action=tool_action,
                     replay_id=replay_ids[0] if replay_ids else replay_id,
                     replay_ids=list(replay_ids),
+                    expires_at=_new_auth_request_expire_at(),
                 )
                 result.raw_response = {
                     **(result.raw_response if isinstance(result.raw_response, dict) else {}),
@@ -2158,7 +2172,11 @@ class FeishuAdapter(BasePlatformAdapter):
         replay_id = str(metadata.get("replay_id", "") or "").strip()
         replay_ids = _merge_replay_ids(metadata.get("replay_ids"), replay_id)
 
-        for state in self._pending_app_scope_requests.values():
+        for state in list(self._pending_app_scope_requests.values()):
+            if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                self._discard_pending_tool_replays(list(_merge_replay_ids(state.replay_ids, state.replay_id)))
+                self._pending_app_scope_requests.pop(state.request_id, None)
+                continue
             if state.chat_id != chat_id:
                 continue
             if (state.thread_id or "") != thread_id:
@@ -2233,6 +2251,7 @@ class FeishuAdapter(BasePlatformAdapter):
             merged_replay_ids = _merge_replay_ids(state.replay_ids, state.replay_id, replay_ids)
             state.replay_ids = merged_replay_ids
             state.replay_id = merged_replay_ids[0] if merged_replay_ids else ""
+            state.expires_at = _new_auth_request_expire_at()
             return SendResult(
                 success=True,
                 message_id=state.message_id,
@@ -2306,6 +2325,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     tool_action=tool_action,
                     replay_id=replay_ids[0] if replay_ids else replay_id,
                     replay_ids=list(replay_ids),
+                    expires_at=_new_auth_request_expire_at(),
                 )
                 result.raw_response = {
                     **(result.raw_response if isinstance(result.raw_response, dict) else {}),
@@ -2420,6 +2440,27 @@ class FeishuAdapter(BasePlatformAdapter):
             )
         except Exception:
             logger.debug("[Feishu] Failed to send card action notice", exc_info=True)
+
+    async def _expire_auth_request_card(
+        self,
+        *,
+        state: Any,
+        resolved_account_id: Optional[str],
+        expired_by_label: str,
+    ) -> None:
+        """Mark an authorization-style card as expired and discard pending replay state."""
+        self._discard_pending_tool_replays(list(_merge_replay_ids(getattr(state, "replay_ids", []), getattr(state, "replay_id", ""))))
+        await self._update_interactive_card(
+            message_id=str(getattr(state, "message_id", "") or ""),
+            title=str(getattr(state, "title", "Feishu Authorization") or "Feishu Authorization"),
+            body_markdown=(
+                f"{str(getattr(state, 'reason', '') or '').strip()}\n\n"
+                f"**Expired after:** {expired_by_label}\n"
+                "**Status:** this authorization card expired and can no longer continue the action."
+            ),
+            template="grey",
+            account_id=resolved_account_id,
+        )
 
     async def _update_approval_card(
         self,
@@ -3494,6 +3535,18 @@ class FeishuAdapter(BasePlatformAdapter):
 
                 account_id = self._extract_event_account_id(data)
                 resolved_account_id = account_id or state.account_id or None
+                if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                    await self._expire_auth_request_card(
+                        state=state,
+                        resolved_account_id=resolved_account_id,
+                        expired_by_label="30 minutes",
+                    )
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=resolved_account_id,
+                        text="This Feishu authorization card expired. Create a new authorization request to continue.",
+                    )
+                    return
                 sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
                 sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
                 user_name = sender_profile.get("user_name") or open_id
@@ -3632,6 +3685,18 @@ class FeishuAdapter(BasePlatformAdapter):
 
                 account_id = self._extract_event_account_id(data)
                 resolved_account_id = account_id or state.account_id or None
+                if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                    await self._expire_auth_request_card(
+                        state=state,
+                        resolved_account_id=resolved_account_id,
+                        expired_by_label="30 minutes",
+                    )
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=resolved_account_id,
+                        text="This Feishu authorization card already expired.",
+                    )
+                    return
                 sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
                 sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
                 user_name = sender_profile.get("user_name") or open_id
@@ -3682,6 +3747,18 @@ class FeishuAdapter(BasePlatformAdapter):
 
                 account_id = self._extract_event_account_id(data)
                 resolved_account_id = account_id or state.account_id or None
+                if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                    await self._expire_auth_request_card(
+                        state=state,
+                        resolved_account_id=resolved_account_id,
+                        expired_by_label="30 minutes",
+                    )
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=resolved_account_id,
+                        text="This Feishu app-scope card expired. Create a new request if the handoff is still needed.",
+                    )
+                    return
                 sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
                 sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
                 user_name = sender_profile.get("user_name") or open_id
@@ -3843,6 +3920,18 @@ class FeishuAdapter(BasePlatformAdapter):
 
                 account_id = self._extract_event_account_id(data)
                 resolved_account_id = account_id or state.account_id or None
+                if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                    await self._expire_auth_request_card(
+                        state=state,
+                        resolved_account_id=resolved_account_id,
+                        expired_by_label="30 minutes",
+                    )
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=resolved_account_id,
+                        text="This Feishu app-scope card already expired.",
+                    )
+                    return
                 sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
                 sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
                 user_name = sender_profile.get("user_name") or open_id
