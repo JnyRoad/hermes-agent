@@ -53,35 +53,69 @@ def _channel_target_name(platform_name: str, channel: Dict[str, Any]) -> str:
     return name
 
 
-def _select_resolved_channel_id(platform_name: str, channels: List[Dict[str, Any]], query: str) -> Optional[str]:
-    """Resolve a normalized query against a channel list using display-aware matching."""
+def _collect_channel_resolution_candidates(
+    platform_name: str,
+    channels: List[Dict[str, Any]],
+    query: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Collect exact and prefix channel matches for diagnostics and resolution."""
     if not channels:
-        return None
+        return {"exact": [], "prefix": []}
 
-    # 1. Exact name match, including the display labels shown by send_message(action="list")
+    exact_matches: List[Dict[str, Any]] = []
+    prefix_matches: List[Dict[str, Any]] = []
+    seen_exact: set[str] = set()
+    seen_prefix: set[str] = set()
+
     for ch in channels:
+        channel_id = str(ch.get("id", "")).strip()
+        if not channel_id:
+            continue
         if _normalize_channel_query(ch["name"]) == query:
-            return ch["id"]
+            if channel_id not in seen_exact:
+                exact_matches.append(ch)
+                seen_exact.add(channel_id)
         if _normalize_channel_query(_channel_target_name(platform_name, ch)) == query:
-            return ch["id"]
+            if channel_id not in seen_exact:
+                exact_matches.append(ch)
+                seen_exact.add(channel_id)
 
-    # 2. Guild-qualified match for Discord ("GuildName/channel")
+    # Guild-qualified match for Discord ("GuildName/channel")
     if platform_name == "discord" and "/" in query:
         guild_part, ch_part = query.rsplit("/", 1)
         for ch in channels:
+            channel_id = str(ch.get("id", "")).strip()
+            if not channel_id:
+                continue
             guild = ch.get("guild", "").strip().lower()
-            if guild == guild_part and _normalize_channel_query(ch["name"]) == ch_part:
-                return ch["id"]
+            if guild == guild_part and _normalize_channel_query(ch["name"]) == ch_part and channel_id not in seen_exact:
+                exact_matches.append(ch)
+                seen_exact.add(channel_id)
 
-    # 3. Partial prefix match (only if unambiguous)
-    matches = [ch for ch in channels if _normalize_channel_query(ch["name"]).startswith(query)]
-    if len(matches) == 1:
-        return matches[0]["id"]
+    for ch in channels:
+        channel_id = str(ch.get("id", "")).strip()
+        if not channel_id:
+            continue
+        if _normalize_channel_query(ch["name"]).startswith(query) and channel_id not in seen_prefix:
+            prefix_matches.append(ch)
+            seen_prefix.add(channel_id)
+        display_query = _normalize_channel_query(_channel_target_name(platform_name, ch))
+        if display_query.startswith(query) and channel_id not in seen_prefix:
+            prefix_matches.append(ch)
+            seen_prefix.add(channel_id)
 
-    display_matches = [ch for ch in channels if _normalize_channel_query(_channel_target_name(platform_name, ch)).startswith(query)]
-    if len(display_matches) == 1:
-        return display_matches[0]["id"]
+    return {"exact": exact_matches, "prefix": prefix_matches}
 
+
+def _select_resolved_channel_id(platform_name: str, channels: List[Dict[str, Any]], query: str) -> Optional[str]:
+    """Resolve a normalized query against a channel list using display-aware matching."""
+    candidates = _collect_channel_resolution_candidates(platform_name, channels, query)
+    exact_matches = candidates["exact"]
+    if len(exact_matches) == 1:
+        return exact_matches[0]["id"]
+    prefix_matches = candidates["prefix"]
+    if not exact_matches and len(prefix_matches) == 1:
+        return prefix_matches[0]["id"]
     return None
 
 
@@ -109,6 +143,62 @@ def _resolve_feishu_live_channel_name(query: str) -> Optional[str]:
         logger.debug("Channel directory: failed live Feishu search for %s", query, exc_info=True)
         return None
     return _select_resolved_channel_id("feishu", live_entries, query)
+
+
+def explain_channel_name_resolution(platform_name: str, name: str) -> Dict[str, Any]:
+    """Explain how a channel target would resolve, including ambiguity details."""
+    query = _normalize_channel_query(name)
+    directory = load_directory()
+    cached_channels = directory.get("platforms", {}).get(platform_name, [])
+    cached_candidates = _collect_channel_resolution_candidates(platform_name, cached_channels, query)
+    resolved_id = _select_resolved_channel_id(platform_name, cached_channels, query)
+    source = "cache" if resolved_id else None
+    live_candidates: Dict[str, List[Dict[str, Any]]] | None = None
+    live_channels: List[Dict[str, Any]] = []
+
+    if platform_name == "feishu" and not resolved_id:
+        try:
+            from gateway.config import Platform, load_gateway_config
+            from gateway.platforms.feishu import FeishuAdapter
+
+            config = load_gateway_config()
+            platform_config = (config.platforms or {}).get(Platform.FEISHU)
+            if platform_config and getattr(platform_config, "enabled", False):
+                adapter = FeishuAdapter(platform_config)
+                live_channels = adapter.search_channel_directory_entries(query, limit_per_account=10)
+                live_candidates = _collect_channel_resolution_candidates(platform_name, live_channels, query)
+                resolved_id = _select_resolved_channel_id(platform_name, live_channels, query)
+                if resolved_id:
+                    source = "live_search"
+        except Exception:
+            logger.debug("Channel directory: failed to explain live Feishu search for %s", query, exc_info=True)
+
+    candidates = cached_candidates if source == "cache" or live_candidates is None else live_candidates
+    exact_matches = list(candidates.get("exact", []))
+    prefix_matches = list(candidates.get("prefix", []))
+    if exact_matches:
+        candidate_entries = exact_matches
+    elif prefix_matches:
+        candidate_entries = prefix_matches
+    else:
+        candidate_entries = []
+    suggestions = [
+        {
+            "id": item["id"],
+            "label": _channel_target_name(platform_name, item),
+            "source": item.get("source"),
+            "account_id": item.get("account_id"),
+        }
+        for item in candidate_entries[:5]
+        if isinstance(item, dict)
+    ]
+    status = "resolved" if resolved_id else ("ambiguous" if len(candidate_entries) > 1 else "not_found")
+    return {
+        "status": status,
+        "resolved_id": resolved_id,
+        "source": source,
+        "suggestions": suggestions,
+    }
 
 
 def _session_entry_id(origin: Dict[str, Any]) -> Optional[str]:
@@ -306,18 +396,7 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
     - Telegram: display name or group name
     - Slack: "engineering", "#engineering"
     """
-    directory = load_directory()
-    channels = directory.get("platforms", {}).get(platform_name, [])
-    query = _normalize_channel_query(name)
-
-    resolved = _select_resolved_channel_id(platform_name, channels, query)
-    if resolved:
-        return resolved
-
-    if platform_name == "feishu":
-        return _resolve_feishu_live_channel_name(query)
-
-    return None
+    return explain_channel_name_resolution(platform_name, name).get("resolved_id")
 
 
 def format_directory_for_display() -> str:

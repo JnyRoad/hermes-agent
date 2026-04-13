@@ -123,14 +123,26 @@ def _handle_send(args):
     # Resolve human-friendly channel names to numeric IDs
     if target_ref and not is_explicit:
         try:
-            from gateway.channel_directory import resolve_channel_name
-            resolved = resolve_channel_name(platform_name, target_ref)
+            from gateway.channel_directory import explain_channel_name_resolution
+
+            resolution = explain_channel_name_resolution(platform_name, target_ref)
+            resolved = resolution.get("resolved_id")
             if resolved:
                 chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
             else:
+                suggestions = resolution.get("suggestions") or []
+                suggestion_text = ""
+                if suggestions:
+                    labels = ", ".join(str(item.get("label", "") or "").strip() for item in suggestions if str(item.get("label", "") or "").strip())
+                    if labels:
+                        suggestion_text = f" Candidates: {labels}."
+                if resolution.get("status") == "ambiguous":
+                    return json.dumps({
+                        "error": f"Target '{target_ref}' is ambiguous on {platform_name}.{suggestion_text} Use a more specific target or an explicit channel ID."
+                    })
                 return json.dumps({
                     "error": f"Could not resolve '{target_ref}' on {platform_name}. "
-                    f"Use send_message(action='list') to see available targets."
+                    f"Use send_message(action='list') to see available targets.{suggestion_text}"
                 })
         except Exception:
             return json.dumps({

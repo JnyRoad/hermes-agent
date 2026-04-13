@@ -8,6 +8,7 @@ from unittest.mock import patch
 from gateway.config import Platform
 from gateway.channel_directory import (
     build_channel_directory,
+    explain_channel_name_resolution,
     resolve_channel_name,
     format_directory_for_display,
     load_directory,
@@ -143,6 +144,23 @@ class TestResolveChannelName:
         }
         with self._setup(tmp_path, platforms):
             assert resolve_channel_name("slack", "eng") is None
+
+    def test_explain_resolution_reports_ambiguous_candidates(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "oc_1", "name": "Backend Guild", "type": "group", "account_id": "default"},
+                {"id": "feishu-cn::oc_2", "name": "Backend Ops", "type": "group", "account_id": "feishu-cn"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            result = explain_channel_name_resolution("feishu", "Backend")
+
+        assert result["status"] == "ambiguous"
+        assert result["resolved_id"] is None
+        assert [item["label"] for item in result["suggestions"]] == [
+            "Backend Guild (group)",
+            "feishu-cn/Backend Ops (group)",
+        ]
 
     def test_no_channels_returns_none(self, tmp_path):
         with self._setup(tmp_path, {}):
