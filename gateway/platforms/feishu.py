@@ -6378,6 +6378,12 @@ class FeishuAdapter(BasePlatformAdapter):
                 self,
                 account.account_id,
             )
+            ws_future.add_done_callback(
+                lambda finished_future, finished_account_id=account.account_id: self._handle_websocket_future_done(
+                    finished_account_id,
+                    finished_future,
+                )
+            )
             self._ws_futures_by_account[account.account_id] = ws_future
             self._set_transport_runtime_state(account.account_id, "connected")
             if account.account_id == "default":
@@ -6473,6 +6479,43 @@ class FeishuAdapter(BasePlatformAdapter):
             if account.enabled and (connection_mode is None or account.connection_mode == connection_mode)
         ]
         return ", ".join(entries) if entries else "none"
+
+    def _handle_websocket_future_done(self, account_id: str, ws_future: Any) -> None:
+        """Track websocket worker completion so diagnostics reflect unexpected transport exits."""
+        try:
+            exc = ws_future.exception()
+        except asyncio.CancelledError:
+            self._set_transport_runtime_state(account_id, "disconnected")
+            logger.info("[Feishu] Websocket transport cancelled for account %s", account_id)
+            return
+        except Exception as exc:
+            self._set_transport_runtime_state(account_id, "error", error=str(exc))
+            logger.warning(
+                "[Feishu] Failed to inspect websocket transport result for account %s: %s",
+                account_id,
+                exc,
+                exc_info=True,
+            )
+            return
+
+        if exc is not None:
+            self._set_transport_runtime_state(account_id, "error", error=str(exc))
+            logger.warning(
+                "[Feishu] Websocket transport terminated with error for account %s: %s",
+                account_id,
+                exc,
+                exc_info=True,
+            )
+            return
+
+        current_state = str(self._transport_runtime_state_by_account.get(account_id) or "").strip().lower()
+        if current_state == "disconnecting":
+            self._set_transport_runtime_state(account_id, "disconnected")
+            logger.info("[Feishu] Websocket transport stopped for account %s", account_id)
+            return
+        if current_state not in {"disconnected", "error"}:
+            self._set_transport_runtime_state(account_id, "disconnected")
+            logger.warning("[Feishu] Websocket transport exited unexpectedly for account %s", account_id)
 
     def get_transport_account_status(self) -> List[Dict[str, str]]:
         """Return runtime transport status for each configured Feishu account."""
