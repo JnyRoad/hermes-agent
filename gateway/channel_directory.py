@@ -144,6 +144,17 @@ def _rank_resolution_candidate(
     normalized_account_id = str(channel.get("account_id", "") or "default").strip() or "default"
     preferred_account = str(preferred_account_id or "").strip() or ""
     account_rank = 0 if preferred_account and normalized_account_id == preferred_account else 1
+    channel_type = str(channel.get("type", "") or "").strip().lower()
+    type_rank = 0
+    if platform_name == "feishu":
+        # Feishu business tools most often route follow-ups back into group chats.
+        # When an operator gives an unqualified name, surfacing group targets ahead
+        # of DMs makes the ambiguity list more action-oriented without changing the
+        # conservative uniqueness requirement.
+        type_rank = {
+            "group": 0,
+            "dm": 1,
+        }.get(channel_type, 2)
     source = str(channel.get("source", "") or "unknown").strip() or "unknown"
     source_rank = {
         "config": 0,
@@ -153,7 +164,7 @@ def _rank_resolution_candidate(
         "unknown": 4,
     }.get(source, 5)
     label = _channel_target_name(platform_name, channel).lower()
-    return (match_rank, account_rank, source_rank, label, str(channel.get("id", "")).strip())
+    return (match_rank, account_rank, type_rank, source_rank, label, str(channel.get("id", "")).strip())
 
 
 def _build_resolution_suggestions(
@@ -196,18 +207,22 @@ def _build_resolution_suggestions(
         if preferred_account_id and account_id == (str(preferred_account_id).strip() or "default"):
             reason_parts.append("preferred account")
         source = str(item.get("source", "") or "unknown").strip() or "unknown"
+        candidate_type = str(item.get("type", "") or "").strip().lower()
         if source == "config":
             reason_parts.append("config-backed")
         elif source == "live":
             reason_parts.append("live directory")
         elif source == "live_search":
             reason_parts.append("live search")
+        if platform_name == "feishu" and candidate_type in {"group", "dm"}:
+            reason_parts.append(f"{candidate_type} target")
         suggestions.append(
             {
                 "id": item["id"],
                 "label": _channel_target_name(platform_name, item),
                 "source": source,
                 "account_id": account_id,
+                "type": candidate_type,
                 "match_type": match_type,
                 "reason": ", ".join(reason_parts),
             }

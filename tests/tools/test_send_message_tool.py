@@ -475,8 +475,8 @@ class TestSendMessageTool:
                      "resolved_id": None,
                      "source": "live_search",
                      "suggestions": [
-                         {"label": "Backend Guild (group)"},
-                         {"label": "feishu-cn/Backend Ops (group)"},
+                         {"label": "Backend Guild (group)", "reason": "exact name match, config-backed, group target"},
+                         {"label": "feishu-cn/Backend Ops (group)", "reason": "prefix name match, preferred account, live directory, group target"},
                      ],
                  },
              ), \
@@ -495,6 +495,7 @@ class TestSendMessageTool:
         assert "ambiguous" in result["error"]
         assert "Backend Guild (group)" in result["error"]
         assert "feishu-cn/Backend Ops (group)" in result["error"]
+        assert "config-backed, group target" in result["error"]
 
     def test_media_only_message_uses_placeholder_for_mirroring(self):
         config, telegram_cfg = _make_config()

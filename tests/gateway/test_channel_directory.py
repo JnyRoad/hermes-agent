@@ -221,8 +221,23 @@ class TestResolveChannelName:
             "feishu-cn::oc_2",
             "oc_default",
         ]
-        assert result["suggestions"][0]["reason"] == "exact name match, preferred account, live directory"
-        assert result["suggestions"][2]["reason"] == "exact name match, config-backed"
+        assert result["suggestions"][0]["reason"] == "exact name match, preferred account, live directory, group target"
+        assert result["suggestions"][2]["reason"] == "exact name match, config-backed, group target"
+
+    def test_feishu_group_targets_rank_ahead_of_dm_targets(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "ou_alice", "name": "Backend", "type": "dm", "account_id": "default", "source": "config"},
+                {"id": "oc_backend", "name": "Backend", "type": "group", "account_id": "default", "source": "config"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            result = explain_channel_name_resolution("feishu", "Backend")
+
+        assert result["status"] == "ambiguous"
+        assert [item["id"] for item in result["suggestions"]] == ["oc_backend", "ou_alice"]
+        assert result["suggestions"][0]["reason"] == "exact name match, config-backed, group target"
+        assert result["suggestions"][1]["reason"] == "exact name match, config-backed, dm target"
 
     def test_no_channels_returns_none(self, tmp_path):
         with self._setup(tmp_path, {}):

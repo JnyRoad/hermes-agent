@@ -177,11 +177,7 @@ def _handle_send(args):
                 chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
             else:
                 suggestions = resolution.get("suggestions") or []
-                suggestion_text = ""
-                if suggestions:
-                    labels = ", ".join(str(item.get("label", "") or "").strip() for item in suggestions if str(item.get("label", "") or "").strip())
-                    if labels:
-                        suggestion_text = f" Candidates: {labels}."
+                suggestion_text = _format_resolution_suggestions_for_error(suggestions)
                 if resolution.get("status") == "ambiguous":
                     return json.dumps({
                         "error": f"Target '{target_ref}' is ambiguous on {platform_name}.{suggestion_text} Use a more specific target or an explicit channel ID."
@@ -283,6 +279,26 @@ def _get_preferred_resolution_account_id(platform_name: str, *, config, platform
         if preferred_account_id:
             return preferred_account_id
     return "default"
+
+
+def _format_resolution_suggestions_for_error(suggestions: list[dict]) -> str:
+    """Format ranked directory suggestions for tool-facing error messages."""
+    if not suggestions:
+        return ""
+
+    parts: list[str] = []
+    for item in suggestions:
+        label = str(item.get("label", "") or "").strip()
+        if not label:
+            continue
+        reason = str(item.get("reason", "") or "").strip()
+        if reason:
+            parts.append(f"{label} [{reason}]")
+        else:
+            parts.append(label)
+    if not parts:
+        return ""
+    return f" Candidates: {', '.join(parts)}."
 
 
 def _parse_target_ref(platform_name: str, target_ref: str):
