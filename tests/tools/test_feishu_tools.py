@@ -4203,9 +4203,86 @@ def test_feishu_adapter_marks_oauth_card_warning_when_replay_has_issues(monkeypa
     asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
 
     assert adapter._update_interactive_card.await_args.kwargs["template"] == "orange"
+    assert adapter._update_interactive_card.await_args.kwargs["button_label"] == "Retry Authorized Action"
     card_body = adapter._update_interactive_card.await_args.kwargs["body_markdown"]
     assert "need attention" in card_body
+    assert "fo_1" in adapter._pending_oauth_requests
+    assert "fr_2" in adapter._pending_tool_replays
     adapter.send.assert_awaited_once()
+
+
+def test_feishu_adapter_retry_authorized_action_replays_remaining_failures(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingOAuthRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._pending_oauth_requests["fo_1"] = FeishuPendingOAuthRequest(
+        request_id="fo_1",
+        chat_id="oc_chat_1",
+        message_id="msg_auth_1",
+        scopes=["calendar:calendar.event:delete"],
+        reason="Need event delete.",
+        title="Auth",
+        requester_open_id="ou_requester",
+        account_id="feishu-cn",
+        tool_name="feishu_calendar_event",
+        tool_action="delete",
+        replay_id="fr_2",
+        replay_ids=["fr_2"],
+    )
+    adapter._resolve_sender_profile = AsyncMock(
+        return_value={"user_id": "ou_operator", "user_name": "Alice", "user_id_alt": "ou_operator"}
+    )
+    adapter.get_chat_info = AsyncMock(return_value={"name": "Backend Chat", "chat_type": "group"})
+    adapter._update_interactive_card = AsyncMock()
+    adapter._handle_message_with_guards = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg_result"))
+    adapter._pending_tool_replays = {
+        "fr_2": {
+            "tool_name": "feishu_calendar_event",
+            "args": {"action": "delete", "calendar_id": "cal_1", "event_id": "evt_1"},
+            "chat_id": "oc_chat_1",
+            "thread_id": "",
+            "user_id": "ou_requester",
+        },
+    }
+    attempts = {"count": 0}
+
+    def _dispatch(name, args, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return json.dumps({"error": True, "tool": name}, ensure_ascii=False)
+        return json.dumps({"success": True, "tool": name, "args": args}, ensure_ascii=False)
+
+    monkeypatch.setattr("tools.registry.registry.dispatch", _dispatch)
+
+    event = SimpleNamespace(
+        token="tok_auth_retry_1",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_requester"),
+        action=SimpleNamespace(tag="button", value={"hermes_action": "complete_oauth", "request_id": "fo_1"}),
+    )
+
+    import asyncio
+
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+    assert "fo_1" in adapter._pending_oauth_requests
+    assert "fr_2" in adapter._pending_tool_replays
+
+    retry_event = SimpleNamespace(
+        token="tok_auth_retry_2",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_requester"),
+        action=SimpleNamespace(tag="button", value={"hermes_action": "complete_oauth", "request_id": "fo_1"}),
+    )
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=retry_event)))
+
+    assert "fo_1" not in adapter._pending_oauth_requests
+    assert "fr_2" not in adapter._pending_tool_replays
+    assert adapter._update_interactive_card.await_args.kwargs["template"] == "green"
 
 
 def test_feishu_adapter_rejects_oauth_completion_from_other_user(monkeypatch):

@@ -3246,6 +3246,7 @@ class FeishuAdapter(BasePlatformAdapter):
             if isinstance(parsed, dict) and parsed.get("error"):
                 status = "error"
                 had_failure = True
+                pending_replays[replay_id] = replay
             replay_results.append(
                 {
                     "replay_id": replay_id,
@@ -3419,19 +3420,41 @@ class FeishuAdapter(BasePlatformAdapter):
                 elif replay_count == 0:
                     card_template = "blue"
                     card_status_line = "**Replay status:** no pending actions were waiting for replay"
-                await self._update_interactive_card(
-                    message_id=state.message_id,
-                    title=state.title,
-                    body_markdown=(
-                        f"{state.reason}\n\n"
-                        f"**Confirmed by:** {user_name}\n"
-                        f"**Authorized user:** {authorized_open_id}\n"
-                        f"**Scopes:** {', '.join(state.scopes)}\n"
-                        f"{card_status_line}"
-                    ),
-                    template=card_template,
-                    account_id=resolved_account_id,
-                )
+                if replay_had_failure:
+                    self._pending_oauth_requests[request_id] = state
+                    await self._update_interactive_card(
+                        message_id=state.message_id,
+                        title=state.title,
+                        body_markdown=(
+                            f"{state.reason}\n\n"
+                            f"**Confirmed by:** {user_name}\n"
+                            f"**Authorized user:** {authorized_open_id}\n"
+                            f"**Scopes:** {', '.join(state.scopes)}\n"
+                            f"{card_status_line}\n"
+                            "**Next step:** retry the authorized action after reviewing the replay result details below."
+                        ),
+                        template=card_template,
+                        button_label="Retry Authorized Action",
+                        button_value={
+                            "hermes_action": "complete_oauth",
+                            "request_id": request_id,
+                        },
+                        account_id=resolved_account_id,
+                    )
+                else:
+                    await self._update_interactive_card(
+                        message_id=state.message_id,
+                        title=state.title,
+                        body_markdown=(
+                            f"{state.reason}\n\n"
+                            f"**Confirmed by:** {user_name}\n"
+                            f"**Authorized user:** {authorized_open_id}\n"
+                            f"**Scopes:** {', '.join(state.scopes)}\n"
+                            f"{card_status_line}"
+                        ),
+                        template=card_template,
+                        account_id=resolved_account_id,
+                    )
                 if replayed:
                     logger.info(
                         "[Feishu] Replayed authorized tool %s.%s for %s",
