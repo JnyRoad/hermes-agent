@@ -3530,24 +3530,38 @@ class FeishuAdapter(BasePlatformAdapter):
                         account_id=resolved_account_id,
                     )
                     follow_up_missing_scopes = self._normalize_scope_list(list(status.get("missing_scopes") or []))
-
-                await self._update_interactive_card(
-                    message_id=state.message_id,
-                    title=state.title,
-                    body_markdown=(
-                        f"{state.reason}\n\n"
-                        f"**Confirmed by owner:** {user_name}\n"
-                        f"**App scopes verified:** {', '.join(granted_user_scopes) if granted_user_scopes else 'none'}\n"
-                        f"**Next user auth scopes:** {', '.join(follow_up_missing_scopes) if follow_up_missing_scopes else 'none'}"
-                    ),
-                    template="green",
-                    account_id=resolved_account_id,
-                )
-
-                if not state.requester_open_id or not follow_up_missing_scopes:
+                if not state.requester_open_id:
+                    await self._update_interactive_card(
+                        message_id=state.message_id,
+                        title=state.title,
+                        body_markdown=(
+                            f"{state.reason}\n\n"
+                            f"**Confirmed by owner:** {user_name}\n"
+                            f"**App scopes verified:** {', '.join(granted_user_scopes) if granted_user_scopes else 'none'}\n"
+                            "**Next step:** no requester identity was attached, so Hermes cannot continue user authorization automatically."
+                        ),
+                        template="green",
+                        account_id=resolved_account_id,
+                    )
                     return
 
-                await self.send_oauth_request_card(
+                if not follow_up_missing_scopes:
+                    await self._update_interactive_card(
+                        message_id=state.message_id,
+                        title=state.title,
+                        body_markdown=(
+                            f"{state.reason}\n\n"
+                            f"**Confirmed by owner:** {user_name}\n"
+                            f"**App scopes verified:** {', '.join(granted_user_scopes) if granted_user_scopes else 'none'}\n"
+                            f"**Requester:** {state.requester_open_id}\n"
+                            "**Next step:** user authorization is already complete."
+                        ),
+                        template="green",
+                        account_id=resolved_account_id,
+                    )
+                    return
+
+                oauth_result = await self.send_oauth_request_card(
                     chat_id=state.chat_id,
                     scopes=follow_up_missing_scopes,
                     reason=(
@@ -3564,6 +3578,41 @@ class FeishuAdapter(BasePlatformAdapter):
                         "replay_id": state.replay_id or None,
                         "replay_ids": list(_merge_replay_ids(state.replay_ids, state.replay_id)),
                     },
+                )
+                if not oauth_result.success:
+                    self._pending_app_scope_requests[request_id] = state
+                    await self._update_interactive_card(
+                        message_id=state.message_id,
+                        title=state.title,
+                        body_markdown=(
+                            f"{state.reason}\n\n"
+                            f"**Confirmed by owner:** {user_name}\n"
+                            f"**App scopes verified:** {', '.join(granted_user_scopes) if granted_user_scopes else 'none'}\n"
+                            f"**Next user auth scopes:** {', '.join(follow_up_missing_scopes)}\n\n"
+                            f"Hermes failed to create the follow-up user authorization card: {oauth_result.error or 'unknown error'}"
+                        ),
+                        template="orange",
+                        button_label="Retry Authorization Handoff",
+                        button_value={
+                            "hermes_action": "complete_app_scope_request",
+                            "request_id": request_id,
+                        },
+                        account_id=resolved_account_id,
+                    )
+                    return
+
+                await self._update_interactive_card(
+                    message_id=state.message_id,
+                    title=state.title,
+                    body_markdown=(
+                        f"{state.reason}\n\n"
+                        f"**Confirmed by owner:** {user_name}\n"
+                        f"**App scopes verified:** {', '.join(granted_user_scopes) if granted_user_scopes else 'none'}\n"
+                        f"**Next user auth scopes:** {', '.join(follow_up_missing_scopes)}\n"
+                        "**Next step:** Hermes sent the follow-up user authorization card in this chat."
+                    ),
+                    template="blue",
+                    account_id=resolved_account_id,
                 )
                 logger.info(
                     "[Feishu] Promoted app scope request %s to user authorization for %s",

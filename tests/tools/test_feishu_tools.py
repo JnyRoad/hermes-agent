@@ -3743,6 +3743,107 @@ def test_feishu_adapter_promotes_app_scope_request_to_user_oauth(monkeypatch):
     assert kwargs["metadata"]["requester_open_id"] == "ou_requester"
     assert kwargs["metadata"]["replay_id"] == "fr_1"
     assert kwargs["metadata"]["replay_ids"] == ["fr_1"]
+    assert adapter._update_interactive_card.await_args.kwargs["template"] == "blue"
+
+
+def test_feishu_adapter_marks_app_scope_done_when_user_auth_not_needed(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingAppScopeRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._pending_app_scope_requests["fas_1"] = FeishuPendingAppScopeRequest(
+        request_id="fas_1",
+        chat_id="oc_chat_1",
+        message_id="msg_app_scope_1",
+        scopes=["calendar:calendar.event:delete"],
+        reason="App scopes are required.",
+        title="Feishu App Authorization Required",
+        owner_open_id="ou_owner",
+        requester_open_id="ou_requester",
+        account_id="feishu-cn",
+    )
+    adapter.record_authorization_grant(
+        user_open_id="ou_requester",
+        scopes=["calendar:calendar.event:delete"],
+        account_id="feishu-cn",
+    )
+    adapter._resolve_sender_profile = AsyncMock(
+        return_value={"user_id": "ou_owner", "user_name": "Alice", "user_id_alt": "ou_owner"}
+    )
+    adapter._update_interactive_card = AsyncMock()
+    adapter.send_oauth_request_card = AsyncMock()
+    monkeypatch.setattr(
+        "tools.feishu.client.get_app_granted_scopes_by_token_type",
+        lambda *args, **kwargs: ["calendar:calendar.event:delete"],
+    )
+
+    event = SimpleNamespace(
+        token="tok_app_scope_done",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_owner"),
+        action=SimpleNamespace(tag="button", value={"hermes_action": "complete_app_scope_request", "request_id": "fas_1"}),
+    )
+
+    import asyncio
+
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+    assert "fas_1" not in adapter._pending_app_scope_requests
+    adapter.send_oauth_request_card.assert_not_awaited()
+    assert adapter._update_interactive_card.await_args.kwargs["template"] == "green"
+    assert "already complete" in adapter._update_interactive_card.await_args.kwargs["body_markdown"]
+
+
+def test_feishu_adapter_retries_app_scope_handoff_when_user_auth_card_send_fails(monkeypatch):
+    from gateway.platforms.feishu import FeishuAdapter, FeishuPendingAppScopeRequest
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+    )
+    adapter = FeishuAdapter(config)
+    adapter._pending_app_scope_requests["fas_1"] = FeishuPendingAppScopeRequest(
+        request_id="fas_1",
+        chat_id="oc_chat_1",
+        message_id="msg_app_scope_1",
+        scopes=["calendar:calendar.event:delete"],
+        reason="App scopes are required.",
+        title="Feishu App Authorization Required",
+        owner_open_id="ou_owner",
+        requester_open_id="ou_requester",
+        account_id="feishu-cn",
+        replay_id="fr_1",
+        replay_ids=["fr_1"],
+    )
+    adapter._resolve_sender_profile = AsyncMock(
+        return_value={"user_id": "ou_owner", "user_name": "Alice", "user_id_alt": "ou_owner"}
+    )
+    adapter._update_interactive_card = AsyncMock()
+    adapter.send_oauth_request_card = AsyncMock(return_value=SendResult(success=False, error="network down"))
+    monkeypatch.setattr(
+        "tools.feishu.client.get_app_granted_scopes_by_token_type",
+        lambda *args, **kwargs: ["calendar:calendar.event:delete"],
+    )
+
+    event = SimpleNamespace(
+        token="tok_app_scope_retry",
+        context=SimpleNamespace(open_chat_id="oc_chat_1"),
+        operator=SimpleNamespace(open_id="ou_owner"),
+        action=SimpleNamespace(tag="button", value={"hermes_action": "complete_app_scope_request", "request_id": "fas_1"}),
+    )
+
+    import asyncio
+
+    asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+    assert "fas_1" in adapter._pending_app_scope_requests
+    adapter.send_oauth_request_card.assert_awaited_once()
+    assert adapter._update_interactive_card.await_args.kwargs["template"] == "orange"
+    assert adapter._update_interactive_card.await_args.kwargs["button_label"] == "Retry Authorization Handoff"
+    assert "network down" in adapter._update_interactive_card.await_args.kwargs["body_markdown"]
 
 
 def test_feishu_adapter_merges_pending_app_scope_request_replay_ids(monkeypatch):
