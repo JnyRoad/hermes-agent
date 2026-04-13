@@ -114,6 +114,43 @@ def _handle_send(args):
     chat_id = None
     thread_id = None
     account_id = None
+    config = None
+    platform = None
+    pconfig = None
+
+    from gateway.config import Platform as GatewayPlatform
+
+    platform_map = {
+        "telegram": GatewayPlatform.TELEGRAM,
+        "discord": GatewayPlatform.DISCORD,
+        "slack": GatewayPlatform.SLACK,
+        "whatsapp": GatewayPlatform.WHATSAPP,
+        "signal": GatewayPlatform.SIGNAL,
+        "bluebubbles": GatewayPlatform.BLUEBUBBLES,
+        "matrix": GatewayPlatform.MATRIX,
+        "mattermost": GatewayPlatform.MATTERMOST,
+        "homeassistant": GatewayPlatform.HOMEASSISTANT,
+        "dingtalk": GatewayPlatform.DINGTALK,
+        "feishu": GatewayPlatform.FEISHU,
+        "wecom": GatewayPlatform.WECOM,
+        "weixin": GatewayPlatform.WEIXIN,
+        "email": GatewayPlatform.EMAIL,
+        "sms": GatewayPlatform.SMS,
+    }
+    platform = platform_map.get(platform_name)
+    if not platform:
+        avail = ", ".join(platform_map.keys())
+        return tool_error(f"Unknown platform: {platform_name}. Available: {avail}")
+
+    try:
+        from gateway.config import load_gateway_config
+        config = load_gateway_config()
+    except Exception as e:
+        return json.dumps(_error(f"Failed to load gateway config: {e}"))
+
+    pconfig = config.platforms.get(platform)
+    if not pconfig or not pconfig.enabled:
+        return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
 
     if target_ref:
         chat_id, thread_id, is_explicit = _parse_target_ref(platform_name, target_ref)
@@ -125,7 +162,16 @@ def _handle_send(args):
         try:
             from gateway.channel_directory import explain_channel_name_resolution
 
-            resolution = explain_channel_name_resolution(platform_name, target_ref)
+            preferred_account_id = _get_preferred_resolution_account_id(
+                platform_name,
+                config=config,
+                platform_config=pconfig,
+            )
+            resolution = explain_channel_name_resolution(
+                platform_name,
+                target_ref,
+                preferred_account_id=preferred_account_id,
+            )
             resolved = resolution.get("resolved_id")
             if resolved:
                 chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
@@ -156,38 +202,6 @@ def _handle_send(args):
     from tools.interrupt import is_interrupted
     if is_interrupted():
         return tool_error("Interrupted")
-
-    try:
-        from gateway.config import load_gateway_config, Platform
-        config = load_gateway_config()
-    except Exception as e:
-        return json.dumps(_error(f"Failed to load gateway config: {e}"))
-
-    platform_map = {
-        "telegram": Platform.TELEGRAM,
-        "discord": Platform.DISCORD,
-        "slack": Platform.SLACK,
-        "whatsapp": Platform.WHATSAPP,
-        "signal": Platform.SIGNAL,
-        "bluebubbles": Platform.BLUEBUBBLES,
-        "matrix": Platform.MATRIX,
-        "mattermost": Platform.MATTERMOST,
-        "homeassistant": Platform.HOMEASSISTANT,
-        "dingtalk": Platform.DINGTALK,
-        "feishu": Platform.FEISHU,
-        "wecom": Platform.WECOM,
-        "weixin": Platform.WEIXIN,
-        "email": Platform.EMAIL,
-        "sms": Platform.SMS,
-    }
-    platform = platform_map.get(platform_name)
-    if not platform:
-        avail = ", ".join(platform_map.keys())
-        return tool_error(f"Unknown platform: {platform_name}. Available: {avail}")
-
-    pconfig = config.platforms.get(platform)
-    if not pconfig or not pconfig.enabled:
-        return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
 
     from gateway.platforms.base import BasePlatformAdapter
 
@@ -247,6 +261,28 @@ def _handle_send(args):
         return json.dumps(result)
     except Exception as e:
         return json.dumps(_error(f"Send failed: {e}"))
+
+
+def _get_preferred_resolution_account_id(platform_name: str, *, config, platform_config) -> str | None:
+    """Infer a safe account preference for human-readable target resolution.
+
+    This is intentionally conservative. For Feishu, a tool call does not carry
+    chat-local account context, so the best available hint is the configured
+    home channel account. If no explicit account is encoded there, fall back to
+    the primary default account. The resolver still only auto-selects when that
+    preferred account yields one unique match.
+    """
+    if platform_name != "feishu" or config is None or platform_config is None:
+        return None
+
+    from gateway.config import Platform as GatewayPlatform
+
+    home_channel = config.get_home_channel(GatewayPlatform.FEISHU)
+    if home_channel and getattr(home_channel, "chat_id", None):
+        _, preferred_account_id = _split_feishu_account_target(str(home_channel.chat_id))
+        if preferred_account_id:
+            return preferred_account_id
+    return "default"
 
 
 def _parse_target_ref(platform_name: str, target_ref: str):

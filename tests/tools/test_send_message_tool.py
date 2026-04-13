@@ -358,6 +358,106 @@ class TestSendMessageTool:
             account_id="feishu-cn",
         )
 
+    def test_feishu_target_resolution_prefers_home_channel_account(self, tmp_path):
+        feishu_cfg = SimpleNamespace(enabled=True, token="", extra={})
+        home = SimpleNamespace(chat_id="feishu-cn::oc_home")
+        config = SimpleNamespace(
+            platforms={Platform.FEISHU: feishu_cfg},
+            get_home_channel=lambda _platform: home,
+        )
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({"updated_at": "2026-01-01T00:00:00", "platforms": {"feishu": []}}))
+        captured = {}
+
+        def _explain(platform_name, name, preferred_account_id=None):
+            captured["platform_name"] = platform_name
+            captured["name"] = name
+            captured["preferred_account_id"] = preferred_account_id
+            return {
+                "status": "resolved",
+                "resolved_id": "feishu-cn::oc_backend",
+                "source": "cache",
+                "preferred_account_id": preferred_account_id,
+                "suggestions": [],
+            }
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.channel_directory.explain_channel_name_resolution", side_effect=_explain), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "feishu:Backend",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert captured["preferred_account_id"] == "feishu-cn"
+        send_mock.assert_awaited_once_with(
+            Platform.FEISHU,
+            feishu_cfg,
+            "oc_backend",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            account_id="feishu-cn",
+        )
+
+    def test_feishu_target_resolution_falls_back_to_default_account(self, tmp_path):
+        feishu_cfg = SimpleNamespace(enabled=True, token="", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.FEISHU: feishu_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({"updated_at": "2026-01-01T00:00:00", "platforms": {"feishu": []}}))
+        captured = {}
+
+        def _explain(platform_name, name, preferred_account_id=None):
+            captured["preferred_account_id"] = preferred_account_id
+            return {
+                "status": "resolved",
+                "resolved_id": "oc_backend",
+                "source": "cache",
+                "preferred_account_id": preferred_account_id,
+                "suggestions": [],
+            }
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.channel_directory.explain_channel_name_resolution", side_effect=_explain), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "feishu:Backend",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert captured["preferred_account_id"] == "default"
+        send_mock.assert_awaited_once_with(
+            Platform.FEISHU,
+            feishu_cfg,
+            "oc_backend",
+            "hello",
+            thread_id=None,
+            media_files=[],
+        )
+
     def test_feishu_ambiguous_target_returns_candidates(self, tmp_path):
         feishu_cfg = SimpleNamespace(enabled=True, token="", extra={})
         config = SimpleNamespace(
