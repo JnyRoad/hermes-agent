@@ -325,6 +325,35 @@ class TestFeishuDirectoryDiscovery(unittest.TestCase):
         )
         self.assertEqual(calls, ["/open-apis/im/v1/chats"])
 
+    def test_config_directory_respects_account_settings(self):
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_id": "cli_xxx",
+                    "app_secret": "secret_xxx",
+                    "allow_from": ["ou_1"],
+                    "group_allow_from": ["oc_1"],
+                    "directory": {
+                        "include_config_users": False,
+                        "include_config_groups": True,
+                        "include_live_users": False,
+                        "include_live_groups": False,
+                    },
+                },
+            )
+        )
+
+        entries = adapter.build_channel_directory_entries(include_live=True, limit_per_account=50)
+
+        self.assertEqual(
+            entries,
+            [{"id": "oc_1", "name": "oc_1", "type": "group", "source": "config", "account_id": "default"}],
+        )
+
     def test_search_channel_directory_entries_queries_users_and_chats(self):
         from gateway.platforms.feishu import FeishuAdapter
         from gateway.config import PlatformConfig

@@ -4154,6 +4154,23 @@ class GatewayRunner:
             feishu_entries = directory.get("platforms", {}).get("feishu", []) or []
             source_counts: dict[str, int] = {}
             account_counts: dict[str, int] = {}
+            directory_settings = {}
+            config_settings = {}
+            if hasattr(adapter, "_get_account_live_directory_settings"):
+                account_id = str(getattr(event.source, "account_id", None) or "default").strip() or "default"
+                try:
+                    directory_settings = adapter._get_account_live_directory_settings(account_id) or {}
+                except Exception:
+                    directory_settings = {}
+                config_settings = {
+                    "account_id": account_id,
+                    "include_config_users": directory_settings.get("include_config_users"),
+                    "include_config_groups": directory_settings.get("include_config_groups"),
+                    "include_live_users": directory_settings.get("include_live_users"),
+                    "include_live_groups": directory_settings.get("include_live_groups"),
+                    "live_limit": directory_settings.get("live_limit"),
+                    "live_page_size": directory_settings.get("live_page_size"),
+                }
             for item in feishu_entries:
                 if not isinstance(item, dict):
                     continue
@@ -4173,6 +4190,16 @@ class GatewayRunner:
             if account_counts:
                 account_detail = ", ".join(f"{key}={value}" for key, value in sorted(account_counts.items()))
                 lines.append(f"- Accounts: {account_detail}")
+            if config_settings:
+                lines.append(
+                    "- Current account directory policy: "
+                    f"account=`{config_settings['account_id']}` "
+                    f"config_users={config_settings['include_config_users'] if config_settings['include_config_users'] is not None else 'default'} "
+                    f"config_groups={config_settings['include_config_groups'] if config_settings['include_config_groups'] is not None else 'default'} "
+                    f"live_users={config_settings['include_live_users'] if config_settings['include_live_users'] is not None else 'default'} "
+                    f"live_groups={config_settings['include_live_groups'] if config_settings['include_live_groups'] is not None else 'default'} "
+                    f"limit={config_settings['live_limit']} page_size={config_settings['live_page_size']}"
+                )
             if hasattr(adapter, "search_channel_directory_entries"):
                 lines.append("- Live search fallback: available")
             else:
@@ -4262,6 +4289,7 @@ class GatewayRunner:
                 "- `/feishu directory [query]` — inspect cached targets or resolve a Feishu target name\n"
                 "- `/feishu auth ...` — inspect or request Feishu user authorization\n"
                 "- `/feishu auth batch` — owner-only batch authorization for all granted user scopes\n"
+                "- `/feishu onboarding` — alias of `/feishu auth batch` for owner onboarding\n"
                 "- `/feishu help` — show this help"
             )
 
@@ -4272,8 +4300,11 @@ class GatewayRunner:
             return await self._handle_feishu_directory_command(event, remaining)
 
         if subcommand in {"auth", "onboarding"}:
+            forwarded_args = remaining
+            if subcommand == "onboarding" and not forwarded_args:
+                forwarded_args = "batch"
             forwarded_event = MessageEvent(
-                text=f"/feishu-auth {remaining}".rstrip(),
+                text=f"/feishu-auth {forwarded_args}".rstrip(),
                 source=event.source,
                 message_type=event.message_type,
                 raw_message=event.raw_message,
@@ -4301,6 +4332,7 @@ class GatewayRunner:
             warn_or_fail = [item for item in report["items"] if item.get("status") in {"warn", "fail"}]
             if warn_or_fail:
                 lines = ["⚠️ **Feishu Start Check Passed With Warnings**", ""]
+                lines.append("- Unified chat commands are available: `/feishu help`")
                 for item in warn_or_fail:
                     detail = str(item.get("detail", "") or "").strip()
                     line = f"- {item.get('label', '')}"
@@ -4311,10 +4343,14 @@ class GatewayRunner:
                     lines.extend(["", "**Actionable Items**"])
                     lines.extend(f"- {issue}" for issue in report["issues"])
                 return "\n".join(lines)
-            return "✅ **Feishu Start Check Passed**\n- Feishu gateway configuration looks healthy."
+            return (
+                "✅ **Feishu Start Check Passed**\n"
+                "- Feishu gateway configuration looks healthy.\n"
+                "- Unified chat commands are available: `/feishu help`"
+            )
 
         return (
-            "Usage: `/feishu [start|auth|doctor|directory|help]`\n"
+            "Usage: `/feishu [start|auth|onboarding|doctor|directory|help]`\n"
             "Example: `/feishu auth feishu_calendar_event delete`"
         )
 

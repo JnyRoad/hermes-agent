@@ -58,6 +58,7 @@ async def test_feishu_unified_help_lists_subcommands():
     assert "/feishu start" in result
     assert "/feishu auth" in result
     assert "/feishu auth batch" in result
+    assert "/feishu onboarding" in result
     assert "/feishu directory [query]" in result
 
 
@@ -103,6 +104,19 @@ async def test_feishu_unified_auth_delegates(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_feishu_unified_onboarding_delegates_to_batch_auth():
+    runner = _make_runner()
+    delegated = AsyncMock(return_value="auth-result")
+    runner._handle_feishu_auth_command = delegated
+
+    result = await runner._handle_feishu_command(_make_event("/feishu onboarding"))
+
+    assert result == "auth-result"
+    forwarded_event = delegated.await_args.args[0]
+    assert forwarded_event.text == "/feishu-auth batch"
+
+
+@pytest.mark.asyncio
 async def test_feishu_unified_start_reports_success(monkeypatch):
     runner = _make_runner()
     runner.adapters[Platform.FEISHU] = SimpleNamespace()
@@ -114,6 +128,7 @@ async def test_feishu_unified_start_reports_success(monkeypatch):
     result = await runner._handle_feishu_command(_make_event("/feishu start"))
 
     assert "Feishu Start Check Passed" in result
+    assert "/feishu help" in result
 
 
 @pytest.mark.asyncio
@@ -175,7 +190,17 @@ async def test_feishu_doctor_forwards_account_id(monkeypatch):
 @pytest.mark.asyncio
 async def test_feishu_directory_summary_reports_cache_and_live_search(monkeypatch):
     runner = _make_runner()
-    runner.adapters[Platform.FEISHU] = SimpleNamespace(search_channel_directory_entries=lambda *args, **kwargs: [])
+    runner.adapters[Platform.FEISHU] = SimpleNamespace(
+        search_channel_directory_entries=lambda *args, **kwargs: [],
+        _get_account_live_directory_settings=lambda account_id: {
+            "include_config_users": True,
+            "include_config_groups": False,
+            "include_live_users": False,
+            "include_live_groups": True,
+            "live_limit": 25,
+            "live_page_size": 10,
+        },
+    )
     monkeypatch.setattr(
         "gateway.channel_directory.load_directory",
         lambda: {
@@ -195,6 +220,8 @@ async def test_feishu_directory_summary_reports_cache_and_live_search(monkeypatc
     assert "Cached targets: 2" in result
     assert "Sources: config=1, live=1" in result
     assert "Accounts: default=1, feishu-cn=1" in result
+    assert "Current account directory policy" in result
+    assert "config_users=True config_groups=False live_users=False live_groups=True limit=25 page_size=10" in result
     assert "Live search fallback: available" in result
 
 

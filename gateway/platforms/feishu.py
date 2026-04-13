@@ -2967,15 +2967,17 @@ class FeishuAdapter(BasePlatformAdapter):
         return extra
 
     def _get_account_live_directory_settings(self, account_id: str) -> Dict[str, Any]:
-        """Return normalized live directory settings for one account.
+        """Return normalized directory settings for one account.
 
-        The gateway keeps config-based directory entries as the stable fallback.
-        Live discovery is optional per account so operators can disable user or
-        group scans when a tenant is very large or when a scope is unavailable.
+        Config-backed entries and live discovery are controlled independently so
+        operators can keep a minimal static directory, disable expensive live
+        scans for large tenants, or run fully config-only routing.
         """
         cfg = self._get_account_directory_config(account_id)
         raw_settings = cfg.get("directory") if isinstance(cfg.get("directory"), dict) else {}
         return {
+            "include_config_users": _coerce_optional_bool(raw_settings.get("include_config_users")),
+            "include_config_groups": _coerce_optional_bool(raw_settings.get("include_config_groups")),
             "include_live_users": _coerce_optional_bool(raw_settings.get("include_live_users")),
             "include_live_groups": _coerce_optional_bool(raw_settings.get("include_live_groups")),
             "live_limit": _coerce_required_int(raw_settings.get("live_limit"), default=50, min_value=1),
@@ -2985,50 +2987,53 @@ class FeishuAdapter(BasePlatformAdapter):
     def _list_config_directory_entries_for_account(self, account_id: str) -> List[FeishuDirectoryEntry]:
         """Enumerate users and groups from static Feishu config for one account."""
         cfg = self._get_account_directory_config(account_id)
+        settings = self._get_account_live_directory_settings(account_id)
         entries: List[FeishuDirectoryEntry] = []
-        user_ids: set[str] = set()
-        for raw_entry in cfg.get("allow_from", []) or []:
-            user_id = str(raw_entry or "").strip()
-            if not user_id or user_id == "*":
-                continue
-            user_ids.add(user_id)
-        for raw_entry in ((cfg.get("dms") or {}) if isinstance(cfg.get("dms"), dict) else {}):
-            user_id = str(raw_entry or "").strip()
-            if user_id:
+        if settings["include_config_users"] is not False:
+            user_ids: set[str] = set()
+            for raw_entry in cfg.get("allow_from", []) or []:
+                user_id = str(raw_entry or "").strip()
+                if not user_id or user_id == "*":
+                    continue
                 user_ids.add(user_id)
-        for user_id in sorted(user_ids):
-            entries.append(
-                FeishuDirectoryEntry(
-                    id=user_id,
-                    name=user_id,
-                    type="dm",
-                    source="config",
-                    account_id=account_id,
+            for raw_entry in ((cfg.get("dms") or {}) if isinstance(cfg.get("dms"), dict) else {}):
+                user_id = str(raw_entry or "").strip()
+                if user_id:
+                    user_ids.add(user_id)
+            for user_id in sorted(user_ids):
+                entries.append(
+                    FeishuDirectoryEntry(
+                        id=user_id,
+                        name=user_id,
+                        type="dm",
+                        source="config",
+                        account_id=account_id,
+                    )
                 )
-            )
 
-        group_ids: set[str] = set()
-        for raw_entry in cfg.get("group_allow_from", []) or []:
-            group_id = str(raw_entry or "").strip()
-            if not group_id or group_id == "*":
-                continue
-            group_ids.add(group_id)
-        raw_groups = cfg.get("groups") or {}
-        if isinstance(raw_groups, dict):
-            for group_id in raw_groups:
-                normalized_group_id = str(group_id or "").strip()
-                if normalized_group_id and normalized_group_id != "*":
-                    group_ids.add(normalized_group_id)
-        for group_id in sorted(group_ids):
-            entries.append(
-                FeishuDirectoryEntry(
-                    id=group_id,
-                    name=group_id,
-                    type="group",
-                    source="config",
-                    account_id=account_id,
+        if settings["include_config_groups"] is not False:
+            group_ids: set[str] = set()
+            for raw_entry in cfg.get("group_allow_from", []) or []:
+                group_id = str(raw_entry or "").strip()
+                if not group_id or group_id == "*":
+                    continue
+                group_ids.add(group_id)
+            raw_groups = cfg.get("groups") or {}
+            if isinstance(raw_groups, dict):
+                for group_id in raw_groups:
+                    normalized_group_id = str(group_id or "").strip()
+                    if normalized_group_id and normalized_group_id != "*":
+                        group_ids.add(normalized_group_id)
+            for group_id in sorted(group_ids):
+                entries.append(
+                    FeishuDirectoryEntry(
+                        id=group_id,
+                        name=group_id,
+                        type="group",
+                        source="config",
+                        account_id=account_id,
+                    )
                 )
-            )
         return entries
 
     def _list_live_directory_entries_for_account(self, account_id: str, limit: int = 50) -> List[FeishuDirectoryEntry]:

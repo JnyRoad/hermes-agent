@@ -329,14 +329,18 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
         from gateway.channel_directory import load_directory
 
         raw_directory_settings = feishu_config.extra.get("directory") if isinstance(feishu_config.extra.get("directory"), dict) else {}
+        include_config_users = raw_directory_settings.get("include_config_users")
+        include_config_groups = raw_directory_settings.get("include_config_groups")
         include_live_users = raw_directory_settings.get("include_live_users")
         include_live_groups = raw_directory_settings.get("include_live_groups")
         live_limit = raw_directory_settings.get("live_limit", 50)
         live_page_size = raw_directory_settings.get("live_page_size", 50)
         _record(
             "info",
-            "Feishu live directory settings",
+            "Feishu directory settings",
             (
+                f"config_users={include_config_users if include_config_users is not None else 'default'} "
+                f"config_groups={include_config_groups if include_config_groups is not None else 'default'} "
                 f"users={include_live_users if include_live_users is not None else 'default'} "
                 f"groups={include_live_groups if include_live_groups is not None else 'default'} "
                 f"limit={live_limit} page_size={live_page_size}"

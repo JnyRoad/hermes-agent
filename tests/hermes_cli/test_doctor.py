@@ -539,6 +539,8 @@ class TestFeishuDoctorChecks:
                         "connection_mode": "webhook",
                         "domain": "feishu",
                         "directory": {
+                            "include_config_users": True,
+                            "include_config_groups": False,
                             "include_live_users": False,
                             "include_live_groups": True,
                             "live_limit": 12,
@@ -600,7 +602,12 @@ class TestFeishuDoctorChecks:
             account_id="feishu-cn",
         )
 
-        assert any(item["label"] == "Feishu live directory settings" for item in report["items"])
+        assert any(item["label"] == "Feishu directory settings" for item in report["items"])
+        assert any(
+            item["label"] == "Feishu directory settings"
+            and "config_users=True config_groups=False users=False groups=True limit=12 page_size=6" in item["detail"]
+            for item in report["items"]
+        )
         assert any(
             item["label"] == "Feishu reply and streaming settings"
             and "reply_mode=card streaming=false block_streaming=true coalesce_ms=850" in item["detail"]
