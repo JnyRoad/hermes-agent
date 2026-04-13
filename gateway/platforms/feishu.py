@@ -2062,6 +2062,20 @@ class FeishuAdapter(BasePlatformAdapter):
                 raw_response={"request_id": state.request_id, "merged": True},
             )
 
+        for state in list(self._pending_oauth_requests.values()):
+            if state.chat_id != chat_id:
+                continue
+            if (state.thread_id or "") != thread_id:
+                continue
+            if account_id and (state.account_id or "") and state.account_id != account_id:
+                continue
+            await self._supersede_auth_request_card(
+                state=state,
+                resolved_account_id=account_id or state.account_id or None,
+                superseded_by_label="a newer requester authorization card",
+            )
+            self._pending_oauth_requests.pop(state.request_id, None)
+
         card = {
             "config": {"wide_screen_mode": True},
             "header": {
@@ -2282,6 +2296,20 @@ class FeishuAdapter(BasePlatformAdapter):
                 raw_response={"request_id": state.request_id, "merged": True},
             )
 
+        for state in list(self._pending_app_scope_requests.values()):
+            if state.chat_id != chat_id:
+                continue
+            if (state.thread_id or "") != thread_id:
+                continue
+            if account_id and (state.account_id or "") and state.account_id != account_id:
+                continue
+            await self._supersede_auth_request_card(
+                state=state,
+                resolved_account_id=account_id or state.account_id or None,
+                superseded_by_label="a newer app-scope authorization card",
+            )
+            self._pending_app_scope_requests.pop(state.request_id, None)
+
         elements: List[Dict[str, Any]] = [
             {
                 "tag": "markdown",
@@ -2489,6 +2517,29 @@ class FeishuAdapter(BasePlatformAdapter):
                 f"{str(getattr(state, 'reason', '') or '').strip()}\n\n"
                 f"**Expired after:** {expired_by_label}\n"
                 "**Status:** this authorization card expired and can no longer continue the action."
+            ),
+            template="grey",
+            account_id=resolved_account_id,
+        )
+
+    async def _supersede_auth_request_card(
+        self,
+        *,
+        state: Any,
+        resolved_account_id: Optional[str],
+        superseded_by_label: str,
+    ) -> None:
+        """Mark an authorization-style card as replaced by a newer request and discard stale replay state."""
+        self._discard_pending_tool_replays(
+            list(_merge_replay_ids(getattr(state, "replay_ids", []), getattr(state, "replay_id", "")))
+        )
+        await self._update_interactive_card(
+            message_id=str(getattr(state, "message_id", "") or ""),
+            title=str(getattr(state, "title", "Feishu Authorization") or "Feishu Authorization"),
+            body_markdown=(
+                f"{str(getattr(state, 'reason', '') or '').strip()}\n\n"
+                f"**Superseded by:** {superseded_by_label}\n"
+                "**Status:** this card was replaced by a newer authorization request in the same conversation."
             ),
             template="grey",
             account_id=resolved_account_id,
