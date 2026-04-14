@@ -318,6 +318,9 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
                         "Feishu runtime transport errors",
                         "; ".join(transport_errors),
                     )
+                    issues.append(
+                        "Resolve Feishu runtime transport errors before relying on live chat delivery or directory refresh"
+                    )
         except Exception as exc:
             _record("warn", "Feishu runtime transport status unavailable", str(exc))
 
@@ -491,6 +494,7 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
             _record("ok", "Feishu app owner detected", owner_open_id)
         else:
             _record("warn", "Feishu app owner unavailable", "owner-only onboarding checks will be limited")
+            issues.append("Resolve Feishu app owner detection before relying on owner-only onboarding")
 
         granted_user_scopes = list(get_app_granted_scopes_by_token_type("user", account_id=resolved_account_id))
         _record("info", f"Feishu user scopes granted: {len(granted_user_scopes)}")
@@ -508,6 +512,25 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
                 "offline_access is not granted, so user authorization flows cannot complete",
             )
             issues.append("Grant offline_access so `/feishu auth batch` and automatic OAuth flows can complete")
+        onboarding_blockers: list[str] = []
+        if not owner_open_id:
+            onboarding_blockers.append("app owner unavailable")
+        if not granted_user_scopes:
+            onboarding_blockers.append("no app-granted user scopes")
+        if granted_scopes and "offline_access" not in set(granted_scopes):
+            onboarding_blockers.append("offline_access missing")
+        if onboarding_blockers:
+            _record(
+                "warn",
+                "Feishu owner onboarding readiness blocked",
+                ", ".join(onboarding_blockers),
+            )
+        else:
+            _record(
+                "ok",
+                "Feishu owner onboarding prerequisites ready",
+                "owner detection, offline_access, and app-granted user scopes are available",
+            )
     except Exception as exc:
         if isinstance(exc, Exception) and exc.__class__.__name__ == "FeishuAPIError" and getattr(exc, "code", None) == 99991672:
             _record("warn", "Unable to query Feishu app scopes", "application:application:self_manage is missing")
@@ -559,6 +582,7 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
                             issues.append("Run `/feishu auth batch` as the app owner to authorize remaining user scopes")
                 else:
                     _record("info", "Current user is not the Feishu app owner", owner_open_id)
+                    issues.append("Ask the Feishu app owner to run `/feishu auth batch` if owner-only onboarding is required")
         except Exception as exc:
             _record("warn", "Feishu owner diagnostics unavailable", str(exc))
 

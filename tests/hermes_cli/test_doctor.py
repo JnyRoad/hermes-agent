@@ -473,7 +473,10 @@ class TestFeishuDoctorChecks:
         )
         monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
         monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
-        monkeypatch.setattr("tools.feishu.client.get_app_granted_scopes", lambda: ["application:application:self_manage"])
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes",
+            lambda: ["application:application:self_manage", "offline_access"],
+        )
         monkeypatch.setattr(
             "tools.feishu.client.get_app_info",
             lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
@@ -494,6 +497,7 @@ class TestFeishuDoctorChecks:
         )
 
         assert any(item["label"] == "Current user is Feishu app owner" for item in report["items"])
+        assert any(item["label"] == "Feishu owner onboarding prerequisites ready" for item in report["items"])
         assert any(item["label"] == "Owner batch authorization recommended" for item in report["items"])
         assert any("/feishu auth batch" in issue for issue in report["issues"])
 
@@ -526,6 +530,7 @@ class TestFeishuDoctorChecks:
         report = doctor.collect_feishu_doctor_report(user_open_id="ou_owner", account_id="feishu-cn")
 
         assert any(item["label"] == "Feishu OAuth prerequisite missing" for item in report["items"])
+        assert any(item["label"] == "Feishu owner onboarding readiness blocked" for item in report["items"])
         assert any("offline_access" in issue for issue in report["issues"])
 
     def test_collect_report_warns_when_app_has_no_granted_user_scopes(self, monkeypatch):
@@ -562,6 +567,7 @@ class TestFeishuDoctorChecks:
         report = doctor.collect_feishu_doctor_report(user_open_id="ou_owner", account_id="feishu-cn")
 
         assert any(item["label"] == "Feishu user scopes not granted to app yet" for item in report["items"])
+        assert any(item["label"] == "Feishu owner onboarding readiness blocked" for item in report["items"])
         assert any("Grant the required Feishu user scopes first" in issue for issue in report["issues"])
 
     def test_collect_report_warns_missing_required_app_scopes(self, monkeypatch):
@@ -719,6 +725,10 @@ class TestFeishuDoctorChecks:
             and "feishu-cn=ws worker failed" in item["detail"]
             for item in report["items"]
         )
+        assert any(
+            "Resolve Feishu runtime transport errors before relying on live chat delivery or directory refresh" in issue
+            for issue in report["issues"]
+        )
         assert any(item["label"] == "Feishu cached directory targets: 3" for item in report["items"])
         assert any(item["label"] == "Feishu cached directory accounts" for item in report["items"])
         assert any(item["label"] == "Feishu live directory search fallback available" for item in report["items"])
@@ -817,6 +827,86 @@ class TestFeishuDoctorChecks:
         assert any(item["label"] == "Feishu directory policy (feishu-cn)" for item in report["items"])
         assert any(item["label"] == "Feishu directory disabled for account (feishu-cn)" for item in report["items"])
         assert any("Enable at least one Feishu directory source for account `feishu-cn`" in issue for issue in report["issues"])
+
+    def test_collect_report_warns_when_owner_detection_is_unavailable(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes",
+            lambda: ["application:application:self_manage", "offline_access"],
+        )
+        monkeypatch.setattr("tools.feishu.client.get_app_info", lambda account_id=None: {})
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes_by_token_type",
+            lambda token_type, account_id=None: ["im:chat:read"],
+        )
+
+        report = doctor.collect_feishu_doctor_report(user_open_id="ou_user", account_id="feishu-cn")
+
+        assert any(item["label"] == "Feishu app owner unavailable" for item in report["items"])
+        assert any(item["label"] == "Feishu owner onboarding readiness blocked" for item in report["items"])
+        assert any(
+            "Resolve Feishu app owner detection before relying on owner-only onboarding" in issue
+            for issue in report["issues"]
+        )
+
+    def test_collect_report_tells_non_owner_to_ask_owner_for_batch_auth(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes",
+            lambda: ["application:application:self_manage", "offline_access"],
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_info",
+            lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes_by_token_type",
+            lambda token_type, account_id=None: ["im:chat:read", "task:task:read"],
+        )
+
+        class _Adapter:
+            def get_authorization_status(self, user_open_id, scopes=None, account_id=None):
+                return {"authorized": False, "granted_scopes": []}
+
+        report = doctor.collect_feishu_doctor_report(
+            user_open_id="ou_user",
+            adapter=_Adapter(),
+            account_id="feishu-cn",
+        )
+
+        assert any(item["label"] == "Current user is not the Feishu app owner" for item in report["items"])
+        assert any(
+            "Ask the Feishu app owner to run `/feishu auth batch` if owner-only onboarding is required" in issue
+            for issue in report["issues"]
+        )
 
 
 def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):
