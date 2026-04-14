@@ -233,7 +233,13 @@ class TestFeishuApprovalCallback:
             await adapter._handle_card_action_event(data)
 
         mock_resolve.assert_called_once_with("agent:main:feishu:group:oc_12345", "once")
-        mock_update.assert_called_once_with("msg_001", "Approved once", "Norbert", "once")
+        mock_update.assert_called_once_with(
+            "msg_001",
+            "Approved once",
+            "Norbert",
+            "once",
+            account_id=None,
+        )
 
         # State should be cleaned up
         assert 1 not in adapter._approval_state
@@ -263,7 +269,13 @@ class TestFeishuApprovalCallback:
             await adapter._handle_card_action_event(data)
 
         mock_resolve.assert_called_once_with("some-session", "deny")
-        mock_update.assert_called_once_with("msg_002", "Denied", "Alice", "deny")
+        mock_update.assert_called_once_with(
+            "msg_002",
+            "Denied",
+            "Alice",
+            "deny",
+            account_id=None,
+        )
 
     @pytest.mark.asyncio
     async def test_session_approval(self):
@@ -290,7 +302,13 @@ class TestFeishuApprovalCallback:
             await adapter._handle_card_action_event(data)
 
         mock_resolve.assert_called_once_with("sess-3", "session")
-        mock_update.assert_called_once_with("msg_003", "Approved for session", "Bob", "session")
+        mock_update.assert_called_once_with(
+            "msg_003",
+            "Approved for session",
+            "Bob",
+            "session",
+            account_id=None,
+        )
 
     @pytest.mark.asyncio
     async def test_always_approval(self):
@@ -333,6 +351,40 @@ class TestFeishuApprovalCallback:
 
         # Should NOT resolve — already handled
         mock_resolve.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_card_action_token_is_dropped(self):
+        adapter = _make_adapter()
+        adapter._approval_state[5] = {
+            "session_key": "sess-5",
+            "message_id": "msg_005",
+            "chat_id": "oc_12345",
+        }
+
+        data = _make_card_action_data(
+            action_value={"hermes_action": "approve_once", "approval_id": 5},
+            token="tok_dup",
+        )
+
+        with (
+            patch.object(
+                adapter, "_resolve_sender_profile", new_callable=AsyncMock,
+                return_value={"user_id": "ou_user1", "user_name": "Norbert", "user_id_alt": None},
+            ),
+            patch.object(adapter, "_update_approval_card", new_callable=AsyncMock) as mock_update,
+            patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve,
+        ):
+            await adapter._handle_card_action_event(data)
+            await adapter._handle_card_action_event(data)
+
+        mock_resolve.assert_called_once_with("sess-5", "once")
+        mock_update.assert_called_once_with(
+            "msg_005",
+            "Approved once",
+            "Norbert",
+            "once",
+            account_id=None,
+        )
 
     @pytest.mark.asyncio
     async def test_non_approval_actions_route_normally(self):
@@ -397,6 +449,27 @@ class TestFeishuUpdateApprovalCard:
             )
 
         mock_thread.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_updates_card_with_secondary_account_client(self):
+        adapter = _make_adapter()
+        secondary_client = MagicMock()
+        adapter._clients_by_account = {
+            "default": adapter._client,
+            "feishu-cn": secondary_client,
+        }
+
+        with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
+            await adapter._update_approval_card(
+                "msg_002",
+                "Denied",
+                "Alice",
+                "deny",
+                account_id="feishu-cn",
+            )
+
+        mock_thread.assert_called_once()
+        assert mock_thread.call_args[0][0] == secondary_client.im.v1.message.update
 
     @pytest.mark.asyncio
     async def test_skips_update_when_not_connected(self):

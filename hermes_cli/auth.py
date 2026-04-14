@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import ssl
 import shutil
 import shlex
 import stat
@@ -1563,7 +1564,7 @@ def _resolve_verify(
     insecure: Optional[bool] = None,
     ca_bundle: Optional[str] = None,
     auth_state: Optional[Dict[str, Any]] = None,
-) -> bool | str:
+) -> bool | ssl.SSLContext:
     tls_state = auth_state.get("tls") if isinstance(auth_state, dict) else {}
     tls_state = tls_state if isinstance(tls_state, dict) else {}
 
@@ -1589,7 +1590,8 @@ def _resolve_verify(
                 ca_path,
             )
             return True
-        return ca_path
+        # httpx 已弃用 verify=<str>，这里显式构造 SSLContext 以兼容未来版本。
+        return ssl.create_default_context(cafile=ca_path)
     return True
 
 

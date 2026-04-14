@@ -958,11 +958,25 @@ class MatrixAdapter(BasePlatformAdapter):
                 sync_data = await client.sync(
                     since=next_batch, timeout=30000,
                 )
+                try:
+                    from nio import SyncError  # type: ignore
+                except Exception:
+                    SyncError = None  # type: ignore[assignment]
+
+                # 一些 nio 错误不是抛异常，而是作为返回值传回。认证失效时必须
+                # 立即停止同步，否则会在测试和真实运行中进入无意义的重试循环。
+                if SyncError is not None and isinstance(sync_data, SyncError):
+                    message = getattr(sync_data, "message", "") or str(sync_data)
+                    err_str = message.lower()
+                    if "m_unknown_token" in err_str or "401" in err_str or "403" in err_str:
+                        logger.error("Matrix: permanent auth error: %s — stopping sync", message)
+                        return
+                    raise RuntimeError(message or "Matrix sync error")
                 if isinstance(sync_data, dict):
                     # Update joined rooms from sync response.
                     rooms_join = sync_data.get("rooms", {}).get("join", {})
                     if rooms_join:
-                        self._joined_rooms.update(rooms_join.keys())
+                        getattr(self, "_joined_rooms", set()).update(rooms_join.keys())
 
                     # Advance the sync token so the next request is
                     # incremental instead of a full initial sync.
@@ -981,7 +995,7 @@ class MatrixAdapter(BasePlatformAdapter):
                         logger.warning("Matrix: sync event dispatch error: %s", exc)
 
                 # Retry any buffered undecrypted events.
-                if self._pending_megolm:
+                if getattr(self, "_pending_megolm", None):
                     await self._retry_pending_decryptions()
 
             except asyncio.CancelledError:

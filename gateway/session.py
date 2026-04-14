@@ -82,6 +82,7 @@ class SessionSource:
     chat_topic: Optional[str] = None  # Channel topic/description (Discord, Slack)
     user_id_alt: Optional[str] = None  # Signal UUID (alternative to phone number)
     chat_id_alt: Optional[str] = None  # Signal group internal ID
+    account_id: Optional[str] = None  # Platform-specific account/bot identity for multi-account adapters
     
     @property
     def description(self) -> str:
@@ -119,6 +120,8 @@ class SessionSource:
             d["user_id_alt"] = self.user_id_alt
         if self.chat_id_alt:
             d["chat_id_alt"] = self.chat_id_alt
+        if self.account_id:
+            d["account_id"] = self.account_id
         return d
     
     @classmethod
@@ -134,6 +137,7 @@ class SessionSource:
             chat_topic=data.get("chat_topic"),
             user_id_alt=data.get("user_id_alt"),
             chat_id_alt=data.get("chat_id_alt"),
+            account_id=data.get("account_id"),
         )
     
 

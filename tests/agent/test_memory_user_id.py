@@ -56,6 +56,13 @@ class RecordingProvider(MemoryProvider):
         pass
 
 
+class BuiltinRecordingProvider(RecordingProvider):
+    """模拟内置记忆提供者，验证 builtin + external 并存路径。"""
+
+    def __init__(self):
+        super().__init__("builtin")
+
+
 # ---------------------------------------------------------------------------
 # MemoryManager user_id threading tests
 # ---------------------------------------------------------------------------
@@ -109,11 +116,9 @@ class TestMemoryManagerUserIdThreading:
         assert "user_id" not in p._init_kwargs
 
     def test_multiple_providers_all_receive_user_id(self):
-        from agent.builtin_memory_provider import BuiltinMemoryProvider
-
         mgr = MemoryManager()
         # Use builtin + one external (MemoryManager only allows one external)
-        builtin = BuiltinMemoryProvider()
+        builtin = BuiltinRecordingProvider()
         ext = RecordingProvider("external")
         mgr.add_provider(builtin)
         mgr.add_provider(ext)
@@ -208,10 +213,10 @@ class TestMem0UserIdScoping:
 
 
 class TestHonchoUserIdScoping:
-    """Verify Honcho plugin uses gateway user_id for peer_name when provided."""
+    """Verify Honcho plugin uses gateway user_id as fallback scoping only."""
 
-    def test_gateway_user_id_overrides_peer_name(self):
-        """When user_id is in kwargs, cfg.peer_name should be overridden."""
+    def test_explicit_peer_name_is_preserved(self):
+        """显式 peer_name 属于用户配置，不能被 gateway user_id 覆盖。"""
         from plugins.memory.honcho import HonchoMemoryProvider
 
         provider = HonchoMemoryProvider()
@@ -234,7 +239,31 @@ class TestHonchoUserIdScoping:
                 platform="discord",
             )
 
-        # The config's peer_name should have been overridden with the user_id
+        assert mock_cfg.peer_name == "static-user"
+
+    def test_gateway_user_id_used_when_peer_name_missing(self):
+        """When peer_name is missing, gateway user_id should become the scoping identity."""
+        from plugins.memory.honcho import HonchoMemoryProvider
+
+        provider = HonchoMemoryProvider()
+
+        mock_cfg = MagicMock()
+        mock_cfg.enabled = True
+        mock_cfg.api_key = "test-key"
+        mock_cfg.base_url = None
+        mock_cfg.peer_name = None
+        mock_cfg.recall_mode = "tools"
+
+        with patch(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            return_value=mock_cfg,
+        ):
+            provider.initialize(
+                session_id="test-sess",
+                user_id="discord_user_789",
+                platform="discord",
+            )
+
         assert mock_cfg.peer_name == "discord_user_789"
 
     def test_no_user_id_preserves_config_peer_name(self):

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from gateway.config import Platform
 from tools.send_message_tool import (
     _parse_target_ref,
+    _split_feishu_account_target,
     _send_discord,
     _send_telegram,
     _send_to_platform,
@@ -63,6 +64,11 @@ def _ensure_slack_mock(monkeypatch):
 
 
 class TestSendMessageTool:
+    def test_split_feishu_account_target(self):
+        chat_id, account_id = _split_feishu_account_target("feishu-cn::oc_chat_123")
+        assert chat_id == "oc_chat_123"
+        assert account_id == "feishu-cn"
+
     def test_cron_duplicate_target_is_skipped_and_explained(self):
         home = SimpleNamespace(chat_id="-1001")
         config, _telegram_cfg = _make_config()
@@ -209,7 +215,10 @@ class TestSendMessageTool:
 
         with patch("gateway.config.load_gateway_config", return_value=config), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
-             patch("gateway.channel_directory.resolve_channel_name", return_value="-1001:17585"), \
+             patch(
+                 "gateway.channel_directory.explain_channel_name_resolution",
+                 return_value={"status": "resolved", "resolved_id": "-1001:17585", "source": "cache", "suggestions": []},
+             ), \
              patch("model_tools._run_async", side_effect=_run_async_immediately), \
              patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
              patch("gateway.mirror.mirror_to_session", return_value=True):
@@ -231,6 +240,39 @@ class TestSendMessageTool:
             "hello",
             thread_id="17585",
             media_files=[],
+        )
+
+    def test_send_feishu_account_qualified_target_passes_account_id(self):
+        feishu_cfg = SimpleNamespace(enabled=True, token="", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.FEISHU: feishu_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "feishu:feishu-cn::oc_chat_123",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.FEISHU,
+            feishu_cfg,
+            "oc_chat_123",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            account_id="feishu-cn",
         )
 
     def test_display_label_target_resolves_via_channel_directory(self, tmp_path):
@@ -270,6 +312,286 @@ class TestSendMessageTool:
             thread_id="17585",
             media_files=[],
         )
+
+    def test_feishu_target_resolves_via_live_directory_search_when_cache_misses(self, tmp_path):
+        feishu_cfg = SimpleNamespace(enabled=True, token="", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.FEISHU: feishu_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({"updated_at": "2026-01-01T00:00:00", "platforms": {"feishu": []}}))
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch(
+                 "gateway.channel_directory.explain_channel_name_resolution",
+                 return_value={
+                     "status": "resolved",
+                     "resolved_id": "feishu-cn::oc_backend",
+                     "source": "live_search",
+                     "suggestions": [],
+                 },
+             ), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "feishu:Backend Guild (group)",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.FEISHU,
+            feishu_cfg,
+            "oc_backend",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            account_id="feishu-cn",
+        )
+
+    def test_feishu_target_resolution_prefers_home_channel_account(self, tmp_path):
+        feishu_cfg = SimpleNamespace(enabled=True, token="", extra={})
+        home = SimpleNamespace(chat_id="feishu-cn::oc_home")
+        config = SimpleNamespace(
+            platforms={Platform.FEISHU: feishu_cfg},
+            get_home_channel=lambda _platform: home,
+        )
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({"updated_at": "2026-01-01T00:00:00", "platforms": {"feishu": []}}))
+        captured = {}
+
+        def _explain(platform_name, name, preferred_account_id=None, preferred_target_ids=None):
+            captured["platform_name"] = platform_name
+            captured["name"] = name
+            captured["preferred_account_id"] = preferred_account_id
+            captured["preferred_target_ids"] = preferred_target_ids
+            return {
+                "status": "resolved",
+                "resolved_id": "feishu-cn::oc_backend",
+                "source": "cache",
+                "preferred_account_id": preferred_account_id,
+                "suggestions": [],
+            }
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("tools.send_message_tool._RECENT_SEND_TARGETS_PATH", tmp_path / "recent_send_targets.json"), \
+             patch("gateway.channel_directory.explain_channel_name_resolution", side_effect=_explain), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "feishu:Backend",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert captured["preferred_account_id"] == "feishu-cn"
+        assert captured["preferred_target_ids"] == ["feishu-cn::oc_home"]
+        send_mock.assert_awaited_once_with(
+            Platform.FEISHU,
+            feishu_cfg,
+            "oc_backend",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            account_id="feishu-cn",
+        )
+
+    def test_feishu_target_resolution_falls_back_to_default_account(self, tmp_path):
+        feishu_cfg = SimpleNamespace(enabled=True, token="", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.FEISHU: feishu_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({"updated_at": "2026-01-01T00:00:00", "platforms": {"feishu": []}}))
+        captured = {}
+
+        def _explain(platform_name, name, preferred_account_id=None, preferred_target_ids=None):
+            captured["preferred_account_id"] = preferred_account_id
+            captured["preferred_target_ids"] = preferred_target_ids
+            return {
+                "status": "resolved",
+                "resolved_id": "oc_backend",
+                "source": "cache",
+                "preferred_account_id": preferred_account_id,
+                "suggestions": [],
+            }
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("tools.send_message_tool._RECENT_SEND_TARGETS_PATH", tmp_path / "recent_send_targets.json"), \
+             patch("gateway.channel_directory.explain_channel_name_resolution", side_effect=_explain), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "feishu:Backend",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert captured["preferred_account_id"] == "default"
+        assert captured["preferred_target_ids"] == []
+        send_mock.assert_awaited_once_with(
+            Platform.FEISHU,
+            feishu_cfg,
+            "oc_backend",
+            "hello",
+            thread_id=None,
+            media_files=[],
+        )
+
+    def test_feishu_target_resolution_includes_recent_successful_targets(self, tmp_path):
+        feishu_cfg = SimpleNamespace(enabled=True, token="", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.FEISHU: feishu_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({"updated_at": "2026-01-01T00:00:00", "platforms": {"feishu": []}}))
+        recent_targets_file = tmp_path / "recent_send_targets.json"
+        recent_targets_file.write_text(json.dumps({
+            "platforms": {
+                "feishu": [
+                    {"id": "feishu-cn::oc_recent", "updated_at": "2026-01-02T00:00:00+00:00"},
+                    {"id": "oc_default", "updated_at": "2026-01-01T00:00:00+00:00"},
+                ]
+            }
+        }))
+        captured = {}
+
+        def _explain(platform_name, name, preferred_account_id=None, preferred_target_ids=None):
+            captured["preferred_account_id"] = preferred_account_id
+            captured["preferred_target_ids"] = preferred_target_ids
+            return {
+                "status": "resolved",
+                "resolved_id": "feishu-cn::oc_recent",
+                "source": "cache",
+                "preferred_account_id": preferred_account_id,
+                "suggestions": [],
+            }
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("tools.send_message_tool._RECENT_SEND_TARGETS_PATH", recent_targets_file), \
+             patch("gateway.channel_directory.explain_channel_name_resolution", side_effect=_explain), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "feishu:Backend",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert captured["preferred_account_id"] == "default"
+        assert captured["preferred_target_ids"] == ["feishu-cn::oc_recent", "oc_default"]
+        send_mock.assert_awaited_once_with(
+            Platform.FEISHU,
+            feishu_cfg,
+            "oc_recent",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            account_id="feishu-cn",
+        )
+
+    def test_successful_feishu_send_records_recent_target(self, tmp_path):
+        feishu_cfg = SimpleNamespace(enabled=True, token="", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.FEISHU: feishu_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        recent_targets_file = tmp_path / "recent_send_targets.json"
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}), \
+             patch("tools.send_message_tool._RECENT_SEND_TARGETS_PATH", recent_targets_file), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "feishu:feishu-cn::oc_chat_123",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        payload = json.loads(recent_targets_file.read_text())
+        assert payload["platforms"]["feishu"][0]["id"] == "feishu-cn::oc_chat_123"
+
+    def test_feishu_ambiguous_target_returns_candidates(self, tmp_path):
+        feishu_cfg = SimpleNamespace(enabled=True, token="", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.FEISHU: feishu_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({"updated_at": "2026-01-01T00:00:00", "platforms": {"feishu": []}}))
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch(
+                 "gateway.channel_directory.explain_channel_name_resolution",
+                 return_value={
+                     "status": "ambiguous",
+                     "resolved_id": None,
+                     "source": "live_search",
+                     "suggestions": [
+                         {"label": "Backend Guild (group)", "reason": "exact name match, config-backed, group target"},
+                         {"label": "feishu-cn/Backend Ops (group)", "reason": "prefix name match, preferred account, live directory, group target"},
+                     ],
+                 },
+             ), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "feishu:Backend",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert "ambiguous" in result["error"]
+        assert "Backend Guild (group)" in result["error"]
+        assert "feishu-cn/Backend Ops (group)" in result["error"]
+        assert "config-backed, group target" in result["error"]
 
     def test_media_only_message_uses_placeholder_for_mirroring(self):
         config, telegram_cfg = _make_config()
@@ -749,6 +1071,22 @@ class TestParseTargetRefDiscord:
         chat_id, thread_id, is_explicit = _parse_target_ref("discord", "  123456:789  ")
         assert chat_id == "123456"
         assert thread_id == "789"
+        assert is_explicit is True
+
+
+class TestParseTargetRefFeishu:
+    """_parse_target_ref keeps Feishu account-qualified IDs intact."""
+
+    def test_feishu_chat_id_with_account_prefix(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("feishu", "feishu-cn::oc_chat_123")
+        assert chat_id == "feishu-cn::oc_chat_123"
+        assert thread_id is None
+        assert is_explicit is True
+
+    def test_feishu_chat_id_with_account_prefix_and_thread(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("feishu", "feishu-cn::oc_chat_123:thr_1")
+        assert chat_id == "feishu-cn::oc_chat_123"
+        assert thread_id == "thr_1"
         assert is_explicit is True
 
 

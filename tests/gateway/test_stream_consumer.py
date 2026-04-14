@@ -128,6 +128,27 @@ class TestSendOrEditMediaStripping:
         assert "MEDIA:" not in edited_text
 
     @pytest.mark.asyncio
+    async def test_edit_forwards_metadata_when_adapter_supports_it(self):
+        """Streaming edits must preserve adapter metadata for thread/account-aware platforms."""
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="msg_1")
+        edit_result = SimpleNamespace(success=True)
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        async def _edit_message(*, chat_id, message_id, content, metadata=None):
+            return edit_result
+
+        adapter.edit_message = AsyncMock(side_effect=_edit_message)
+
+        metadata = {"thread_id": "omt-thread", "account_id": "feishu-cn"}
+        consumer = GatewayStreamConsumer(adapter, "chat_123", metadata=metadata)
+        await consumer._send_or_edit("Starting response...")
+        await consumer._send_or_edit("Updated response")
+
+        assert adapter.edit_message.call_args.kwargs["metadata"] == metadata
+
+    @pytest.mark.asyncio
     async def test_media_only_skips_send(self):
         """If text is entirely MEDIA: tags, the send is skipped."""
         adapter = MagicMock()
@@ -370,6 +391,64 @@ class TestSegmentBreakOnToolBoundary:
         assert "Hello" in first_text
         assert second_text.strip() == "world"
         assert consumer.already_sent
+
+    @pytest.mark.asyncio
+    async def test_edit_exception_sends_only_unsent_tail_at_finish(self):
+        """An edit exception should enter the same final-tail fallback mode."""
+        adapter = MagicMock()
+        send_results = [
+            SimpleNamespace(success=True, message_id="msg_1"),
+            SimpleNamespace(success=True, message_id="msg_2"),
+        ]
+        adapter.send = AsyncMock(side_effect=send_results)
+        adapter.edit_message = AsyncMock(side_effect=RuntimeError("edit exploded"))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer.on_delta("Hello")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.08)
+        consumer.on_delta(" world")
+        await asyncio.sleep(0.08)
+        consumer.finish()
+        await task
+
+        assert adapter.send.call_count == 2
+        first_text = adapter.send.call_args_list[0][1]["content"]
+        second_text = adapter.send.call_args_list[1][1]["content"]
+        assert "Hello" in first_text
+        assert second_text.strip() == "world"
+        assert consumer.already_sent
+
+    @pytest.mark.asyncio
+    async def test_fallback_final_exception_restores_normal_final_send_path(self):
+        """If no fallback chunk reaches the user, the normal gateway final send should remain allowed."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            side_effect=[
+                SimpleNamespace(success=True, message_id="msg_1"),
+                RuntimeError("send exploded"),
+            ]
+        )
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=False, error="flood_control:6"))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer.on_delta("Hello")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.08)
+        consumer.on_delta(" world")
+        await asyncio.sleep(0.08)
+        consumer.finish()
+        await task
+
+        assert adapter.send.call_count == 2
+        assert consumer.already_sent is False
+        assert consumer._message_id is None
 
     @pytest.mark.asyncio
     async def test_segment_break_clears_failed_edit_fallback_state(self):

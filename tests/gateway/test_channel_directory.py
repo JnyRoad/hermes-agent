@@ -5,8 +5,10 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
+from gateway.config import Platform
 from gateway.channel_directory import (
     build_channel_directory,
+    explain_channel_name_resolution,
     resolve_channel_name,
     format_directory_for_display,
     load_directory,
@@ -66,6 +68,26 @@ class TestBuildChannelDirectoryWrites:
 
         assert result == previous
 
+    def test_feishu_uses_native_directory_builder(self, tmp_path):
+        class _Adapter:
+            def build_channel_directory_entries(self, include_live=True):
+                assert include_live is True
+                return [
+                    {"id": "ou_live_1", "name": "Alice", "type": "dm", "source": "live"},
+                    {"id": "feishu-cn::oc_chat_1", "name": "Hermes Group", "type": "group", "source": "live", "account_id": "feishu-cn"},
+                ]
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}), patch(
+            "gateway.channel_directory.DIRECTORY_PATH",
+            tmp_path / "channel_directory.json",
+        ):
+            result = build_channel_directory({Platform.FEISHU: _Adapter()})
+
+        assert result["platforms"]["feishu"] == [
+            {"id": "ou_live_1", "name": "Alice", "type": "dm", "source": "live"},
+            {"id": "feishu-cn::oc_chat_1", "name": "Hermes Group", "type": "group", "source": "live", "account_id": "feishu-cn"},
+        ]
+
 
 class TestResolveChannelName:
     def _setup(self, tmp_path, platforms):
@@ -123,6 +145,155 @@ class TestResolveChannelName:
         with self._setup(tmp_path, platforms):
             assert resolve_channel_name("slack", "eng") is None
 
+    def test_explain_resolution_reports_ambiguous_candidates(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "oc_1", "name": "Backend Guild", "type": "group", "account_id": "default"},
+                {"id": "feishu-cn::oc_2", "name": "Backend Ops", "type": "group", "account_id": "feishu-cn"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            result = explain_channel_name_resolution("feishu", "Backend")
+
+        assert result["status"] == "ambiguous"
+        assert result["resolved_id"] is None
+        assert [item["label"] for item in result["suggestions"]] == [
+            "Backend Guild (group)",
+            "feishu-cn/Backend Ops (group)",
+        ]
+
+    def test_feishu_preferred_account_resolves_duplicate_name(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "oc_default", "name": "Backend", "type": "group", "account_id": "default"},
+                {"id": "feishu-cn::oc_cn", "name": "Backend", "type": "group", "account_id": "feishu-cn"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            result = explain_channel_name_resolution("feishu", "Backend", preferred_account_id="feishu-cn")
+
+        assert result["status"] == "resolved"
+        assert result["resolved_id"] == "feishu-cn::oc_cn"
+        assert result["preferred_account_id"] == "feishu-cn"
+
+    def test_feishu_preferred_account_keeps_ambiguous_without_unique_match(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "feishu-cn::oc_1", "name": "Backend", "type": "group", "account_id": "feishu-cn"},
+                {"id": "feishu-cn::oc_2", "name": "Backend", "type": "group", "account_id": "feishu-cn"},
+                {"id": "oc_default", "name": "Backend", "type": "group", "account_id": "default"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            result = explain_channel_name_resolution("feishu", "Backend", preferred_account_id="feishu-cn")
+
+        assert result["status"] == "ambiguous"
+        assert result["resolved_id"] is None
+
+    def test_feishu_ambiguity_suggestions_rank_preferred_account_first(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "oc_default", "name": "Backend", "type": "group", "account_id": "default", "source": "config"},
+                {"id": "feishu-cn::oc_cn", "name": "Backend", "type": "group", "account_id": "feishu-cn", "source": "live"},
+                {"id": "feishu-cn::oc_prefix", "name": "Backend Ops", "type": "group", "account_id": "feishu-cn", "source": "live"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            result = explain_channel_name_resolution("feishu", "Backend", preferred_account_id="feishu-cn")
+
+        assert result["status"] == "resolved"
+        assert result["resolved_id"] == "feishu-cn::oc_cn"
+
+    def test_feishu_ambiguity_suggestions_include_reason_and_sorting(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "oc_default", "name": "Backend", "type": "group", "account_id": "default", "source": "config"},
+                {"id": "feishu-cn::oc_1", "name": "Backend", "type": "group", "account_id": "feishu-cn", "source": "live"},
+                {"id": "feishu-cn::oc_2", "name": "Backend", "type": "group", "account_id": "feishu-cn", "source": "live_search"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            result = explain_channel_name_resolution("feishu", "Backend", preferred_account_id="feishu-cn")
+
+        assert result["status"] == "ambiguous"
+        assert [item["id"] for item in result["suggestions"]] == [
+            "feishu-cn::oc_1",
+            "feishu-cn::oc_2",
+            "oc_default",
+        ]
+        assert result["suggestions"][0]["reason"] == "exact name match, preferred account, live directory, group target"
+        assert result["suggestions"][2]["reason"] == "exact name match, config-backed, group target"
+
+    def test_feishu_group_targets_rank_ahead_of_dm_targets(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "ou_alice", "name": "Backend", "type": "dm", "account_id": "default", "source": "config"},
+                {"id": "oc_backend", "name": "Backend", "type": "group", "account_id": "default", "source": "config"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            result = explain_channel_name_resolution("feishu", "Backend")
+
+        assert result["status"] == "ambiguous"
+        assert [item["id"] for item in result["suggestions"]] == ["oc_backend", "ou_alice"]
+        assert result["suggestions"][0]["reason"] == "exact name match, config-backed, group target"
+        assert result["suggestions"][1]["reason"] == "exact name match, config-backed, dm target"
+
+    def test_feishu_preferred_target_ranks_first_in_ambiguity(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "oc_home", "name": "Backend", "type": "group", "account_id": "default", "source": "config"},
+                {"id": "oc_other", "name": "Backend", "type": "group", "account_id": "default", "source": "config"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            result = explain_channel_name_resolution(
+                "feishu",
+                "Backend",
+                preferred_target_ids=["oc_other"],
+            )
+
+        assert result["status"] == "ambiguous"
+        assert [item["id"] for item in result["suggestions"]] == ["oc_other", "oc_home"]
+        assert result["suggestions"][0]["reason"] == "exact name match, preferred target, config-backed, group target"
+
+    def test_feishu_recent_session_ranks_ahead_of_non_recent_target(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "oc_recent", "name": "Backend", "type": "group", "account_id": "default", "source": "live"},
+                {"id": "oc_other", "name": "Backend", "type": "group", "account_id": "default", "source": "live"},
+            ]
+        }
+        with self._setup(tmp_path, platforms), patch(
+            "gateway.channel_directory._load_recent_session_target_ids",
+            return_value=["oc_recent", "oc_other"],
+        ):
+            result = explain_channel_name_resolution("feishu", "Backend")
+
+        assert result["status"] == "ambiguous"
+        assert [item["id"] for item in result["suggestions"]] == ["oc_recent", "oc_other"]
+        assert result["suggestions"][0]["reason"] == "exact name match, recent session, live directory, group target"
+
+    def test_feishu_recent_successful_send_ranks_ahead_of_recent_session(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "oc_sent", "name": "Backend", "type": "group", "account_id": "default", "source": "live"},
+                {"id": "oc_recent", "name": "Backend", "type": "group", "account_id": "default", "source": "live"},
+            ]
+        }
+        with self._setup(tmp_path, platforms), patch(
+            "gateway.channel_directory._load_recent_successful_target_ids",
+            return_value=["oc_sent"],
+        ), patch(
+            "gateway.channel_directory._load_recent_session_target_ids",
+            return_value=["oc_recent"],
+        ):
+            result = explain_channel_name_resolution("feishu", "Backend")
+
+        assert result["status"] == "ambiguous"
+        assert [item["id"] for item in result["suggestions"]] == ["oc_sent", "oc_recent"]
+        assert result["suggestions"][0]["reason"] == "exact name match, recent successful send, live directory, group target"
+
     def test_no_channels_returns_none(self, tmp_path):
         with self._setup(tmp_path, {}):
             assert resolve_channel_name("telegram", "someone") is None
@@ -153,6 +324,17 @@ class TestResolveChannelName:
             assert resolve_channel_name("telegram", "Alice (dm)") == "123"
             assert resolve_channel_name("telegram", "Dev Group (group)") == "456"
             assert resolve_channel_name("telegram", "Coaching Chat / topic 17585 (group)") == "-1001:17585"
+
+    def test_feishu_account_qualified_label_resolves(self, tmp_path):
+        platforms = {
+            "feishu": [
+                {"id": "ou_alice", "name": "Alice", "type": "dm", "account_id": "default"},
+                {"id": "feishu-cn::ou_bob", "name": "Bob", "type": "dm", "account_id": "feishu-cn"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            assert resolve_channel_name("feishu", "Alice (dm)") == "ou_alice"
+            assert resolve_channel_name("feishu", "feishu-cn/Bob (dm)") == "feishu-cn::ou_bob"
 
 
 class TestBuildFromSessions:

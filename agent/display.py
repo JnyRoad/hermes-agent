@@ -138,7 +138,8 @@ def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
     Resolution order:
     1. Active skin's ``tool_emojis`` overrides (if a skin is loaded)
     2. Tool registry's per-tool ``emoji`` field
-    3. *default* fallback
+    3. 内置稳定回退，避免测试或轻量运行时因未触发工具发现而漂移
+    4. *default* fallback
     """
     # 1. Skin override
     skin = _get_skin()
@@ -154,7 +155,15 @@ def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
             return emoji
     except Exception:
         pass
-    # 3. Hardcoded fallback
+    # 3. Stable fallback for core tools that appear in progress UI before
+    # tool discovery necessarily runs.
+    fallback_emojis = {
+        "terminal": "💻",
+    }
+    emoji = fallback_emojis.get(tool_name)
+    if emoji:
+        return emoji
+    # 4. Hardcoded fallback
     return default
 
 

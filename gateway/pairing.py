@@ -43,7 +43,14 @@ LOCKOUT_SECONDS = 3600              # Lockout duration after too many failures
 MAX_PENDING_PER_PLATFORM = 3        # Max pending codes per platform
 MAX_FAILED_ATTEMPTS = 5             # Failed approvals before lockout
 
-PAIRING_DIR = get_hermes_dir("platforms/pairing", "pairing")
+def _get_pairing_dir() -> Path:
+    """按当前 HERMES_HOME 动态解析 pairing 目录，避免跨测试/跨 profile 串用状态。"""
+    return get_hermes_dir("platforms/pairing", "pairing")
+
+
+# 保留模块级入口，兼容现有测试对 gateway.pairing.PAIRING_DIR 的 patch。
+# 默认值为 None，表示每次实例化时再按当前 HERMES_HOME 动态解析。
+PAIRING_DIR: Path | None = None
 
 
 def _secure_write(path: Path, data: str) -> None:
@@ -83,19 +90,20 @@ class PairingStore:
     """
 
     def __init__(self):
-        PAIRING_DIR.mkdir(parents=True, exist_ok=True)
+        self._pairing_dir = PAIRING_DIR or _get_pairing_dir()
+        self._pairing_dir.mkdir(parents=True, exist_ok=True)
         # Protects all read-modify-write cycles. The gateway runs multiple
         # platform adapters concurrently in threads sharing one PairingStore.
         self._lock = threading.RLock()
 
     def _pending_path(self, platform: str) -> Path:
-        return PAIRING_DIR / f"{platform}-pending.json"
+        return self._pairing_dir / f"{platform}-pending.json"
 
     def _approved_path(self, platform: str) -> Path:
-        return PAIRING_DIR / f"{platform}-approved.json"
+        return self._pairing_dir / f"{platform}-approved.json"
 
     def _rate_limit_path(self) -> Path:
-        return PAIRING_DIR / "_rate_limits.json"
+        return self._pairing_dir / "_rate_limits.json"
 
     def _load_json(self, path: Path) -> dict:
         if path.exists():
@@ -125,12 +133,20 @@ class PairingStore:
                 results.append({"platform": p, "user_id": uid, **info})
         return results
 
-    def _approve_user(self, platform: str, user_id: str, user_name: str = "") -> None:
+    def _approve_user(
+        self,
+        platform: str,
+        user_id: str,
+        user_name: str = "",
+        *,
+        account_id: Optional[str] = None,
+    ) -> None:
         """Add a user to the approved list. Must be called under self._lock."""
         approved = self._load_json(self._approved_path(platform))
         approved[user_id] = {
             "user_name": user_name,
             "approved_at": time.time(),
+            "account_id": str(account_id or "").strip(),
         }
         self._save_json(self._approved_path(platform), approved)
 
@@ -148,7 +164,12 @@ class PairingStore:
     # ----- Pending codes -----
 
     def generate_code(
-        self, platform: str, user_id: str, user_name: str = ""
+        self,
+        platform: str,
+        user_id: str,
+        user_name: str = "",
+        *,
+        account_id: Optional[str] = None,
     ) -> Optional[str]:
         """
         Generate a pairing code for a new user.
@@ -182,6 +203,7 @@ class PairingStore:
                 "user_id": user_id,
                 "user_name": user_name,
                 "created_at": time.time(),
+                "account_id": str(account_id or "").strip(),
             }
             self._save_json(self._pending_path(platform), pending)
 
@@ -209,11 +231,17 @@ class PairingStore:
             self._save_json(self._pending_path(platform), pending)
 
             # Add to approved list
-            self._approve_user(platform, entry["user_id"], entry.get("user_name", ""))
+            self._approve_user(
+                platform,
+                entry["user_id"],
+                entry.get("user_name", ""),
+                account_id=entry.get("account_id", ""),
+            )
 
             return {
                 "user_id": entry["user_id"],
                 "user_name": entry.get("user_name", ""),
+                "account_id": str(entry.get("account_id", "") or "").strip(),
             }
 
     def list_pending(self, platform: str = None) -> list:
@@ -230,6 +258,7 @@ class PairingStore:
                     "code": code,
                     "user_id": info["user_id"],
                     "user_name": info.get("user_name", ""),
+                    "account_id": str(info.get("account_id", "") or "").strip(),
                     "age_minutes": age_min,
                 })
         return results
@@ -301,7 +330,7 @@ class PairingStore:
     def _all_platforms(self, suffix: str) -> list:
         """List all platforms that have data files of a given suffix."""
         platforms = []
-        for f in PAIRING_DIR.iterdir():
+        for f in self._pairing_dir.iterdir():
             if f.name.endswith(f"-{suffix}.json"):
                 platform = f.name.replace(f"-{suffix}.json", "")
                 if not platform.startswith("_"):

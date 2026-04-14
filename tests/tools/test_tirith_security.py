@@ -366,24 +366,31 @@ class TestFailedDownloadCaching:
     @patch("tools.tirith_security.shutil.which", return_value=None)
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
-    def test_failed_install_scan_uses_fail_open(self, mock_cfg, mock_run,
+    @patch("tools.tirith_security.threading.Thread")
+    def test_failed_install_scan_uses_fail_open(self, mock_thread_cls, mock_cfg, mock_run,
                                                  mock_which, mock_install,
                                                  mock_disk_check, mock_mark):
-        """After cached miss, check_command_security hits OSError → fail_open."""
+        """运行时扫描必须快速 fail-open，安装流程只能后台触发，不能同步阻塞。"""
         _tirith_mod._resolved_path = None
         mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
                                  "tirith_timeout": 5, "tirith_fail_open": True}
         mock_run.side_effect = FileNotFoundError("No such file: tirith")
+        mock_thread = MagicMock()
+        mock_thread.is_alive.return_value = False
+        mock_thread_cls.return_value = mock_thread
         # First command triggers install attempt + cached miss + scan
         result = check_command_security("echo hello")
         assert result["action"] == "allow"
-        assert mock_install.call_count == 1
+        assert mock_install.call_count == 0
+        mock_thread_cls.assert_called_once()
+        mock_thread.start.assert_called_once()
 
-        # Second command: no install retry, just hits OSError → allow
+        # Second command: no同步安装重试，仍然快速 fail-open
         result = check_command_security("echo world")
         assert result["action"] == "allow"
-        assert mock_install.call_count == 1  # still 1
+        assert mock_install.call_count == 0
 
+        _tirith_mod._install_thread = None
         _tirith_mod._resolved_path = None
 
 

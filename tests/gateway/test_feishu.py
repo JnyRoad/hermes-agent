@@ -24,6 +24,7 @@ def _mock_event_dispatcher_builder(mock_handler_class):
     mock_builder.register_p2_im_message_reaction_created_v1 = Mock(return_value=mock_builder)
     mock_builder.register_p2_im_message_reaction_deleted_v1 = Mock(return_value=mock_builder)
     mock_builder.register_p2_card_action_trigger = Mock(return_value=mock_builder)
+    mock_builder.register_p2_drive_notice_comment_add_v1 = Mock(return_value=mock_builder)
     mock_builder.build = Mock(return_value=object())
     mock_handler_class.builder = Mock(return_value=mock_builder)
     return mock_builder
@@ -149,6 +150,188 @@ class TestFeishuMessageNormalization(unittest.TestCase):
         self.assertEqual(normalized.metadata["chat_id"], "oc_chat_shared")
         self.assertEqual(normalized.metadata["chat_name"], "Backend Guild")
 
+
+class TestFeishuDirectoryDiscovery(unittest.TestCase):
+    def test_live_directory_paginates_users_and_groups(self):
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"app_id": "cli_xxx", "app_secret": "secret_xxx", "directory": {"live_page_size": 1}},
+            )
+        )
+
+        calls = []
+
+        def _fake_request(method, path, params=None, account_id=None, **_kwargs):
+            calls.append((path, dict(params or {}), account_id))
+            page_token = str((params or {}).get("page_token", "") or "")
+            if path == "/open-apis/contact/v3/users":
+                if not page_token:
+                    return {
+                        "data": {
+                            "items": [{"open_id": "ou_1", "name": "Alice"}],
+                            "has_more": True,
+                            "page_token": "user_next",
+                        }
+                    }
+                return {
+                    "data": {
+                        "items": [{"open_id": "ou_2", "name": "Bob"}],
+                        "has_more": False,
+                        "page_token": "",
+                    }
+                }
+            if path == "/open-apis/im/v1/chats":
+                if not page_token:
+                    return {
+                        "data": {
+                            "items": [{"chat_id": "oc_1", "name": "Backend"}],
+                            "has_more": True,
+                            "page_token": "chat_next",
+                        }
+                    }
+                return {
+                    "data": {
+                        "items": [{"chat_id": "oc_2", "name": "Ops"}],
+                        "has_more": False,
+                        "page_token": "",
+                    }
+                }
+            raise AssertionError(f"unexpected path {path}")
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=_fake_request):
+            entries = adapter.build_channel_directory_entries(include_live=True, limit_per_account=2)
+
+        self.assertEqual(
+            entries,
+            [
+                {"id": "ou_1", "name": "Alice", "type": "dm", "source": "live", "account_id": "default"},
+                {"id": "ou_2", "name": "Bob", "type": "dm", "source": "live", "account_id": "default"},
+                {"id": "oc_1", "name": "Backend", "type": "group", "source": "live", "account_id": "default"},
+                {"id": "oc_2", "name": "Ops", "type": "group", "source": "live", "account_id": "default"},
+            ],
+        )
+        self.assertEqual(
+            [item[1].get("page_size") for item in calls],
+            [1, 1, 1, 1],
+        )
+
+    def test_live_directory_respects_account_settings(self):
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_id": "cli_xxx",
+                    "app_secret": "secret_xxx",
+                    "directory": {"include_live_users": False, "live_limit": 1},
+                },
+            )
+        )
+
+        calls = []
+
+        def _fake_request(method, path, params=None, account_id=None, **_kwargs):
+            calls.append(path)
+            if path == "/open-apis/im/v1/chats":
+                return {
+                    "data": {
+                        "items": [{"chat_id": "oc_1", "name": "Backend"}],
+                        "has_more": False,
+                        "page_token": "",
+                    }
+                }
+            raise AssertionError(f"unexpected path {path}")
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=_fake_request):
+            entries = adapter.build_channel_directory_entries(include_live=True, limit_per_account=50)
+
+        self.assertEqual(
+            entries,
+            [{"id": "oc_1", "name": "Backend", "type": "group", "source": "live", "account_id": "default"}],
+        )
+        self.assertEqual(calls, ["/open-apis/im/v1/chats"])
+
+    def test_config_directory_respects_account_settings(self):
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_id": "cli_xxx",
+                    "app_secret": "secret_xxx",
+                    "allow_from": ["ou_1"],
+                    "group_allow_from": ["oc_1"],
+                    "directory": {
+                        "include_config_users": False,
+                        "include_config_groups": True,
+                        "include_live_users": False,
+                        "include_live_groups": False,
+                    },
+                },
+            )
+        )
+
+        entries = adapter.build_channel_directory_entries(include_live=True, limit_per_account=50)
+
+        self.assertEqual(
+            entries,
+            [{"id": "oc_1", "name": "oc_1", "type": "group", "source": "config", "account_id": "default"}],
+        )
+
+    def test_search_channel_directory_entries_queries_users_and_chats(self):
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"app_id": "cli_xxx", "app_secret": "secret_xxx"},
+            )
+        )
+
+        calls = []
+
+        def _fake_request(method, path, params=None, account_id=None, **_kwargs):
+            calls.append((path, dict(params or {}), account_id))
+            if path == "/open-apis/search/v1/user":
+                return {
+                    "data": {
+                        "users": [
+                            {"user_info": {"open_id": "ou_alice", "name": "Alice"}},
+                        ]
+                    }
+                }
+            if path == "/open-apis/im/v1/chats/search":
+                return {
+                    "data": {
+                        "items": [
+                            {"chat_id": "oc_backend", "name": "Backend Guild"},
+                        ]
+                    }
+                }
+            raise AssertionError(f"unexpected path {path}")
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=_fake_request):
+            entries = adapter.search_channel_directory_entries("backend", limit_per_account=5)
+
+        self.assertEqual(
+            entries,
+            [
+                {"id": "ou_alice", "name": "Alice", "type": "dm", "source": "live_search", "account_id": "default"},
+                {"id": "oc_backend", "name": "Backend Guild", "type": "group", "source": "live_search", "account_id": "default"},
+            ],
+        )
+        self.assertEqual(calls[0][1]["query"], "backend")
+        self.assertEqual(calls[1][1]["query"], "backend")
+
     def test_normalize_interactive_card_preserves_title_body_and_actions(self):
         from gateway.platforms.feishu import normalize_feishu_message
 
@@ -211,6 +394,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             patch("gateway.platforms.feishu.release_scoped_lock"),
             patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
             patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+            patch.object(adapter, "_build_lark_client_for_account", return_value=SimpleNamespace()),
             patch("gateway.platforms.feishu.web", web_module),
         ):
             _mock_event_dispatcher_builder(mock_handler_class)
@@ -219,6 +403,56 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertTrue(connected)
         runner.setup.assert_awaited_once()
         site.start.assert_awaited_once()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_connect_webhook_mode_registers_secondary_account_paths(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        add_post = Mock()
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "webhook",
+                    "webhook_path": "/webhook/primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "connection_mode": "webhook",
+                            "webhook_path": "/webhook/secondary",
+                        }
+                    },
+                }
+            )
+        )
+        runner = AsyncMock()
+        site = AsyncMock()
+        web_module = SimpleNamespace(
+            Application=lambda: SimpleNamespace(router=SimpleNamespace(add_post=add_post)),
+            AppRunner=lambda _app: runner,
+            TCPSite=lambda _runner, host, port: SimpleNamespace(start=site.start, host=host, port=port),
+        )
+
+        with (
+            patch("gateway.platforms.feishu.FEISHU_AVAILABLE", True),
+            patch("gateway.platforms.feishu.FEISHU_WEBHOOK_AVAILABLE", True),
+            patch("gateway.platforms.feishu.EventDispatcherHandler") as mock_handler_class,
+            patch("gateway.platforms.feishu.acquire_scoped_lock", return_value=(True, None)),
+            patch("gateway.platforms.feishu.release_scoped_lock"),
+            patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
+            patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+            patch.object(adapter, "_build_lark_client_for_account", return_value=SimpleNamespace()),
+            patch("gateway.platforms.feishu.web", web_module),
+        ):
+            _mock_event_dispatcher_builder(mock_handler_class)
+            connected = asyncio.run(adapter.connect())
+
+        self.assertTrue(connected)
+        registered_paths = {call.args[0] for call in add_post.call_args_list}
+        self.assertEqual(registered_paths, {"/webhook/primary", "/webhook/secondary"})
 
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
@@ -352,6 +586,523 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertEqual(fake_loop.calls, 2)
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_connect_websocket_mode_starts_secondary_account_clients(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "websocket",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "connection_mode": "websocket",
+                            "domain": "lark",
+                        }
+                    },
+                }
+            )
+        )
+        ws_clients = []
+
+        def _build_ws_client(**kwargs):
+            client = SimpleNamespace(**kwargs)
+            ws_clients.append(client)
+            return client
+
+        future = asyncio.Future()
+        future.set_result(None)
+
+        class _Loop:
+            def __init__(self):
+                self.calls = []
+
+            def run_in_executor(self, executor, fn, *args):
+                self.calls.append((executor, fn, args))
+                return future
+
+            def is_closed(self):
+                return False
+
+        fake_loop = _Loop()
+
+        with (
+            patch("gateway.platforms.feishu.FEISHU_AVAILABLE", True),
+            patch("gateway.platforms.feishu.FEISHU_WEBSOCKET_AVAILABLE", True),
+            patch("gateway.platforms.feishu.lark", SimpleNamespace(LogLevel=SimpleNamespace(INFO="INFO", WARNING="WARNING"))),
+            patch("gateway.platforms.feishu.EventDispatcherHandler") as mock_handler_class,
+            patch("gateway.platforms.feishu.FeishuWSClient", side_effect=_build_ws_client),
+            patch("gateway.platforms.feishu._run_official_feishu_ws_client"),
+            patch("gateway.platforms.feishu.acquire_scoped_lock", return_value=(True, None)) as acquire_lock,
+            patch("gateway.platforms.feishu.release_scoped_lock"),
+            patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()) as hydrate_identity,
+            patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace(name="primary_client")),
+            patch.object(
+                adapter,
+                "_build_lark_client_for_account",
+                return_value=SimpleNamespace(name="secondary_client"),
+            ),
+            patch("gateway.platforms.feishu.asyncio.get_running_loop", return_value=fake_loop),
+        ):
+            _mock_event_dispatcher_builder(mock_handler_class)
+            connected = asyncio.run(adapter.connect())
+
+        self.assertTrue(connected)
+        self.assertEqual(len(ws_clients), 2)
+        self.assertEqual(ws_clients[0].app_id, "cli_primary")
+        self.assertEqual(ws_clients[1].app_id, "cli_secondary")
+        self.assertEqual(
+            [call.kwargs.get("account_id") for call in hydrate_identity.await_args_list],
+            ["default", "feishu-cn"],
+        )
+        self.assertEqual(adapter._clients_by_account["default"].name, "primary_client")
+        self.assertEqual(adapter._clients_by_account["feishu-cn"].name, "secondary_client")
+        self.assertEqual(set(adapter._ws_futures_by_account.keys()), {"default", "feishu-cn"})
+        self.assertEqual(acquire_lock.call_args_list[0].args[:2], ("feishu-app-id", "cli_primary"))
+        self.assertEqual(acquire_lock.call_args_list[1].args[:2], ("feishu-app-id", "cli_secondary"))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_connect_websocket_mode_registers_future_done_callbacks(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "websocket",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "connection_mode": "websocket",
+                        }
+                    },
+                }
+            )
+        )
+
+        class _FakeFuture:
+            def __init__(self):
+                self.callbacks = []
+
+            def add_done_callback(self, callback):
+                self.callbacks.append(callback)
+
+        futures = []
+
+        class _Loop:
+            def run_in_executor(self, executor, fn, *args):
+                future = _FakeFuture()
+                futures.append(future)
+                return future
+
+            def is_closed(self):
+                return False
+
+        fake_loop = _Loop()
+
+        with (
+            patch("gateway.platforms.feishu.FEISHU_AVAILABLE", True),
+            patch("gateway.platforms.feishu.FEISHU_WEBSOCKET_AVAILABLE", True),
+            patch("gateway.platforms.feishu.lark", SimpleNamespace(LogLevel=SimpleNamespace(INFO="INFO", WARNING="WARNING"))),
+            patch("gateway.platforms.feishu.EventDispatcherHandler") as mock_handler_class,
+            patch("gateway.platforms.feishu.FeishuWSClient", side_effect=lambda **kwargs: SimpleNamespace(**kwargs)),
+            patch("gateway.platforms.feishu.acquire_scoped_lock", return_value=(True, None)),
+            patch("gateway.platforms.feishu.release_scoped_lock"),
+            patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
+            patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace(name="primary_client")),
+            patch.object(adapter, "_build_lark_client_for_account", return_value=SimpleNamespace(name="secondary_client")),
+            patch("gateway.platforms.feishu.asyncio.get_running_loop", return_value=fake_loop),
+        ):
+            _mock_event_dispatcher_builder(mock_handler_class)
+            connected = asyncio.run(adapter.connect())
+
+        self.assertTrue(connected)
+        self.assertEqual(len(futures), 2)
+        self.assertTrue(all(len(future.callbacks) == 1 for future in futures))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_connect_websocket_mode_logs_account_summary(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "websocket",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "connection_mode": "websocket",
+                            "domain": "lark",
+                        }
+                    },
+                }
+            )
+        )
+
+        future = asyncio.Future()
+        future.set_result(None)
+
+        class _Loop:
+            def run_in_executor(self, executor, fn, *args):
+                return future
+
+            def is_closed(self):
+                return False
+
+        fake_loop = _Loop()
+
+        with (
+            patch("gateway.platforms.feishu.FEISHU_AVAILABLE", True),
+            patch("gateway.platforms.feishu.FEISHU_WEBSOCKET_AVAILABLE", True),
+            patch("gateway.platforms.feishu.lark", SimpleNamespace(LogLevel=SimpleNamespace(INFO="INFO", WARNING="WARNING"))),
+            patch("gateway.platforms.feishu.EventDispatcherHandler") as mock_handler_class,
+            patch("gateway.platforms.feishu.FeishuWSClient", side_effect=lambda **kwargs: SimpleNamespace(**kwargs)),
+            patch("gateway.platforms.feishu._run_official_feishu_ws_client"),
+            patch("gateway.platforms.feishu.acquire_scoped_lock", return_value=(True, None)),
+            patch("gateway.platforms.feishu.release_scoped_lock"),
+            patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
+            patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace(name="primary_client")),
+            patch.object(adapter, "_build_lark_client_for_account", return_value=SimpleNamespace(name="secondary_client")),
+            patch("gateway.platforms.feishu.asyncio.get_running_loop", return_value=fake_loop),
+            patch("gateway.platforms.feishu.logger.info") as info_log,
+        ):
+            _mock_event_dispatcher_builder(mock_handler_class)
+            connected = asyncio.run(adapter.connect())
+
+        self.assertTrue(connected)
+        logged_messages = [call.args[1] for call in info_log.call_args_list if call.args and call.args[0].startswith("[Feishu] Starting websocket transports")]
+        self.assertEqual(
+            logged_messages,
+            ["default@feishu(websocket), feishu-cn@lark(websocket)"],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_disconnect_waits_for_all_websocket_account_threads(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "websocket",
+                }
+            )
+        )
+        loop_calls = []
+
+        class _ThreadLoop:
+            def __init__(self, name):
+                self.name = name
+
+            def is_closed(self):
+                return False
+
+            def call_soon_threadsafe(self, callback):
+                loop_calls.append(self.name)
+                callback()
+
+            def call_later(self, *_args, **_kwargs):
+                return None
+
+        adapter._ws_thread_loops_by_account = {
+            "default": _ThreadLoop("default"),
+            "feishu-cn": _ThreadLoop("feishu-cn"),
+        }
+        adapter._ws_thread_loop = adapter._ws_thread_loops_by_account["default"]
+        adapter._ws_clients_by_account = {
+            "default": SimpleNamespace(),
+            "feishu-cn": SimpleNamespace(),
+        }
+        adapter._ws_client = adapter._ws_clients_by_account["default"]
+
+        primary_future = asyncio.Future()
+        primary_future.set_result(None)
+        secondary_future = asyncio.Future()
+        secondary_future.set_result(None)
+        adapter._ws_futures_by_account = {
+            "default": primary_future,
+            "feishu-cn": secondary_future,
+        }
+        adapter._ws_future = primary_future
+        adapter._app_lock_identities = ["cli_primary", "cli_secondary"]
+        adapter._app_lock_identity = "cli_primary"
+
+        with (
+            patch("gateway.platforms.feishu.release_scoped_lock") as release_lock,
+            patch("gateway.platforms.feishu.asyncio.all_tasks", return_value=[]),
+        ):
+            asyncio.run(adapter.disconnect())
+
+        self.assertEqual(loop_calls, ["default", "feishu-cn"])
+        self.assertEqual(
+            [call.args[:2] for call in release_lock.call_args_list],
+            [("feishu-app-id", "cli_primary"), ("feishu-app-id", "cli_secondary")],
+        )
+        self.assertEqual(adapter._ws_futures_by_account, {})
+        self.assertEqual(adapter._ws_thread_loops_by_account, {})
+        self.assertEqual(adapter._ws_clients_by_account, {})
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_disconnect_logs_websocket_account_summary(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "websocket",
+                }
+            )
+        )
+        adapter._ws_futures_by_account = {
+            "default": asyncio.Future(),
+            "feishu-cn": asyncio.Future(),
+        }
+        adapter._ws_futures_by_account["default"].set_result(None)
+        adapter._ws_futures_by_account["feishu-cn"].set_result(None)
+        adapter._app_lock_identities = ["cli_primary", "cli_secondary"]
+        adapter._app_lock_identity = "cli_primary"
+
+        with (
+            patch("gateway.platforms.feishu.release_scoped_lock"),
+            patch("gateway.platforms.feishu.asyncio.all_tasks", return_value=[]),
+            patch.object(adapter, "_cancel_pending_tasks", new=AsyncMock()),
+            patch.object(adapter, "_stop_webhook_server", new=AsyncMock()),
+            patch.object(adapter, "_persist_seen_message_ids"),
+            patch.object(adapter, "_release_app_lock", new=AsyncMock()),
+            patch.object(adapter, "_mark_disconnected"),
+            patch("gateway.platforms.feishu.logger.info") as info_log,
+        ):
+            asyncio.run(adapter.disconnect())
+
+        logged_messages = [call.args[1] for call in info_log.call_args_list if call.args and call.args[0].startswith("[Feishu] Disconnecting websocket transports")]
+        self.assertEqual(logged_messages, ["default, feishu-cn"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_get_transport_account_status_reports_websocket_and_webhook_runtime_state(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "websocket",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "connection_mode": "webhook",
+                            "domain": "lark",
+                        }
+                    },
+                }
+            )
+        )
+        adapter._ws_futures_by_account = {"default": asyncio.Future()}
+        adapter._webhook_runner = object()
+
+        statuses = adapter.get_transport_account_status()
+
+        self.assertEqual(
+            statuses,
+            [
+                {
+                    "account_id": "default",
+                    "connection_mode": "websocket",
+                    "domain": "feishu",
+                    "runtime_state": "connected",
+                },
+                {
+                    "account_id": "feishu-cn",
+                    "connection_mode": "webhook",
+                    "domain": "lark",
+                    "runtime_state": "connected",
+                },
+            ],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_get_transport_account_status_prefers_recorded_runtime_states_and_errors(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "websocket",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "connection_mode": "webhook",
+                            "domain": "lark",
+                        }
+                    },
+                }
+            )
+        )
+
+        adapter._set_transport_runtime_state("default", "connecting")
+        adapter._set_transport_runtime_state("feishu-cn", "error", error="webhook bind failed")
+
+        statuses = adapter.get_transport_account_status()
+
+        self.assertEqual(
+            statuses,
+            [
+                {
+                    "account_id": "default",
+                    "connection_mode": "websocket",
+                    "domain": "feishu",
+                    "runtime_state": "connecting",
+                },
+                {
+                    "account_id": "feishu-cn",
+                    "connection_mode": "webhook",
+                    "domain": "lark",
+                    "runtime_state": "error",
+                    "last_error": "webhook bind failed",
+                },
+            ],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_disconnect_marks_transport_runtime_state_disconnected(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "websocket",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "connection_mode": "webhook",
+                        }
+                    },
+                }
+            )
+        )
+        adapter._set_transport_runtime_state("default", "connected")
+        adapter._set_transport_runtime_state("feishu-cn", "connected")
+        adapter._ws_futures_by_account = {"default": asyncio.Future()}
+        adapter._webhook_runner = object()
+
+        with patch.object(adapter, "_stop_webhook_server", new=AsyncMock()), patch(
+            "gateway.platforms.feishu.release_scoped_lock"
+        ):
+            asyncio.run(adapter.disconnect())
+
+        self.assertEqual(
+            adapter.get_transport_account_status(),
+            [
+                {
+                    "account_id": "default",
+                    "connection_mode": "websocket",
+                    "domain": "feishu",
+                    "runtime_state": "disconnected",
+                },
+                {
+                    "account_id": "feishu-cn",
+                    "connection_mode": "webhook",
+                    "domain": "feishu",
+                    "runtime_state": "disconnected",
+                },
+            ],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_websocket_future_done_marks_error_runtime_state(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "websocket",
+                }
+            )
+        )
+        future = asyncio.Future()
+        future.set_exception(RuntimeError("ws worker failed"))
+
+        with patch("gateway.platforms.feishu.logger.warning") as warning_log:
+            adapter._handle_websocket_future_done("default", future)
+
+        self.assertEqual(
+            adapter.get_transport_account_status(),
+            [
+                {
+                    "account_id": "default",
+                    "connection_mode": "websocket",
+                    "domain": "feishu",
+                    "runtime_state": "error",
+                    "last_error": "ws worker failed",
+                }
+            ],
+        )
+        self.assertTrue(warning_log.called)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_websocket_future_done_marks_disconnect_completion(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "connection_mode": "websocket",
+                }
+            )
+        )
+        adapter._set_transport_runtime_state("default", "disconnecting")
+        future = asyncio.Future()
+        future.set_result(None)
+
+        with patch("gateway.platforms.feishu.logger.info") as info_log:
+            adapter._handle_websocket_future_done("default", future)
+
+        self.assertEqual(
+            adapter.get_transport_account_status(),
+            [
+                {
+                    "account_id": "default",
+                    "connection_mode": "websocket",
+                    "domain": "feishu",
+                    "runtime_state": "disconnected",
+                }
+            ],
+        )
+        self.assertTrue(info_log.called)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_edit_message_updates_existing_feishu_message(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -429,6 +1180,50 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
+        self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
+        self.assertEqual(
+            captured["calls"][1].request_body.content,
+            json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_edit_message_falls_back_to_text_when_post_update_raises_invalid_payload(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"calls": []}
+
+        class _MessageAPI:
+            def update(self, request):
+                captured["calls"].append(request)
+                if len(captured["calls"]) == 1:
+                    raise RuntimeError("content format of the post type is incorrect")
+                return SimpleNamespace(success=lambda: True)
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.edit_message(
+                    chat_id="oc_chat",
+                    message_id="om_progress",
+                    content="可以用 **粗体** 和 *斜体*。",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_progress")
         self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
         self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
         self.assertEqual(
@@ -545,6 +1340,34 @@ class TestAdapterModule(unittest.TestCase):
         self.assertIsNone(settings.ws_ping_interval)
         self.assertIsNone(settings.ws_ping_timeout)
 
+    def test_load_settings_collects_multi_account_webhook_config(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        settings = FeishuAdapter._load_settings(
+            {
+                "app_id": "cli_primary",
+                "app_secret": "sec_primary",
+                "accounts": {
+                    "feishu-cn": {
+                        "app_id": "cli_cn",
+                        "app_secret": "sec_cn",
+                        "webhook_path": "/feishu-cn",
+                    },
+                    "feishu-disabled": {
+                        "app_id": "cli_disabled",
+                        "app_secret": "sec_disabled",
+                        "enabled": False,
+                    },
+                },
+            }
+        )
+
+        self.assertIn("default", settings.accounts)
+        self.assertIn("feishu-cn", settings.accounts)
+        self.assertNotIn("feishu-disabled", settings.accounts)
+        self.assertEqual(settings.accounts["feishu-cn"].app_id, "cli_cn")
+        self.assertEqual(settings.accounts["feishu-cn"].webhook_path, "/feishu-cn")
+
     def test_runtime_ws_overrides_reapply_after_sdk_configure(self):
         import sys
         from types import ModuleType
@@ -574,6 +1397,8 @@ class TestAdapterModule(unittest.TestCase):
             _ws_reconnect_interval=3,
             _ws_ping_interval=4,
             _ws_ping_timeout=5,
+            _transport_runtime_state_by_account={},
+            _set_transport_runtime_state=Mock(),
         )
         fake_client_module = ModuleType("lark_oapi.ws.client")
         fake_client_module.loop = None
@@ -599,6 +1424,49 @@ class TestAdapterModule(unittest.TestCase):
         self.assertEqual(fake_client._reconnect_nonce, 2)
         self.assertEqual(fake_client._reconnect_interval, 3)
         self.assertEqual(fake_client._ping_interval, 4)
+        fake_adapter._set_transport_runtime_state.assert_any_call("default", "connecting")
+        fake_adapter._set_transport_runtime_state.assert_any_call("default", "error", error="stop test client")
+
+    def test_runtime_ws_overrides_record_runtime_error(self):
+        import sys
+        from types import ModuleType
+
+        class _FailingWSClient:
+            def start(self):
+                raise RuntimeError("boom")
+
+        fake_client = _FailingWSClient()
+        fake_adapter = SimpleNamespace(
+            _ws_thread_loop=None,
+            _ws_reconnect_nonce=2,
+            _ws_reconnect_interval=3,
+            _ws_ping_interval=4,
+            _ws_ping_timeout=5,
+            _transport_runtime_state_by_account={},
+            _set_transport_runtime_state=Mock(),
+        )
+        fake_client_module = ModuleType("lark_oapi.ws.client")
+        fake_client_module.loop = None
+        fake_client_module.websockets = SimpleNamespace(connect=AsyncMock())
+        fake_ws_module = ModuleType("lark_oapi.ws")
+        fake_ws_module.client = fake_client_module
+        fake_root_module = ModuleType("lark_oapi")
+        fake_root_module.ws = fake_ws_module
+
+        original_modules = sys.modules.copy()
+        sys.modules["lark_oapi"] = fake_root_module
+        sys.modules["lark_oapi.ws"] = fake_ws_module
+        sys.modules["lark_oapi.ws.client"] = fake_client_module
+        try:
+            from gateway.platforms.feishu import _run_official_feishu_ws_client
+
+            _run_official_feishu_ws_client(fake_client, fake_adapter, "feishu-cn")
+        finally:
+            sys.modules.clear()
+            sys.modules.update(original_modules)
+
+        fake_adapter._set_transport_runtime_state.assert_any_call("feishu-cn", "connecting")
+        fake_adapter._set_transport_runtime_state.assert_any_call("feishu-cn", "error", error="boom")
 
 
 class TestAdapterBehavior(unittest.TestCase):
@@ -736,6 +1604,89 @@ class TestAdapterBehavior(unittest.TestCase):
             adapter._on_reaction_event("im.message.reaction.created_v1", data)
 
         run_threadsafe.assert_not_called()
+    @patch.dict(os.environ, {}, clear=True)
+    def test_handle_reaction_event_uses_secondary_account_client_for_lookup(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                        }
+                    },
+                }
+            )
+        )
+        captured = {"primary": 0, "secondary": 0}
+
+        class _PrimaryMessageAPI:
+            def get(self, request):
+                captured["primary"] += 1
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(items=[]))
+
+        class _SecondaryMessageAPI:
+            def get(self, request):
+                captured["secondary"] += 1
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(
+                        items=[
+                            SimpleNamespace(
+                                sender=SimpleNamespace(sender_type="app"),
+                                chat_id="oc_secondary",
+                                chat_type="group",
+                            )
+                        ]
+                    ),
+                )
+
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_PrimaryMessageAPI())))
+        adapter._clients_by_account = {
+            "default": adapter._client,
+            "feishu-cn": SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_SecondaryMessageAPI()))),
+        }
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter.get_chat_info = AsyncMock(return_value={"chat_id": "oc_secondary", "name": "Secondary Chat", "type": "group"})
+        adapter._handle_message_with_guards = AsyncMock()
+
+        event = SimpleNamespace(
+            message_id="om_reaction",
+            user_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+            reaction_type=SimpleNamespace(emoji_type="THUMBSUP"),
+        )
+        data = SimpleNamespace(
+            header=SimpleNamespace(app_id="cli_secondary"),
+            event=event,
+        )
+        setattr(data, "_hermes_feishu_account_id", "feishu-cn")
+        setattr(event, "_hermes_feishu_account_id", "feishu-cn")
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            asyncio.run(adapter._handle_reaction_event("im.message.reaction.created_v1", data))
+
+        self.assertEqual(captured["primary"], 0)
+        self.assertEqual(captured["secondary"], 1)
+        adapter._handle_message_with_guards.assert_awaited_once()
+        routed = adapter._handle_message_with_guards.await_args.args[0]
+        self.assertEqual(routed.source.account_id, "feishu-cn")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_normalize_inbound_text_strips_feishu_mentions(self):
+        from gateway.platforms.feishu import _normalize_feishu_text
+
+        cleaned = _normalize_feishu_text("hi @_user_1  there @_user_2")
+        self.assertEqual(cleaned, "hi there")
 
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_message_requires_mentions_even_when_policy_open(self):
@@ -749,6 +1700,47 @@ class TestAdapterBehavior(unittest.TestCase):
 
         message_with_mention = SimpleNamespace(mentions=[SimpleNamespace(key="@_user_1")])
         self.assertFalse(adapter._should_accept_group_message(message_with_mention, sender_id, ""))
+
+    def test_group_message_can_disable_require_mention_globally(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "group_policy": "open",
+                    "require_mention": False,
+                }
+            )
+        )
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertTrue(adapter._should_accept_group_message(SimpleNamespace(mentions=[]), sender_id, ""))
+
+    def test_group_rule_can_override_require_mention(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "group_policy": "open",
+                    "require_mention": True,
+                    "group_rules": {
+                        "oc_chat_free": {
+                            "policy": "open",
+                            "require_mention": False,
+                        }
+                    },
+                }
+            )
+        )
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertTrue(
+            adapter._should_accept_group_message(SimpleNamespace(mentions=[]), sender_id, "oc_chat_free")
+        )
+        self.assertFalse(
+            adapter._should_accept_group_message(SimpleNamespace(mentions=[]), sender_id, "oc_chat_other")
+        )
 
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_message_with_other_user_mention_is_rejected_when_bot_identity_unknown(self):
@@ -802,6 +1794,71 @@ class TestAdapterBehavior(unittest.TestCase):
             )
         )
 
+    def test_dm_policy_allowlist_uses_allow_from(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "dm_policy": "allowlist",
+                    "allow_from": ["ou_alice"],
+                }
+            )
+        )
+
+        self.assertTrue(adapter._allow_dm_message(SimpleNamespace(open_id="ou_alice", user_id=None)))
+        self.assertFalse(adapter._allow_dm_message(SimpleNamespace(open_id="ou_bob", user_id=None)))
+
+    def test_dm_policy_disabled_blocks_all_non_admin_users(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "dm_policy": "disabled",
+                    "admins": ["ou_admin"],
+                }
+            )
+        )
+
+        self.assertFalse(adapter._allow_dm_message(SimpleNamespace(open_id="ou_regular", user_id=None)))
+        self.assertTrue(adapter._allow_dm_message(SimpleNamespace(open_id="ou_admin", user_id=None)))
+
+    def test_group_policy_reads_extra_group_allow_from(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "group_policy": "allowlist",
+                    "group_allow_from": ["ou_alice"],
+                }
+            )
+        )
+        adapter._bot_open_id = "ou_bot"
+
+        message = SimpleNamespace(
+            mentions=[SimpleNamespace(name="Bot", id=SimpleNamespace(open_id="ou_bot", user_id=None))]
+        )
+
+        self.assertTrue(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_alice", user_id=None),
+                "oc_chat_group",
+            )
+        )
+        self.assertFalse(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_bob", user_id=None),
+                "oc_chat_group",
+            )
+        )
+
     def test_per_group_allowlist_policy_gates_by_sender(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -811,7 +1868,7 @@ class TestAdapterBehavior(unittest.TestCase):
                 "group_rules": {
                     "oc_chat_a": {
                         "policy": "allowlist",
-                        "allowlist": ["ou_alice", "ou_bob"],
+                        "allow_from": ["ou_alice", "ou_bob"],
                     }
                 }
             }
@@ -973,6 +2030,70 @@ class TestAdapterBehavior(unittest.TestCase):
                 message,
                 SimpleNamespace(open_id="ou_admin", user_id=None),
                 "oc_chat_e",
+            )
+        )
+
+    def test_wildcard_group_rule_applies_to_unlisted_groups(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        config = PlatformConfig(
+            extra={
+                "group_rules": {
+                    "*": {
+                        "policy": "allowlist",
+                        "allow_from": ["ou_alice"],
+                    }
+                }
+            }
+        )
+        adapter = FeishuAdapter(config)
+        adapter._bot_open_id = "ou_bot"
+
+        message = SimpleNamespace(
+            mentions=[SimpleNamespace(name="Bot", id=SimpleNamespace(open_id="ou_bot", user_id=None))]
+        )
+
+        self.assertTrue(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_alice", user_id=None),
+                "oc_chat_unknown",
+            )
+        )
+        self.assertFalse(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_bob", user_id=None),
+                "oc_chat_unknown",
+            )
+        )
+
+    def test_wildcard_group_rule_can_disable_group_chat(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        config = PlatformConfig(
+            extra={
+                "group_policy": "open",
+                "group_rules": {
+                    "*": {
+                        "enabled": False,
+                    }
+                },
+            }
+        )
+        adapter = FeishuAdapter(config)
+        adapter._bot_open_id = "ou_bot"
+
+        message = SimpleNamespace(
+            mentions=[SimpleNamespace(name="Bot", id=SimpleNamespace(open_id="ou_bot", user_id=None))]
+        )
+        self.assertFalse(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_regular", user_id=None),
+                "oc_chat_disabled",
             )
         )
 
@@ -1150,12 +2271,14 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter._download_feishu_image.assert_awaited_once_with(
             message_id="om_post_media",
             image_key="img_123",
+            account_id=None,
         )
         adapter._download_feishu_message_resource.assert_awaited_once_with(
             message_id="om_post_media",
             file_key="file_123",
             resource_type="file",
             fallback_filename="spec.pdf",
+            account_id=None,
         )
 
     @patch.dict(os.environ, {}, clear=True)
@@ -1263,6 +2386,7 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter._download_feishu_image.assert_awaited_once_with(
             message_id="om_image",
             image_key="img_123",
+            account_id=None,
         )
 
     @patch.dict(os.environ, {}, clear=True)
@@ -1804,6 +2928,63 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(event.reply_to_text, "父消息内容")
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_message_passes_secondary_account_id_to_extract_and_reply_lookup(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                        }
+                    },
+                }
+            )
+        )
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(return_value={"chat_id": "oc_chat", "name": "Secondary DM", "type": "dm"})
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter._extract_message_content = AsyncMock(return_value=("reply", MessageType.TEXT, [], []))
+        adapter._fetch_message_text = AsyncMock(return_value="父消息内容")
+        message = SimpleNamespace(
+            chat_id="oc_chat",
+            thread_id=None,
+            parent_id="om_parent",
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"reply"}',
+            message_id="om_reply",
+        )
+
+        data = SimpleNamespace(
+            header=SimpleNamespace(app_id="cli_secondary"),
+            event=SimpleNamespace(message=message),
+        )
+        setattr(data, "_hermes_feishu_account_id", "feishu-cn")
+        setattr(data.event, "_hermes_feishu_account_id", "feishu-cn")
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=data,
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                chat_type="p2p",
+                message_id="om_reply",
+            )
+        )
+
+        self.assertEqual(adapter._extract_message_content.await_args.kwargs["account_id"], "feishu-cn")
+        self.assertEqual(adapter._fetch_message_text.await_args.kwargs["account_id"], "feishu-cn")
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_replies_in_thread_when_thread_metadata_present(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -1890,6 +3071,60 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(sleeps, [1])
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_send_routes_to_secondary_account_client(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                        }
+                    },
+                }
+            )
+        )
+        captured = {"primary": 0, "secondary": 0}
+
+        class _PrimaryMessageAPI:
+            def create(self, request):
+                captured["primary"] += 1
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_primary"))
+
+        class _SecondaryMessageAPI:
+            def create(self, request):
+                captured["secondary"] += 1
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_secondary"))
+
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_PrimaryMessageAPI())))
+        adapter._clients_by_account = {
+            "default": adapter._client,
+            "feishu-cn": SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_SecondaryMessageAPI()))),
+        }
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="hello secondary",
+                    metadata={"account_id": "feishu-cn"},
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_secondary")
+        self.assertEqual(captured["primary"], 0)
+        self.assertEqual(captured["secondary"], 1)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_does_not_retry_deterministic_api_failure(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -1931,6 +3166,53 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(result.error, "[400] bad request")
         self.assertEqual(captured["attempts"], 1)
         self.assertEqual(sleeps, [])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_falls_back_to_new_message_when_reply_raises_withdrawn_code(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"reply_attempts": 0, "create_attempts": 0}
+
+        class _MessageAPI:
+            def reply(self, request):
+                captured["reply_attempts"] += 1
+                raise RuntimeError("Feishu API error: code=230011 msg=message has been withdrawn")
+
+            def create(self, request):
+                captured["create_attempts"] += 1
+                captured["create_request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_fallback_from_exception"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="reply fallback",
+                    reply_to="om_parent",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_fallback_from_exception")
+        self.assertEqual(captured["reply_attempts"], 1)
+        self.assertEqual(captured["create_attempts"], 1)
+        self.assertEqual(captured["create_request"].request_body.receive_id, "oc_chat")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_document_reply_uses_thread_flag(self):
@@ -1986,6 +3268,68 @@ class TestAdapterBehavior(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertTrue(captured["request"].request_body.reply_in_thread)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_document_falls_back_to_new_message_when_reply_raises_withdrawn_code(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"reply_attempts": 0, "create_attempts": 0}
+
+        class _FileAPI:
+            def create(self, request):
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(file_key="file_123"),
+                )
+
+        class _MessageAPI:
+            def reply(self, request):
+                captured["reply_attempts"] += 1
+                raise RuntimeError("[231003] reply target not found")
+
+            def create(self, request):
+                captured["create_attempts"] += 1
+                captured["create_request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_file_fallback"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    file=_FileAPI(),
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with tempfile.NamedTemporaryFile("wb", suffix=".pdf", delete=False) as tmp:
+            tmp.write(b"%PDF-1.4 test")
+            file_path = tmp.name
+
+        try:
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                result = asyncio.run(
+                    adapter.send_document(
+                        chat_id="oc_chat",
+                        file_path=file_path,
+                        reply_to="om_parent",
+                    )
+                )
+        finally:
+            os.unlink(file_path)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_file_fallback")
+        self.assertEqual(captured["reply_attempts"], 1)
+        self.assertEqual(captured["create_attempts"], 1)
+        self.assertEqual(captured["create_request"].request_body.receive_id, "oc_chat")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_document_uploads_file_and_sends_file_message(self):
@@ -2147,6 +3491,79 @@ class TestAdapterBehavior(unittest.TestCase):
             captured["message_request"].request_body.content,
             '{"image_key": "img_123"}',
         )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_image_file_routes_upload_to_secondary_account_client(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                        }
+                    },
+                }
+            )
+        )
+        captured = {"primary_uploads": 0, "secondary_uploads": 0}
+
+        class _PrimaryImageAPI:
+            def create(self, request):
+                captured["primary_uploads"] += 1
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(image_key="img_primary"))
+
+        class _SecondaryImageAPI:
+            def create(self, request):
+                captured["secondary_uploads"] += 1
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(image_key="img_secondary"))
+
+        class _PrimaryMessageAPI:
+            def create(self, request):
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_primary"))
+
+        class _SecondaryMessageAPI:
+            def create(self, request):
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_secondary"))
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(image=_PrimaryImageAPI(), message=_PrimaryMessageAPI()))
+        )
+        adapter._clients_by_account = {
+            "default": adapter._client,
+            "feishu-cn": SimpleNamespace(
+                im=SimpleNamespace(v1=SimpleNamespace(image=_SecondaryImageAPI(), message=_SecondaryMessageAPI()))
+            ),
+        }
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with tempfile.NamedTemporaryFile("wb", suffix=".png", delete=False) as tmp:
+            tmp.write(b"\x89PNG\r\n\x1a\n")
+            image_path = tmp.name
+
+        try:
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                result = asyncio.run(
+                    adapter.send_image_file(
+                        chat_id="oc_chat",
+                        image_path=image_path,
+                        metadata={"account_id": "feishu-cn"},
+                    )
+                )
+        finally:
+            os.unlink(image_path)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_secondary")
+        self.assertEqual(captured["primary_uploads"], 0)
+        self.assertEqual(captured["secondary_uploads"], 1)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_image_file_with_caption_uses_single_post_message(self):
@@ -2525,6 +3942,1148 @@ class TestAdapterBehavior(unittest.TestCase):
             [[{"tag": "md", "text": "---\n1. 第一项\n<u>下划线</u>\n~~删除线~~"}]],
         )
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_reply_mode_text_forces_plain_text(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"reply_mode": "text"}))
+        captured = {}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_reply_mode_text"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="可以用 **粗体** 和 *斜体*。",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["request"].request_body.msg_type, "text")
+        self.assertEqual(
+            captured["request"].request_body.content,
+            json.dumps({"text": "可以用 **粗体** 和 *斜体*。"}, ensure_ascii=False),
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_reply_mode_card_forces_post(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"reply_mode": "card"}))
+        captured = {}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_reply_mode_card"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="纯文本也应该按卡片模式发送",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["request"].request_body.msg_type, "post")
+        payload = json.loads(captured["request"].request_body.content)
+        self.assertEqual(
+            payload["zh_cn"]["content"],
+            [[{"tag": "md", "text": "纯文本也应该按卡片模式发送"}]],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_comment_target_replies_to_drive_comment(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("tools.feishu.client.feishu_api_request", return_value={"data": {}}) as api_request, patch(
+            "gateway.platforms.feishu.asyncio.to_thread",
+            side_effect=_direct,
+        ):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="feishu-comment://docx/doc_token/comment_123",
+                    content="请按评论内容处理",
+                )
+            )
+
+        self.assertTrue(result.success)
+        api_request.assert_called_once()
+        self.assertEqual(
+            api_request.call_args.args[:2],
+            ("POST", "/open-apis/drive/v1/files/doc_token/comments/comment_123/replies"),
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_comment_target_extracts_plain_text_from_post_payload(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"reply_mode": "card"}))
+        adapter._client = object()
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("tools.feishu.client.feishu_api_request", return_value={"data": {}}) as api_request, patch(
+            "gateway.platforms.feishu.asyncio.to_thread",
+            side_effect=_direct,
+        ):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="feishu-comment://docx/doc_token/comment_123",
+                    content="## Summary\n- Item one\n- Item two",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            api_request.call_args.args[:2],
+            ("POST", "/open-apis/drive/v1/files/doc_token/comments/comment_123/replies"),
+        )
+        sent_elements = api_request.call_args.kwargs["json_body"]["content"]["elements"]
+        self.assertEqual(
+            sent_elements,
+            [
+                {
+                    "type": "text_run",
+                    "text_run": {"text": "Summary Item one Item two"},
+                }
+            ],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_comment_target_routes_by_account_metadata(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("tools.feishu.client.feishu_api_request", return_value={"data": {}}) as api_request, patch(
+            "gateway.platforms.feishu.asyncio.to_thread",
+            side_effect=_direct,
+        ):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="feishu-comment://docx/doc_token/comment_123",
+                    content="请按评论内容处理",
+                    metadata={"account_id": "feishu-cn"},
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(api_request.call_args.kwargs["account_id"], "feishu-cn")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_comment_target_respects_no_reply_marker(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+
+        with patch("tools.feishu.client.feishu_api_request") as api_request:
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="feishu-comment://docx/doc_token/comment_123",
+                    content="NO_REPLY",
+                )
+            )
+
+        self.assertTrue(result.success)
+        api_request.assert_not_called()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_resolve_comment_event_context_includes_document_title_and_quote(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Project Spec"}]}},
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_123",
+                            "quote": "Current paragraph",
+                            "reply_list": {
+                                "replies": [
+                                    {
+                                        "content": {
+                                            "elements": [
+                                                {"type": "text_run", "text_run": {"text": "Please refine this section"}},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            },
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses):
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context["document_title"], "Project Spec")
+        self.assertIn('The user added a comment in "Project Spec": Please refine this section', context["prompt"])
+        self.assertIn("Quoted content: Current paragraph", context["prompt"])
+        self.assertIn("Event type: add_comment", context["prompt"])
+        self.assertEqual("false", context["is_whole_comment"])
+
+    def test_resolve_comment_event_context_marks_whole_document_comment(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with patch("tools.feishu.client.feishu_api_request") as mock_request:
+            mock_request.side_effect = [
+                {"data": {"metas": [{"title": "Project Spec"}]}},
+                {
+                    "data": {
+                        "items": [
+                            {
+                                "comment_id": "comment_123",
+                                "quote": "",
+                                "reply_list": {
+                                    "replies": [
+                                        {
+                                            "content": {
+                                                "elements": [
+                                                    {"type": "text_run", "text_run": {"text": "Please summarize the whole doc"}}
+                                                ]
+                                            }
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                },
+            ]
+
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+            )
+
+        self.assertEqual("true", context["is_whole_comment"])
+        self.assertIn("whole-document comment", context["prompt"])
+
+    def test_resolve_comment_event_context_marks_bot_mention(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with patch("tools.feishu.client.feishu_api_request") as mock_request:
+            mock_request.side_effect = [
+                {"data": {"metas": [{"title": "Project Spec"}]}},
+                {
+                    "data": {
+                        "items": [
+                            {
+                                "comment_id": "comment_123",
+                                "quote": "Anchor",
+                                "reply_list": {
+                                    "replies": [
+                                        {
+                                            "content": {
+                                                "elements": [
+                                                    {"type": "text_run", "text_run": {"text": "Please handle this"}}
+                                                ]
+                                            }
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                },
+            ]
+
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+                reply_id=None,
+                account_id=None,
+                is_mentioned=True,
+            )
+
+        self.assertEqual("true", context["is_mentioned"])
+        self.assertIn("This comment mentioned you.", context["prompt"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_resolve_comment_event_context_includes_reply_chain(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Review Notes"}]}},
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_123",
+                            "quote": "Anchor line",
+                            "reply_list": {
+                                "replies": [
+                                    {
+                                        "content": {
+                                            "elements": [
+                                                {"type": "text_run", "text_run": {"text": "Please review this block"}},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            },
+            {
+                "data": {
+                    "items": [
+                        {
+                            "reply_id": "reply_prev",
+                            "user_id": {"open_id": "ou_alice"},
+                            "content": {
+                                "elements": [
+                                    {"type": "text_run", "text_run": {"text": "I think this can be shorter"}},
+                                ]
+                            },
+                        },
+                        {
+                            "reply_id": "reply_target",
+                            "user_id": {"open_id": "ou_bob"},
+                            "content": {
+                                "elements": [
+                                    {"type": "text_run", "text_run": {"text": "Please rewrite the summary"}},
+                                ]
+                            },
+                        },
+                        {
+                            "reply_id": "reply_after",
+                            "user_id": {"open_id": "ou_future"},
+                            "content": {
+                                "elements": [
+                                    {"type": "text_run", "text_run": {"text": "This happened later"}},
+                                ]
+                            },
+                        },
+                    ]
+                }
+            },
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses):
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+                reply_id="reply_target",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertIn('The user added a reply in "Review Notes": Please rewrite the summary', context["prompt"])
+        self.assertIn("Original comment: Please review this block", context["prompt"])
+        self.assertIn("Reply chain context:", context["prompt"])
+        self.assertIn("[ou_alice]: I think this can be shorter", context["prompt"])
+        self.assertNotIn("[ou_future]: This happened later", context["prompt"])
+        self.assertIn("reply_id: reply_target", context["prompt"])
+
+    def test_resolve_comment_event_context_includes_local_anchor_guidance(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Design Notes"}]}},
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_123",
+                            "quote": "Current section",
+                            "reply_list": {
+                                "replies": [
+                                    {
+                                        "content": {
+                                            "elements": [
+                                                {"type": "text_run", "text_run": {"text": "Please summarize this"}},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            },
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses):
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertIn(
+            "For requests like summarize, explain, rewrite, continue, review, or translate this section",
+            context["prompt"],
+        )
+        self.assertIn(
+            "If the quoted content is not enough, read nearby context with Feishu document tools before answering",
+            context["prompt"],
+        )
+        self.assertIn(
+            "If this is a reading task such as summarization, explanation, extraction, or translation",
+            context["prompt"],
+        )
+        self.assertIn(
+            "Primary document target: file_token=doc_token, file_type=docx. Use feishu_fetch_doc with this target to read the document.",
+            context["prompt"],
+        )
+        self.assertIn(
+            "If you need the comment thread, use feishu_doc_comments with file_token=doc_token and file_type=docx.",
+            context["prompt"],
+        )
+        self.assertIn(
+            "If the request requires editing document content, use feishu_update_doc against file_token=doc_token before replying.",
+            context["prompt"],
+        )
+        self.assertIn(
+            "Keep the user-visible reply in the same language as the user's comment or reply",
+            context["prompt"],
+        )
+        self.assertIn(
+            "If the comment does not require any user-visible action, end your final response with NO_REPLY.",
+            context["prompt"],
+        )
+
+    def test_resolve_comment_event_context_fallback_includes_primary_tool_targets(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Project Spec"}]}},
+            {"data": {"items": [], "has_more": False, "page_token": ""}},
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses):
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_missing",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertIn(
+            "Primary document tools: feishu_fetch_doc(file_token=doc_token, file_type=docx), feishu_doc_comments(file_token=doc_token, file_type=docx), feishu_update_doc(file_token=doc_token).",
+            context["prompt"],
+        )
+
+    def test_resolve_comment_event_context_paginates_comments_until_target(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Paged Doc"}]}},
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_other",
+                            "quote": "Other",
+                            "reply_list": {"replies": []},
+                        }
+                    ],
+                    "has_more": True,
+                    "page_token": "next_comments",
+                }
+            },
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_123",
+                            "quote": "Anchor",
+                            "reply_list": {
+                                "replies": [
+                                    {
+                                        "content": {
+                                            "elements": [
+                                                {"type": "text_run", "text_run": {"text": "Please handle the second page"}},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                    "has_more": False,
+                    "page_token": "",
+                }
+            },
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses) as api_request:
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertIn("Please handle the second page", context["prompt"])
+        comment_calls = [
+            call for call in api_request.call_args_list if call.args[1].endswith("/comments")
+        ]
+        self.assertEqual(comment_calls[0].kwargs["params"]["page_token"], "")
+        self.assertEqual(comment_calls[1].kwargs["params"]["page_token"], "next_comments")
+
+    def test_resolve_comment_event_context_paginates_replies_until_target(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Paged Replies"}]}},
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_123",
+                            "quote": "Anchor",
+                            "reply_list": {
+                                "replies": [
+                                    {
+                                        "content": {
+                                            "elements": [
+                                                {"type": "text_run", "text_run": {"text": "Original root comment"}},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                    "has_more": False,
+                    "page_token": "",
+                }
+            },
+            {
+                "data": {
+                    "items": [
+                        {
+                            "reply_id": "reply_prev",
+                            "user_id": {"open_id": "ou_alice"},
+                            "content": {
+                                "elements": [
+                                    {"type": "text_run", "text_run": {"text": "Earlier reply"}},
+                                ]
+                            },
+                        }
+                    ],
+                    "has_more": True,
+                    "page_token": "next_replies",
+                }
+            },
+            {
+                "data": {
+                    "items": [
+                        {
+                            "reply_id": "reply_target",
+                            "user_id": {"open_id": "ou_bob"},
+                            "content": {
+                                "elements": [
+                                    {"type": "text_run", "text_run": {"text": "Target reply on second page"}},
+                                ]
+                            },
+                        }
+                    ],
+                    "has_more": False,
+                    "page_token": "",
+                }
+            },
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses) as api_request:
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+                reply_id="reply_target",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertIn("Target reply on second page", context["prompt"])
+        self.assertIn("[ou_alice]: Earlier reply", context["prompt"])
+        reply_calls = [
+            call for call in api_request.call_args_list if call.args[1].endswith("/replies")
+        ]
+        self.assertEqual(reply_calls[0].kwargs["params"]["page_token"], "")
+        self.assertEqual(reply_calls[1].kwargs["params"]["page_token"], "next_replies")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_resolve_comment_event_context_degrades_when_meta_lookup_fails(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with patch(
+            "tools.feishu.client.feishu_api_request",
+            side_effect=[
+                RuntimeError("meta failed"),
+                {"data": {"items": []}},
+            ],
+        ):
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context["document_title"], "")
+        self.assertIn("docx document doc_token", context["prompt"])
+        self.assertIn("comment_id: comment_123", context["prompt"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_resolve_comment_event_context_uses_account_aware_requests(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Project Spec"}]}},
+            {"data": {"items": []}},
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses) as api_request:
+            FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+                account_id="feishu-cn",
+            )
+
+        for call in api_request.call_args_list:
+            self.assertEqual(call.kwargs["account_id"], "feishu-cn")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_build_comment_event_context_returns_structured_fields(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Project Spec"}]}},
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_123",
+                            "quote": "Current paragraph",
+                            "reply_list": {
+                                "replies": [
+                                    {
+                                        "content": {
+                                            "elements": [
+                                                {"type": "text_run", "text_run": {"text": "Please refine this section"}},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            },
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses):
+            context = FeishuAdapter._build_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context.document_title, "Project Spec")
+        self.assertEqual(context.quoted_text, "Current paragraph")
+        self.assertEqual(context.root_comment_text, "Please refine this section")
+        self.assertEqual(context.active_text, "Please refine this section")
+        self.assertEqual(context.event_type, "add_comment")
+        self.assertIn("Project Spec", context.preview)
+        self.assertIn("Please refine this section", context.preview)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_build_comment_event_context_tracks_reply_fields(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Review Notes"}]}},
+            {
+                "data": {
+                    "items": [
+                        {
+                            "comment_id": "comment_123",
+                            "quote": "Anchor line",
+                            "reply_list": {
+                                "replies": [
+                                    {
+                                        "content": {
+                                            "elements": [
+                                                {"type": "text_run", "text_run": {"text": "Please review this block"}},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            },
+            {
+                "data": {
+                    "items": [
+                        {
+                            "reply_id": "reply_prev",
+                            "user_id": {"open_id": "ou_alice"},
+                            "content": {
+                                "elements": [
+                                    {"type": "text_run", "text_run": {"text": "I think this can be shorter"}},
+                                ]
+                            },
+                        },
+                        {
+                            "reply_id": "reply_target",
+                            "user_id": {"open_id": "ou_bob"},
+                            "content": {
+                                "elements": [
+                                    {"type": "text_run", "text_run": {"text": "Please rewrite the summary"}},
+                                ]
+                            },
+                        },
+                    ]
+                }
+            },
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses):
+            context = FeishuAdapter._build_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_123",
+                reply_id="reply_target",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context.reply_id, "reply_target")
+        self.assertEqual(context.event_type, "add_reply")
+        self.assertEqual(context.root_comment_text, "Please review this block")
+        self.assertEqual(context.active_text, "Please rewrite the summary")
+        self.assertEqual(context.reply_chain_lines, ["[ou_alice]: I think this can be shorter"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_stream_consumer_config_respects_feishu_block_streaming_settings(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "streaming": True,
+                    "block_streaming": True,
+                    "block_streaming_coalesce_ms": 850,
+                }
+            )
+        )
+
+        cfg = adapter.get_stream_consumer_config(
+            default_edit_interval=0.3,
+            default_buffer_threshold=40,
+            default_cursor=" ▉",
+        )
+
+        self.assertTrue(cfg["enabled"])
+        self.assertEqual(cfg["buffer_threshold"], 40)
+        self.assertEqual(cfg["cursor"], " ▉")
+        self.assertEqual(cfg["edit_interval"], 0.85)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_stream_consumer_config_can_disable_feishu_streaming(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "streaming": False,
+                    "block_streaming": True,
+                    "block_streaming_coalesce_ms": 600,
+                }
+            )
+        )
+
+        cfg = adapter.get_stream_consumer_config(
+            default_edit_interval=0.3,
+            default_buffer_threshold=40,
+            default_cursor=" ▉",
+        )
+
+        self.assertFalse(cfg["enabled"])
+        self.assertEqual(cfg["edit_interval"], 0.6)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_feishu_formats_tool_progress_as_markdown_trace(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        rendered = adapter.format_tool_progress_content(
+            [
+                '📄 feishu_fetch_doc: "spec.md"',
+                '🗓️ feishu_calendar_event: "team sync"',
+            ]
+        )
+
+        self.assertIn("**Tool Activity**", rendered)
+        self.assertIn("_Status: active._", rendered)
+        self.assertIn("_Summary: 2 steps, 2 running, 0 completed, 0 need attention._", rendered)
+        self.assertIn("_Active tools: feishu_calendar_event, feishu_fetch_doc._", rendered)
+        self.assertIn("**Running**", rendered)
+        self.assertIn('- 📄 feishu_fetch_doc: "spec.md"', rendered)
+        self.assertIn('_Running tools for this request..._', rendered)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_feishu_formats_tool_progress_status_sections(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        rendered = adapter.format_tool_progress_content(
+            [
+                '⏳ feishu_fetch_doc: "spec.md"',
+                '✅ feishu_doc_update: "summary updated"',
+                '❌ feishu_drive_reply_comment: "missing anchor"',
+            ]
+        )
+
+        self.assertIn("_Status: active._", rendered)
+        self.assertIn("**Running**", rendered)
+        self.assertIn("**Completed**", rendered)
+        self.assertIn("**Needs Attention**", rendered)
+        self.assertIn("_Summary: 3 steps, 1 running, 1 completed, 1 need attention._", rendered)
+        self.assertIn("_Active tools: feishu_fetch_doc._", rendered)
+        self.assertIn("_Needs attention: feishu_drive_reply_comment._", rendered)
+        self.assertIn('- ✅ feishu_doc_update: "summary updated"', rendered)
+        self.assertIn('- ❌ feishu_drive_reply_comment: "missing anchor"', rendered)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_feishu_tool_progress_completed_status(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        rendered = adapter.format_tool_progress_content(
+            [
+                '✅ feishu_fetch_doc: "spec.md"',
+                '✅ feishu_doc_update: "summary updated"',
+            ]
+        )
+
+        self.assertIn("_Status: completed._", rendered)
+        self.assertIn("_Recent tool activity for this request._", rendered)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_feishu_tool_progress_failed_status(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        rendered = adapter.format_tool_progress_content(
+            [
+                '✅ feishu_fetch_doc: "spec.md"',
+                '❌ feishu_doc_update: "missing anchor"',
+            ]
+        )
+
+        self.assertIn("_Status: needs attention._", rendered)
+        self.assertIn("_Some tool steps need attention before the request is fully complete._", rendered)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_feishu_tool_progress_summary_counts_full_trace_when_visible_window_is_truncated(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        progress_lines = [
+            *[f'✅ feishu_fetch_doc: "completed {index}"' for index in range(5)],
+            *[f'⏳ feishu_doc_update: "running {index}"' for index in range(4)],
+            *[f'❌ feishu_doc_comment: "failed {index}"' for index in range(4)],
+        ]
+
+        rendered = adapter.format_tool_progress_content(progress_lines)
+
+        self.assertIn("_Summary: 13 steps, 4 running, 5 completed, 4 need attention._", rendered)
+        self.assertIn("_Showing the most recent 12 steps._", rendered)
+        self.assertIn('_Active tools: feishu_doc_update ×4._', rendered)
+        self.assertIn('_Needs attention: feishu_doc_comment ×4._', rendered)
+        self.assertNotIn('- ✅ feishu_fetch_doc: "completed 0"', rendered)
+        self.assertIn('- ✅ feishu_fetch_doc: "completed 1"', rendered)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_feishu_tool_progress_summary_mentions_recent_window(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        rendered = adapter.format_tool_progress_content(
+            [f'⏳ tool_{index}: "step"' for index in range(15)]
+        )
+
+        self.assertIn("_Summary: 15 steps, 15 running, 0 completed, 0 need attention._", rendered)
+        self.assertIn("_Active tools: tool_10, tool_11, tool_12._", rendered)
+        self.assertIn("_Showing the most recent 12 steps._", rendered)
+        self.assertNotIn('- ⏳ tool_0: "step"', rendered)
+        self.assertIn('- ⏳ tool_14: "step"', rendered)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_feishu_tool_progress_groups_duplicate_tool_names(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        rendered = adapter.format_tool_progress_content(
+            [
+                '⏳ feishu_doc_read: "section 1"',
+                '⏳ feishu_doc_read: "section 2"',
+                '⏳ feishu_doc_update: "apply patch"',
+                '❌ feishu_drive_reply_comment: "missing anchor"',
+                '❌ feishu_drive_reply_comment: "reply failed"',
+            ]
+        )
+
+        self.assertIn("_Active tools: feishu_doc_read ×2, feishu_doc_update._", rendered)
+        self.assertIn("_Needs attention: feishu_drive_reply_comment ×2._", rendered)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_gateway_progress_renderer_uses_adapter_formatter(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.run import _render_progress_content
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        rendered = _render_progress_content(adapter, ['📄 feishu_fetch_doc: "spec.md"'])
+
+        self.assertIn("**Tool Activity**", rendered)
+        self.assertIn('- 📄 feishu_fetch_doc: "spec.md"', rendered)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_apply_settings_indexes_secondary_account_identities(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "bot_open_id": "ou_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "bot_open_id": "ou_secondary",
+                            "bot_user_id": "ouu_secondary",
+                            "bot_name": "Hermes CN",
+                            "webhook_path": "/webhook/feishu-secondary",
+                        }
+                    },
+                }
+            )
+        )
+
+        self.assertIn("ou_secondary", adapter._bot_open_ids)
+        self.assertIn("ouu_secondary", adapter._bot_user_ids)
+        self.assertIn("Hermes CN", adapter._bot_names)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_get_chat_info_uses_account_scoped_cache(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                        }
+                    },
+                }
+            )
+        )
+
+        class _PrimaryChatAPI:
+            def get(self, request):
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(name="Primary Chat", chat_type="group"),
+                )
+
+        class _SecondaryChatAPI:
+            def get(self, request):
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(name="Secondary Chat", chat_type="group"),
+                )
+
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(chat=_PrimaryChatAPI())))
+        adapter._clients_by_account = {
+            "default": adapter._client,
+            "feishu-cn": SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(chat=_SecondaryChatAPI()))),
+        }
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            primary = asyncio.run(adapter.get_chat_info("oc_chat", account_id="default"))
+            secondary = asyncio.run(adapter.get_chat_info("oc_chat", account_id="feishu-cn"))
+
+        self.assertEqual(primary["name"], "Primary Chat")
+        self.assertEqual(secondary["name"], "Secondary Chat")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_fetch_message_text_cache_is_scoped_by_account(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                        }
+                    },
+                }
+            )
+        )
+        captured = {"primary": 0, "secondary": 0}
+
+        class _PrimaryMessageAPI:
+            def get(self, request):
+                captured["primary"] += 1
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(
+                        items=[
+                            SimpleNamespace(
+                                body=SimpleNamespace(content='{"text":"Primary parent"}'),
+                                msg_type="text",
+                            )
+                        ]
+                    ),
+                )
+
+        class _SecondaryMessageAPI:
+            def get(self, request):
+                captured["secondary"] += 1
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(
+                        items=[
+                            SimpleNamespace(
+                                body=SimpleNamespace(content='{"text":"Secondary parent"}'),
+                                msg_type="text",
+                            )
+                        ]
+                    ),
+                )
+
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_PrimaryMessageAPI())))
+        adapter._clients_by_account = {
+            "default": adapter._client,
+            "feishu-cn": SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_SecondaryMessageAPI()))),
+        }
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            primary = asyncio.run(adapter._fetch_message_text("om_parent", account_id="default"))
+            secondary = asyncio.run(adapter._fetch_message_text("om_parent", account_id="feishu-cn"))
+            primary_cached = asyncio.run(adapter._fetch_message_text("om_parent", account_id="default"))
+
+        self.assertEqual(primary, "Primary parent")
+        self.assertEqual(secondary, "Secondary parent")
+        self.assertEqual(primary_cached, "Primary parent")
+        self.assertEqual(captured["primary"], 1)
+        self.assertEqual(captured["secondary"], 1)
+
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
 class TestWebhookSecurity(unittest.TestCase):
@@ -2589,6 +5148,64 @@ class TestWebhookSecurity(unittest.TestCase):
         adapter._webhook_rate_counts[ip] = (count, window_start - _FEISHU_WEBHOOK_RATE_WINDOW_SECONDS - 1)
         self.assertTrue(adapter._check_webhook_rate_limit(ip))
 
+    def test_rate_limit_prunes_stale_keys_when_capacity_is_reached(self):
+        from gateway.platforms.feishu import _FEISHU_WEBHOOK_RATE_MAX_KEYS, _FEISHU_WEBHOOK_RATE_WINDOW_SECONDS
+
+        adapter = self._make_adapter()
+        stale_start = time.time() - _FEISHU_WEBHOOK_RATE_WINDOW_SECONDS - 1
+        adapter._webhook_rate_counts = {
+            f"stale-{index}": (1, stale_start)
+            for index in range(_FEISHU_WEBHOOK_RATE_MAX_KEYS)
+        }
+
+        self.assertTrue(adapter._check_webhook_rate_limit("fresh-key"))
+        self.assertIn("fresh-key", adapter._webhook_rate_counts)
+        self.assertLess(len(adapter._webhook_rate_counts), _FEISHU_WEBHOOK_RATE_MAX_KEYS + 1)
+
+    def test_rate_limit_allows_new_key_without_tracking_when_capacity_remains_full(self):
+        from gateway.platforms.feishu import _FEISHU_WEBHOOK_RATE_MAX_KEYS
+
+        adapter = self._make_adapter()
+        current_start = time.time()
+        adapter._webhook_rate_counts = {
+            f"active-{index}": (1, current_start)
+            for index in range(_FEISHU_WEBHOOK_RATE_MAX_KEYS)
+        }
+
+        self.assertTrue(adapter._check_webhook_rate_limit("overflow-key"))
+        self.assertNotIn("overflow-key", adapter._webhook_rate_counts)
+        self.assertEqual(len(adapter._webhook_rate_counts), _FEISHU_WEBHOOK_RATE_MAX_KEYS)
+
+    def test_webhook_anomaly_logs_when_threshold_is_hit(self):
+        from gateway.platforms.feishu import _FEISHU_WEBHOOK_ANOMALY_THRESHOLD
+
+        adapter = self._make_adapter()
+        with patch("gateway.platforms.feishu.logger.warning") as warning_log:
+            for _ in range(_FEISHU_WEBHOOK_ANOMALY_THRESHOLD):
+                adapter._record_webhook_anomaly("10.0.0.8", "401-token")
+
+        self.assertEqual(adapter._webhook_anomaly_counts["10.0.0.8"][0], _FEISHU_WEBHOOK_ANOMALY_THRESHOLD)
+        warning_log.assert_called_once()
+
+    def test_successful_webhook_request_clears_existing_anomaly_counter(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._webhook_anomaly_counts["127.0.0.1"] = (3, "400", time.time())
+        body = json.dumps({"header": {"event_type": "unknown.event"}}).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+
+        response = asyncio.run(adapter._handle_webhook_request(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertNotIn("127.0.0.1", adapter._webhook_anomaly_counts)
+
     @patch.dict(os.environ, {}, clear=True)
     def test_webhook_request_rejects_oversized_body(self):
         from gateway.config import PlatformConfig
@@ -2604,6 +5221,20 @@ class TestWebhookSecurity(unittest.TestCase):
         self.assertEqual(response.status, 413)
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_request_rejects_unexpected_content_type(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=2,
+            headers={"Content-Type": "text/plain"},
+        )
+        response = asyncio.run(adapter._handle_webhook_request(request))
+        self.assertEqual(response.status, 415)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_webhook_request_rejects_invalid_json(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -2616,6 +5247,39 @@ class TestWebhookSecurity(unittest.TestCase):
         )
         response = asyncio.run(adapter._handle_webhook_request(request))
         self.assertEqual(response.status, 400)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_request_returns_400_when_body_read_fails(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(side_effect=RuntimeError("socket error")),
+        )
+        response = asyncio.run(adapter._handle_webhook_request(request))
+        self.assertEqual(response.status, 400)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_request_returns_408_when_body_read_times_out(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        async def _timeout():
+            raise asyncio.TimeoutError()
+
+        adapter = FeishuAdapter(PlatformConfig())
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=_timeout,
+        )
+        response = asyncio.run(adapter._handle_webhook_request(request))
+        self.assertEqual(response.status, 408)
 
     @patch.dict(os.environ, {"FEISHU_ENCRYPT_KEY": "secret"}, clear=True)
     def test_webhook_request_rejects_bad_signature(self):
@@ -2633,6 +5297,158 @@ class TestWebhookSecurity(unittest.TestCase):
         response = asyncio.run(adapter._handle_webhook_request(request))
         self.assertEqual(response.status, 401)
 
+    @patch.dict(os.environ, {"FEISHU_VERIFICATION_TOKEN": "verify_me"}, clear=True)
+    def test_webhook_request_rejects_invalid_verification_token(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        body = json.dumps(
+            {
+                "header": {
+                    "event_type": "im.message.receive_v1",
+                    "token": "wrong_token",
+                }
+            }
+        ).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+        response = asyncio.run(adapter._handle_webhook_request(request))
+        self.assertEqual(response.status, 401)
+
+    @patch.dict(os.environ, {"FEISHU_APP_ID": "cli", "FEISHU_APP_SECRET": "sec"}, clear=True)
+    def test_webhook_request_rejects_mismatched_event_app_id(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        body = json.dumps(
+            {
+                "header": {
+                    "event_type": "im.message.receive_v1",
+                    "app_id": "other_app",
+                }
+            }
+        ).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+        response = asyncio.run(adapter._handle_webhook_request(request))
+        self.assertEqual(response.status, 403)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_request_accepts_event_for_secondary_account_path(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "verification_token": "verify_secondary",
+                            "webhook_path": "/webhook/feishu-secondary",
+                        }
+                    },
+                }
+            )
+        )
+        body = json.dumps(
+            {
+                "header": {
+                    "event_type": "unknown.event",
+                    "app_id": "cli_secondary",
+                    "token": "verify_secondary",
+                }
+            }
+        ).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            path="/webhook/feishu-secondary",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+
+        response = asyncio.run(adapter._handle_webhook_request(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertIn(b'"code": 0', response.body)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_request_rejects_secondary_account_with_wrong_token(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_primary",
+                    "app_secret": "sec_primary",
+                    "accounts": {
+                        "feishu-cn": {
+                            "app_id": "cli_secondary",
+                            "app_secret": "sec_secondary",
+                            "verification_token": "verify_secondary",
+                            "webhook_path": "/webhook/feishu-secondary",
+                        }
+                    },
+                }
+            )
+        )
+        body = json.dumps(
+            {
+                "header": {
+                    "event_type": "unknown.event",
+                    "app_id": "cli_secondary",
+                    "token": "wrong_token",
+                }
+            }
+        ).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            path="/webhook/feishu-secondary",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+
+        response = asyncio.run(adapter._handle_webhook_request(request))
+
+        self.assertEqual(response.status, 401)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_request_rejects_encrypted_payload(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        body = json.dumps(
+            {
+                "header": {"event_type": "im.message.receive_v1"},
+                "encrypt": "ciphertext",
+            }
+        ).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+        response = asyncio.run(adapter._handle_webhook_request(request))
+        self.assertEqual(response.status, 400)
+
     @patch.dict(os.environ, {}, clear=True)
     def test_webhook_url_verification_challenge_passes_without_signature(self):
         """Challenge requests must succeed even when no encrypt_key is set."""
@@ -2649,6 +5465,56 @@ class TestWebhookSecurity(unittest.TestCase):
         response = asyncio.run(adapter._handle_webhook_request(request))
         self.assertEqual(response.status, 200)
         self.assertIn(b"test_challenge_token", response.body)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_unknown_event_type_returns_ok(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        body = json.dumps({"header": {"event_type": "unknown.event"}}).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+        response = asyncio.run(adapter._handle_webhook_request(request))
+        self.assertEqual(response.status, 200)
+        self.assertIn(b'"code": 0', response.body)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_comment_event_routes_to_comment_handler(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        body = json.dumps(
+            {
+                "header": {"event_type": "drive.notice.comment_add_v1"},
+                "event": {
+                    "comment_id": "comment_123",
+                    "notice_meta": {
+                        "file_token": "doc_token",
+                        "file_type": "docx",
+                        "from_user_id": "ou_alice",
+                        "is_mentioned": True,
+                    },
+                },
+            }
+        ).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+
+        with patch.object(adapter, "_handle_comment_event", new=AsyncMock()) as handle_comment:
+            response = asyncio.run(adapter._handle_webhook_request(request))
+
+        self.assertEqual(response.status, 200)
+        handle_comment.assert_awaited_once()
 
 
 class TestDedupTTL(unittest.TestCase):
@@ -2739,6 +5605,45 @@ class TestGroupMentionAtAll(unittest.TestCase):
         # Allowlisted user — should pass.
         allowed_sender = SimpleNamespace(open_id="ou_allowed", user_id=None)
         self.assertTrue(adapter._should_accept_group_message(message, allowed_sender, ""))
+
+    def test_at_all_can_be_disabled_globally(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "group_policy": "open",
+                    "respond_to_mention_all": False,
+                }
+            )
+        )
+        message = SimpleNamespace(content='{"text":"@_all attention"}', mentions=[])
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertFalse(adapter._should_accept_group_message(message, sender_id, ""))
+
+    def test_group_rule_can_enable_at_all_when_global_setting_disables_it(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "group_policy": "open",
+                    "respond_to_mention_all": False,
+                    "group_rules": {
+                        "oc_chat_all": {
+                            "policy": "open",
+                            "respondToMentionAll": True,
+                        }
+                    },
+                }
+            )
+        )
+        message = SimpleNamespace(content='{"text":"@_all attention"}', mentions=[])
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertTrue(adapter._should_accept_group_message(message, sender_id, "oc_chat_all"))
+        self.assertFalse(adapter._should_accept_group_message(message, sender_id, "oc_chat_other"))
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")

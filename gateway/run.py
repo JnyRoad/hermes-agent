@@ -307,6 +307,25 @@ def _expand_whatsapp_auth_aliases(identifier: str) -> set:
 
     return resolved
 
+
+def _render_progress_content(adapter: BasePlatformAdapter, progress_lines: List[str]) -> str:
+    """通过平台适配器渲染工具进度，默认回退为纯文本拼接。"""
+    try:
+        return adapter.format_tool_progress_content(progress_lines)
+    except Exception:
+        logger.debug("[%s] Failed to format tool progress content", adapter.name, exc_info=True)
+    return "\n".join(str(line) for line in progress_lines if str(line).strip())
+
+
+def _build_source_metadata(adapter: BasePlatformAdapter, source: Any, *, thread_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """根据消息来源构造平台 metadata，并允许覆盖 thread_id。"""
+    metadata = adapter.build_reply_metadata(source) if source is not None else None
+    if thread_id:
+        metadata = dict(metadata or {})
+        metadata["thread_id"] = thread_id
+    return metadata
+
+
 logger = logging.getLogger(__name__)
 
 # Sentinel placed into _running_agents immediately when a session starts
@@ -973,6 +992,12 @@ class GatewayRunner:
             try:
                 await adapter.disconnect()
             finally:
+                try:
+                    from gateway.adapter_registry import unregister_adapter
+
+                    unregister_adapter(adapter.platform, adapter)
+                except Exception:
+                    pass
                 self.adapters.pop(adapter.platform, None)
                 self.delivery_router.adapters = self.adapters
 
@@ -1336,7 +1361,7 @@ class GatewayRunner:
         if not adapter:
             return True
 
-        thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        thread_meta = _build_source_metadata(adapter, event.source)
         if self._queue_during_drain_enabled():
             self._queue_or_replace_pending_event(session_key, event)
             message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
@@ -1352,15 +1377,17 @@ class GatewayRunner:
         return True
 
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
-        snapshot = self._snapshot_running_agents()
-        last_active_count = self._running_agent_count()
+        snapshot = GatewayRunner._snapshot_running_agents(self)
+        last_active_count = GatewayRunner._running_agent_count(self)
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
             nonlocal last_active_count, last_status_at
             now = asyncio.get_running_loop().time()
-            active_count = self._running_agent_count()
+            active_count = GatewayRunner._running_agent_count(self)
             if force or active_count != last_active_count or (now - last_status_at) >= 1.0:
+                # 关机节流逻辑既要调用真实实现，也要允许测试替换成 MagicMock
+                # 统计调用次数，因此这里必须走实例属性而不是硬绑类方法。
                 self._update_runtime_status("draining")
                 last_active_count = active_count
                 last_status_at = now
@@ -1591,6 +1618,12 @@ class GatewayRunner:
                 success = await adapter.connect()
                 if success:
                     self.adapters[platform] = adapter
+                    try:
+                        from gateway.adapter_registry import register_adapter
+
+                        register_adapter(platform, adapter)
+                    except Exception:
+                        pass
                     self._sync_voice_mode_state_to_adapter(adapter)
                     connected_count += 1
                     self._update_platform_runtime_status(
@@ -1926,6 +1959,12 @@ class GatewayRunner:
                     success = await adapter.connect()
                     if success:
                         self.adapters[platform] = adapter
+                        try:
+                            from gateway.adapter_registry import register_adapter
+
+                            register_adapter(platform, adapter)
+                        except Exception:
+                            pass
                         self._sync_voice_mode_state_to_adapter(adapter)
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
@@ -2004,8 +2043,9 @@ class GatewayRunner:
             self._restart_requested = True
             self._restart_detached = detached_restart
             self._restart_via_service = service_restart
-        if self._stop_task is not None:
-            await self._stop_task
+        existing_stop_task = getattr(self, "_stop_task", None)
+        if existing_stop_task is not None and hasattr(existing_stop_task, "__await__"):
+            await existing_stop_task
             return
 
         async def _stop_impl() -> None:
@@ -2016,20 +2056,25 @@ class GatewayRunner:
             self._running = False
             self._draining = True
 
-            timeout = self._restart_drain_timeout
-            active_agents, timed_out = await self._drain_active_agents(timeout)
+            timeout = getattr(self, "_restart_drain_timeout", 0.0)
+            try:
+                timeout = float(timeout)
+            except (TypeError, ValueError):
+                timeout = 0.0
+            active_agents, timed_out = await GatewayRunner._drain_active_agents(self, timeout)
             if timed_out:
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s); interrupting remaining work.",
                     timeout,
-                    self._running_agent_count(),
+                    GatewayRunner._running_agent_count(self),
                 )
-                self._interrupt_running_agents(
+                GatewayRunner._interrupt_running_agents(
+                    self,
                     "Gateway restarting" if self._restart_requested else "Gateway shutting down"
                 )
                 interrupt_deadline = asyncio.get_running_loop().time() + 5.0
                 while self._running_agents and asyncio.get_running_loop().time() < interrupt_deadline:
-                    self._update_runtime_status("draining")
+                    GatewayRunner._update_runtime_status(self, "draining")
                     await asyncio.sleep(0.1)
 
             if self._restart_requested and self._restart_detached:
@@ -2038,7 +2083,7 @@ class GatewayRunner:
                 except Exception as e:
                     logger.error("Failed to launch detached gateway restart: %s", e)
 
-            self._finalize_shutdown_agents(active_agents)
+            GatewayRunner._finalize_shutdown_agents(self, active_agents)
 
             for platform, adapter in list(self.adapters.items()):
                 try:
@@ -2047,6 +2092,12 @@ class GatewayRunner:
                     logger.debug("✗ %s background-task cancel error: %s", platform.value, e)
                 try:
                     await adapter.disconnect()
+                    try:
+                        from gateway.adapter_registry import unregister_adapter
+
+                        unregister_adapter(platform, adapter)
+                    except Exception:
+                        pass
                     logger.info("✓ %s disconnected", platform.value)
                 except Exception as e:
                     logger.error("✗ %s disconnect error: %s", platform.value, e)
@@ -2058,6 +2109,12 @@ class GatewayRunner:
             self._background_tasks.clear()
 
             self.adapters.clear()
+            try:
+                from gateway.adapter_registry import clear_adapters
+
+                clear_adapters()
+            except Exception:
+                pass
             self._running_agents.clear()
             self._pending_messages.clear()
             self._pending_approvals.clear()
@@ -2098,7 +2155,7 @@ class GatewayRunner:
                 self._exit_reason = self._exit_reason or "Gateway restart requested"
 
             self._draining = False
-            self._update_runtime_status("stopped", self._exit_reason)
+            GatewayRunner._update_runtime_status(self, "stopped", self._exit_reason)
             logger.info("Gateway stopped")
 
         self._stop_task = asyncio.create_task(_stop_impl())
@@ -2408,7 +2465,10 @@ class GatewayRunner:
                 if self.pairing_store._is_rate_limited(platform_name, source.user_id):
                     return None
                 code = self.pairing_store.generate_code(
-                    platform_name, source.user_id, source.user_name or ""
+                    platform_name,
+                    source.user_id,
+                    source.user_name or "",
+                    account_id=getattr(source, "account_id", None),
                 )
                 if code:
                     adapter = self.adapters.get(source.platform)
@@ -2671,6 +2731,15 @@ class GatewayRunner:
 
         if canonical == "commands":
             return await self._handle_commands_command(event)
+
+        if canonical == "feishu-doctor":
+            return await self._handle_feishu_doctor_command(event)
+
+        if canonical == "feishu":
+            return await self._handle_feishu_command(event)
+
+        if canonical == "feishu-auth":
+            return await self._handle_feishu_auth_command(event)
         
         if canonical == "profile":
             return await self._handle_profile_command(event)
@@ -2798,15 +2867,22 @@ class GatewayRunner:
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
-                            proc = await asyncio.create_subprocess_shell(
+                            import subprocess
+
+                            # 快捷命令是显式的同步旁路入口，直接执行受限子进程，
+                            # 避免异步 subprocess 在不同事件循环实现下出现回收挂起。
+                            result = subprocess.run(
                                 exec_cmd,
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE,
+                                shell=True,
+                                capture_output=True,
+                                text=True,
+                                timeout=30,
                             )
-                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-                            output = (stdout or stderr).decode().strip()
+                            output = (result.stdout or result.stderr).strip()
                             return output if output else "Command returned no output."
                         except asyncio.TimeoutError:
+                            return "Quick command timed out (30s)."
+                        except subprocess.TimeoutExpired:
                             return "Quick command timed out (30s)."
                         except Exception as e:
                             return f"Quick command error: {e}"
@@ -3407,7 +3483,8 @@ class GatewayRunner:
                         f"{_compress_token_threshold:,}",
                     )
 
-                    _hyg_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                    _hyg_adapter = self.adapters.get(source.platform)
+                    _hyg_meta = _build_source_metadata(_hyg_adapter, source)
 
                     try:
                         from run_agent import AIAgent
@@ -3541,6 +3618,135 @@ class GatewayRunner:
         )
         if message_text is None:
             return
+
+        if _is_shared_thread and source.user_name:
+            message_text = f"[{source.user_name}] {message_text}"
+
+        if event.media_urls:
+            image_paths = []
+            for i, path in enumerate(event.media_urls):
+                # Check media_types if available; otherwise infer from message type
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                is_image = (
+                    mtype.startswith("image/")
+                    or event.message_type == MessageType.PHOTO
+                )
+                if is_image:
+                    image_paths.append(path)
+            if image_paths:
+                message_text = await self._enrich_message_with_vision(
+                    message_text, image_paths
+                )
+        
+        # -----------------------------------------------------------------
+        # Auto-transcribe voice/audio messages sent by the user
+        # -----------------------------------------------------------------
+        if event.media_urls:
+            audio_paths = []
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                is_audio = (
+                    mtype.startswith("audio/")
+                    or event.message_type in (MessageType.VOICE, MessageType.AUDIO)
+                )
+                if is_audio:
+                    audio_paths.append(path)
+            if audio_paths:
+                message_text = await self._enrich_message_with_transcription(
+                    message_text, audio_paths
+                )
+                # If STT failed, send a direct message to the user so they
+                # know voice isn't configured — don't rely on the agent to
+                # relay the error clearly.
+                _stt_fail_markers = (
+                    "No STT provider",
+                    "STT is disabled",
+                    "can't listen",
+                    "VOICE_TOOLS_OPENAI_KEY",
+                )
+                if any(m in message_text for m in _stt_fail_markers):
+                    _stt_adapter = self.adapters.get(source.platform)
+                    _stt_meta = _build_source_metadata(adapter, source)
+                    if _stt_adapter:
+                        try:
+                            _stt_msg = (
+                                "🎤 I received your voice message but can't transcribe it — "
+                                "no speech-to-text provider is configured.\n\n"
+                                "To enable voice: install faster-whisper "
+                                "(`pip install faster-whisper` in the Hermes venv) "
+                                "and set `stt.enabled: true` in config.yaml, "
+                                "then /restart the gateway."
+                            )
+                            # Point to setup skill if it's installed
+                            if self._has_setup_skill():
+                                _stt_msg += "\n\nFor full setup instructions, type: `/skill hermes-agent-setup`"
+                            await _stt_adapter.send(
+                                source.chat_id, _stt_msg,
+                                metadata=_stt_meta,
+                            )
+                        except Exception:
+                            pass
+
+        # -----------------------------------------------------------------
+        # Enrich document messages with context notes for the agent
+        # -----------------------------------------------------------------
+        if event.media_urls and event.message_type == MessageType.DOCUMENT:
+            import mimetypes as _mimetypes
+            _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                # Fall back to extension-based detection when MIME type is unreliable.
+                if mtype in ("", "application/octet-stream"):
+                    import os as _os2
+                    _ext = _os2.path.splitext(path)[1].lower()
+                    if _ext in _TEXT_EXTENSIONS:
+                        mtype = "text/plain"
+                    else:
+                        guessed, _ = _mimetypes.guess_type(path)
+                        if guessed:
+                            mtype = guessed
+                if not mtype.startswith(("application/", "text/")):
+                    continue
+                # Extract display filename by stripping the doc_{uuid12}_ prefix
+                import os as _os
+                basename = _os.path.basename(path)
+                # Format: doc_<12hex>_<original_filename>
+                parts = basename.split("_", 2)
+                display_name = parts[2] if len(parts) >= 3 else basename
+                # Sanitize to prevent prompt injection via filenames
+                import re as _re
+                display_name = _re.sub(r'[^\w.\- ]', '_', display_name)
+
+                if mtype.startswith("text/"):
+                    context_note = (
+                        f"[The user sent a text document: '{display_name}'. "
+                        f"Its content has been included below. "
+                        f"The file is also saved at: {path}]"
+                    )
+                else:
+                    context_note = (
+                        f"[The user sent a document: '{display_name}'. "
+                        f"The file is saved at: {path}. "
+                        f"Ask the user what they'd like you to do with it.]"
+                    )
+                message_text = f"{context_note}\n\n{message_text}"
+
+        # -----------------------------------------------------------------
+        # Inject reply context when user replies to a message not in history.
+        # Telegram (and other platforms) let users reply to specific messages,
+        # but if the quoted message is from a previous session, cron delivery,
+        # or background task, the agent has no context about what's being
+        # referenced. Prepend the quoted text so the agent understands. (#1594)
+        # -----------------------------------------------------------------
+        if getattr(event, 'reply_to_text', None) and event.reply_to_message_id:
+            reply_snippet = event.reply_to_text[:500]
+            found_in_history = any(
+                reply_snippet[:200] in (msg.get("content") or "")
+                for msg in history
+                if msg.get("role") in ("assistant", "user", "tool")
+            )
+            if not found_in_history:
+                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
 
         try:
             # Emit agent:start hook
@@ -4253,6 +4459,479 @@ class GatewayRunner:
         if page != requested_page:
             lines.append(f"_(Requested page {requested_page} was out of range, showing page {page}.)_")
         return "\n".join(lines)
+
+    async def _handle_feishu_doctor_command(self, event: MessageEvent) -> str:
+        """Handle /feishu-doctor - show Feishu integration diagnostics in chat."""
+        from gateway.config import Platform
+
+        if event.source.platform != Platform.FEISHU:
+            return "This command is only available inside a Feishu chat."
+
+        adapter = self.adapters.get(Platform.FEISHU)
+        if adapter is None:
+            return "Feishu adapter is not connected."
+
+        from hermes_cli.doctor import collect_feishu_doctor_report
+
+        report = collect_feishu_doctor_report(
+            user_open_id=str(event.source.user_id or "").strip() or None,
+            adapter=adapter,
+            account_id=getattr(event.source, "account_id", None),
+        )
+        marker_map = {"ok": "✓", "warn": "⚠", "fail": "✗", "info": "→"}
+        lines = ["🩺 **Feishu Doctor**", ""]
+        for item in report["items"]:
+            marker = marker_map.get(item.get("status", "info"), "•")
+            line = f"{marker} {item.get('label', '')}"
+            detail = str(item.get("detail", "") or "").strip()
+            if detail:
+                line += f" — {detail}"
+            lines.append(line)
+        if report["issues"]:
+            lines.extend(["", "**Actionable Items**"])
+            for issue in report["issues"]:
+                lines.append(f"- {issue}")
+        else:
+            lines.extend(["", "No actionable Feishu issues detected."])
+        return "\n".join(lines)
+
+    async def _handle_feishu_directory_command(self, event: MessageEvent, query: str) -> str:
+        """Handle `/feishu directory` for cache and live directory diagnostics."""
+        from gateway.config import Platform
+        from gateway.channel_directory import explain_channel_name_resolution, load_directory
+
+        if event.source.platform != Platform.FEISHU:
+            return "This command is only available inside a Feishu chat."
+
+        adapter = self.adapters.get(Platform.FEISHU)
+        if adapter is None:
+            return "Feishu adapter is not connected."
+
+        normalized_query = str(query or "").strip()
+        if not normalized_query:
+            directory = load_directory()
+            feishu_entries = directory.get("platforms", {}).get("feishu", []) or []
+            source_counts: dict[str, int] = {}
+            account_counts: dict[str, int] = {}
+            directory_settings = {}
+            config_settings = {}
+            if hasattr(adapter, "_get_account_live_directory_settings"):
+                account_id = str(getattr(event.source, "account_id", None) or "default").strip() or "default"
+                try:
+                    directory_settings = adapter._get_account_live_directory_settings(account_id) or {}
+                except Exception:
+                    directory_settings = {}
+                config_settings = {
+                    "account_id": account_id,
+                    "include_config_users": directory_settings.get("include_config_users"),
+                    "include_config_groups": directory_settings.get("include_config_groups"),
+                    "include_live_users": directory_settings.get("include_live_users"),
+                    "include_live_groups": directory_settings.get("include_live_groups"),
+                    "live_limit": directory_settings.get("live_limit"),
+                    "live_page_size": directory_settings.get("live_page_size"),
+                }
+            for item in feishu_entries:
+                if not isinstance(item, dict):
+                    continue
+                source = str(item.get("source", "") or "unknown").strip() or "unknown"
+                account_key = str(item.get("account_id", "") or "default").strip() or "default"
+                source_counts[source] = source_counts.get(source, 0) + 1
+                account_counts[account_key] = account_counts.get(account_key, 0) + 1
+
+            lines = ["📚 **Feishu Directory**", ""]
+            updated_at = str(directory.get("updated_at", "") or "").strip()
+            if updated_at:
+                lines.append(f"- Cache updated at: `{updated_at}`")
+            lines.append(f"- Cached targets: {len(feishu_entries)}")
+            if source_counts:
+                source_detail = ", ".join(f"{key}={value}" for key, value in sorted(source_counts.items()))
+                lines.append(f"- Sources: {source_detail}")
+            if account_counts:
+                account_detail = ", ".join(f"{key}={value}" for key, value in sorted(account_counts.items()))
+                lines.append(f"- Accounts: {account_detail}")
+            if config_settings:
+                lines.append(
+                    "- Current account directory policy: "
+                    f"account=`{config_settings['account_id']}` "
+                    f"config_users={config_settings['include_config_users'] if config_settings['include_config_users'] is not None else 'default'} "
+                    f"config_groups={config_settings['include_config_groups'] if config_settings['include_config_groups'] is not None else 'default'} "
+                    f"live_users={config_settings['include_live_users'] if config_settings['include_live_users'] is not None else 'default'} "
+                    f"live_groups={config_settings['include_live_groups'] if config_settings['include_live_groups'] is not None else 'default'} "
+                    f"limit={config_settings['live_limit']} page_size={config_settings['live_page_size']}"
+                )
+            if hasattr(adapter, "search_channel_directory_entries"):
+                lines.append("- Live search fallback: available")
+            else:
+                lines.append("- Live search fallback: unavailable")
+            lines.extend(
+                [
+                    "",
+                    "Use `/feishu directory <name>` to inspect resolution or live search candidates.",
+                ]
+            )
+            return "\n".join(lines)
+
+        resolution = explain_channel_name_resolution(
+            "feishu",
+            normalized_query,
+            preferred_account_id=getattr(event.source, "account_id", None),
+            preferred_target_ids=[
+                (
+                    f"{getattr(event.source, 'account_id', None)}::{event.source.chat_id}"
+                    if getattr(event.source, "account_id", None)
+                    and getattr(event.source, "account_id", None) != "default"
+                    else str(event.source.chat_id or "")
+                )
+            ],
+        )
+        status = resolution.get("status", "not_found")
+        source = str(resolution.get("source", "") or "none").strip() or "none"
+        suggestions = resolution.get("suggestions", []) or []
+        preferred_account_id = str(resolution.get("preferred_account_id", "") or "").strip()
+        lines = [f"📚 **Feishu Directory Lookup** — `{normalized_query}`", ""]
+
+        if status == "resolved":
+            resolved_id = str(resolution.get("resolved_id", "") or "").strip()
+            lines.append(f"- Status: resolved via `{source}`")
+            if preferred_account_id:
+                lines.append(f"- Preferred account: `{preferred_account_id}`")
+            if suggestions:
+                top = suggestions[0]
+                label = str(top.get("label", "") or resolved_id).strip() or resolved_id
+                account_id = str(top.get("account_id", "") or "default").strip() or "default"
+                lines.append(f"- Target: `{label}`")
+                lines.append(f"- Account: `{account_id}`")
+            lines.append(f"- Resolved ID: `{resolved_id}`")
+            return "\n".join(lines)
+
+        if status == "ambiguous":
+            lines.append(f"- Status: ambiguous after `{source if source != 'none' else 'cache/live_search'}` lookup")
+            if preferred_account_id:
+                lines.append(f"- Preferred account: `{preferred_account_id}`")
+            lines.append("- Candidates:")
+            for item in suggestions:
+                label = str(item.get("label", "") or item.get("id", "")).strip() or "unknown"
+                candidate_source = str(item.get("source", "") or "unknown").strip() or "unknown"
+                account_id = str(item.get("account_id", "") or "default").strip() or "default"
+                reason = str(item.get("reason", "") or "").strip()
+                detail = f"{candidate_source}, account={account_id}"
+                if reason:
+                    detail += f", {reason}"
+                lines.append(f"  - `{label}` ({detail})")
+            return "\n".join(lines)
+
+        lines.append("- Status: not found in cached directory or live search")
+        lines.append("- Try a more specific display label such as `feishu-cn/Backend (group)`.")
+        return "\n".join(lines)
+
+    async def _handle_feishu_command(self, event: MessageEvent) -> str:
+        """Handle `/feishu` unified subcommands inside Feishu chats."""
+        from gateway.config import Platform
+
+        if event.source.platform != Platform.FEISHU:
+            return "This command is only available inside a Feishu chat."
+
+        raw_args = event.get_command_args().strip()
+        try:
+            parts = shlex.split(raw_args) if raw_args else []
+        except ValueError as exc:
+            return f"Invalid command arguments: {exc}"
+
+        subcommand = parts[0].lower() if parts else "help"
+        remaining = " ".join(parts[1:]).strip()
+
+        if subcommand in {"help", ""}:
+            return (
+                "📘 **Feishu Commands**\n"
+                "- `/feishu start` — validate Feishu gateway readiness\n"
+                "- `/feishu doctor` — show Feishu diagnostics in chat\n"
+                "- `/feishu directory [query]` — inspect cached targets or resolve a Feishu target name\n"
+                "- `/feishu auth ...` — inspect or request Feishu user authorization\n"
+                "- `/feishu auth batch` — owner-only batch authorization for all granted user scopes\n"
+                "- `/feishu onboarding` — alias of `/feishu auth batch` for owner onboarding\n"
+                "- `/feishu help` — show this help"
+            )
+
+        if subcommand == "doctor":
+            return await self._handle_feishu_doctor_command(event)
+
+        if subcommand == "directory":
+            return await self._handle_feishu_directory_command(event, remaining)
+
+        if subcommand in {"auth", "onboarding"}:
+            forwarded_args = remaining
+            if subcommand == "onboarding" and not forwarded_args:
+                forwarded_args = "batch"
+            forwarded_event = MessageEvent(
+                text=f"/feishu-auth {forwarded_args}".rstrip(),
+                source=event.source,
+                message_type=event.message_type,
+                raw_message=event.raw_message,
+                message_id=event.message_id,
+                timestamp=event.timestamp,
+            )
+            return await self._handle_feishu_auth_command(forwarded_event)
+
+        if subcommand == "start":
+            adapter = self.adapters.get(Platform.FEISHU)
+            if adapter is None:
+                return (
+                    "❌ **Feishu Start Check Failed**\n"
+                    "- Feishu adapter is not connected.\n"
+                    "- Enable the Feishu gateway platform and restart Hermes gateway."
+                )
+
+            from hermes_cli.doctor import collect_feishu_doctor_report
+
+            report = collect_feishu_doctor_report(
+                user_open_id=str(event.source.user_id or "").strip() or None,
+                adapter=adapter,
+                account_id=getattr(event.source, "account_id", None),
+            )
+            warn_or_fail = [item for item in report["items"] if item.get("status") in {"warn", "fail"}]
+            if warn_or_fail:
+                lines = ["⚠️ **Feishu Start Check Passed With Warnings**", ""]
+                lines.append("- Unified chat commands are available: `/feishu help`")
+                for item in warn_or_fail:
+                    detail = str(item.get("detail", "") or "").strip()
+                    line = f"- {item.get('label', '')}"
+                    if detail:
+                        line += f": {detail}"
+                    lines.append(line)
+                if report["issues"]:
+                    lines.extend(["", "**Actionable Items**"])
+                    lines.extend(f"- {issue}" for issue in report["issues"])
+                return "\n".join(lines)
+            return (
+                "✅ **Feishu Start Check Passed**\n"
+                "- Feishu gateway configuration looks healthy.\n"
+                "- Unified chat commands are available: `/feishu help`"
+            )
+
+        return (
+            "Usage: `/feishu [start|auth|onboarding|doctor|directory|help]`\n"
+            "Example: `/feishu auth feishu_calendar_event delete`"
+        )
+
+    async def _handle_feishu_auth_command(self, event: MessageEvent) -> str:
+        """Handle /feishu-auth - inspect or request Feishu user authorization."""
+        from gateway.config import Platform
+        from tools.feishu.client import get_app_granted_scopes_by_token_type, get_app_info
+        from tools.feishu.scopes import get_required_scopes, split_sensitive_scopes
+
+        if event.source.platform != Platform.FEISHU:
+            return "This command is only available inside a Feishu chat."
+
+        adapter = self.adapters.get(Platform.FEISHU)
+        if adapter is None:
+            return "Feishu adapter is not connected."
+
+        user_open_id = str(event.source.user_id or "").strip()
+        if not user_open_id:
+            return "Current Feishu user ID is unavailable."
+
+        raw_args = event.get_command_args().strip()
+        try:
+            parts = shlex.split(raw_args) if raw_args else []
+        except ValueError as exc:
+            return f"Invalid command arguments: {exc}"
+
+        def _parse_scope_tokens(tokens: list[str]) -> list[str]:
+            scopes: list[str] = []
+            for token in tokens:
+                for item in token.split(","):
+                    scope = str(item or "").strip()
+                    if scope:
+                        scopes.append(scope)
+            return adapter._normalize_scope_list(scopes)
+
+        subcommand = parts[0].lower() if parts else "status"
+        payload_args = parts[1:] if parts else []
+        metadata = getattr(event, "metadata", None)
+        thread_id = str(metadata.get("thread_id", "") if isinstance(metadata, dict) else "").strip()
+
+        if subcommand == "status":
+            scopes = _parse_scope_tokens(payload_args)
+            account_id = getattr(event.source, "account_id", None)
+            if account_id:
+                status = adapter.get_authorization_status(
+                    user_open_id,
+                    scopes or None,
+                    account_id=account_id,
+                )
+            else:
+                status = adapter.get_authorization_status(user_open_id, scopes or None)
+            lines = [
+                "🔐 **Feishu Authorization Status**",
+                f"- Authorized: {'yes' if status.get('authorized') else 'no'}",
+                f"- Granted scopes: {len(status.get('granted_scopes') or [])}",
+            ]
+            requested = list(status.get("requested_scopes") or [])
+            missing = list(status.get("missing_scopes") or [])
+            granted = list(status.get("granted_scopes") or [])
+            if requested:
+                lines.append(f"- Requested scopes: {', '.join(requested)}")
+            if missing:
+                lines.append(f"- Missing scopes: {', '.join(missing)}")
+            if granted:
+                lines.append(f"- Granted preview: {', '.join(granted[:8])}")
+            return "\n".join(lines)
+
+        if subcommand == "revoke":
+            scopes = _parse_scope_tokens(payload_args)
+            account_id = getattr(event.source, "account_id", None)
+            if account_id:
+                status = adapter.revoke_authorization(
+                    user_open_id,
+                    scopes or None,
+                    account_id=account_id,
+                )
+            else:
+                status = adapter.revoke_authorization(user_open_id, scopes or None)
+            target = ", ".join(scopes) if scopes else "all local Feishu scopes"
+            return (
+                "🗑 **Feishu authorization revoked**\n"
+                f"- Target: {target}\n"
+                f"- Remaining scopes: {len(status.get('granted_scopes') or [])}"
+            )
+
+        if subcommand == "batch":
+            account_id = getattr(event.source, "account_id", None)
+            try:
+                app_info = get_app_info(account_id=account_id)
+            except Exception:
+                return (
+                    "❌ **Feishu batch authorization unavailable**\n"
+                    "- Hermes could not inspect app ownership or granted scopes.\n"
+                    "- Ask a Feishu app admin to grant `application:application:self_manage`, then retry `/feishu auth batch`."
+                )
+            owner_open_id = str(app_info.get("effective_owner_open_id", "") or "").strip()
+            if not owner_open_id:
+                return (
+                    "❌ **Feishu batch authorization unavailable**\n"
+                    "- Hermes could not determine the Feishu app owner for this account."
+                )
+            if owner_open_id != user_open_id:
+                return (
+                    "❌ **Feishu batch authorization is owner-only**\n"
+                    "- Ask the Feishu app owner to run `/feishu auth batch` in chat."
+                )
+
+            all_scopes = get_app_granted_scopes_by_token_type(None, account_id=account_id)
+            all_scopes = adapter._normalize_scope_list(all_scopes)
+            if all_scopes and "offline_access" not in all_scopes:
+                return (
+                    "❌ **Feishu batch authorization unavailable**\n"
+                    "- The Feishu app is missing `offline_access`, which is required for OAuth-based user authorization.\n"
+                    "- Ask a Feishu app admin to grant `offline_access`, then retry `/feishu auth batch`."
+                )
+
+            app_scopes = get_app_granted_scopes_by_token_type("user", account_id=account_id)
+            app_scopes = adapter._normalize_scope_list(app_scopes)
+            if not app_scopes:
+                return (
+                    "ℹ️ **Feishu batch authorization skipped**\n"
+                    "- This app has no granted user scopes yet.\n"
+                    "- Grant the required Feishu user scopes first, then retry `/feishu auth batch`."
+                )
+
+            if account_id:
+                status = adapter.get_authorization_status(
+                    user_open_id,
+                    app_scopes,
+                    account_id=account_id,
+                )
+            else:
+                status = adapter.get_authorization_status(user_open_id, app_scopes)
+
+            missing_scopes = adapter._normalize_scope_list(list(status.get("missing_scopes") or []))
+            if not missing_scopes:
+                return (
+                    "✅ **Feishu batch authorization already complete**\n"
+                    f"- Authorized scopes: {len(status.get('granted_scopes') or [])}"
+                )
+
+            safe_scopes, sensitive_scopes = split_sensitive_scopes(missing_scopes)
+            result = await adapter.send_oauth_request_card(
+                chat_id=event.source.chat_id,
+                scopes=missing_scopes,
+                reason="Batch authorization requested for all app-granted Feishu user scopes.",
+                title="Feishu Batch Authorization Required",
+                metadata={
+                    "thread_id": thread_id,
+                    "account_id": account_id,
+                    "requester_open_id": user_open_id,
+                    "tool_name": "feishu_oauth_batch_auth",
+                    "action": "batch",
+                },
+            )
+            if not result.success:
+                return f"Failed to create Feishu batch authorization request: {result.error}"
+            return (
+                "🔐 **Feishu batch authorization requested**\n"
+                f"- Missing scopes: {len(missing_scopes)}\n"
+                f"- Safe scopes: {', '.join(safe_scopes) if safe_scopes else 'none'}\n"
+                f"- Sensitive scopes: {', '.join(sensitive_scopes) if sensitive_scopes else 'none'}"
+            )
+
+        if subcommand == "scope":
+            scopes = _parse_scope_tokens(payload_args)
+            if not scopes:
+                return "Usage: `/feishu-auth scope <scope1,scope2,...>`"
+            safe_scopes, sensitive_scopes = split_sensitive_scopes(scopes)
+            result = await adapter.send_oauth_request_card(
+                chat_id=event.source.chat_id,
+                scopes=scopes,
+                reason="Manual Feishu authorization request from chat command.",
+                title="Feishu Authorization Required",
+                metadata={
+                    "thread_id": thread_id,
+                    "account_id": getattr(event.source, "account_id", None),
+                    "requester_open_id": user_open_id,
+                    "tool_name": "feishu_oauth",
+                    "action": "authorize",
+                },
+            )
+            if not result.success:
+                return f"Failed to create Feishu authorization request: {result.error}"
+            return (
+                "🔐 **Feishu authorization requested**\n"
+                f"- Safe scopes: {', '.join(safe_scopes) if safe_scopes else 'none'}\n"
+                f"- Sensitive scopes: {', '.join(sensitive_scopes) if sensitive_scopes else 'none'}"
+            )
+
+        tool_name = subcommand
+        action_name = payload_args[0].lower() if payload_args else "default"
+        scopes = get_required_scopes(tool_name, action_name)
+        if not scopes:
+            return (
+                "Usage: `/feishu-auth [status|revoke|batch|scope|<tool_name> [action]]`\n"
+                "Example: `/feishu-auth feishu_calendar_event delete`"
+            )
+
+        safe_scopes, sensitive_scopes = split_sensitive_scopes(scopes)
+        result = await adapter.send_oauth_request_card(
+            chat_id=event.source.chat_id,
+            scopes=scopes,
+            reason=f"Manual authorization requested for `{tool_name}` action `{action_name}`.",
+            title="Feishu Authorization Required",
+            metadata={
+                "thread_id": thread_id,
+                "account_id": getattr(event.source, "account_id", None),
+                "requester_open_id": user_open_id,
+                "tool_name": tool_name,
+                "action": action_name,
+            },
+        )
+        if not result.success:
+            return f"Failed to create Feishu authorization request: {result.error}"
+        return (
+            "🔐 **Feishu authorization requested**\n"
+            f"- Tool: `{tool_name}`\n"
+            f"- Action: `{action_name}`\n"
+            f"- Safe scopes: {', '.join(safe_scopes) if safe_scopes else 'none'}\n"
+            f"- Sensitive scopes: {', '.join(sensitive_scopes) if sensitive_scopes else 'none'}"
+        )
     
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
@@ -4416,7 +5095,7 @@ class GatewayRunner:
                         lines.append("_(session only — use `/model <name> --global` to persist)_")
                         return "\n".join(lines)
 
-                    metadata = {"thread_id": source.thread_id} if source.thread_id else None
+                    metadata = _build_source_metadata(adapter, source)
                     result = await adapter.send_model_picker(
                         chat_id=source.chat_id,
                         providers=providers,
@@ -5135,7 +5814,7 @@ class GatewayRunner:
                     "reply_to": event.message_id,
                 }
                 if event.source.thread_id:
-                    send_kwargs["metadata"] = {"thread_id": event.source.thread_id}
+                    send_kwargs["metadata"] = _build_source_metadata(adapter, event.source)
                 await adapter.send_voice(**send_kwargs)
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
@@ -5165,7 +5844,7 @@ class GatewayRunner:
             _, cleaned = adapter.extract_images(response)
             local_files, _ = adapter.extract_local_files(cleaned)
 
-            _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+            _thread_meta = _build_source_metadata(adapter, event.source)
 
             _AUDIO_EXTS = {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
@@ -5321,7 +6000,7 @@ class GatewayRunner:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
             return
 
-        _thread_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        _thread_metadata = _build_source_metadata(adapter, source)
 
         try:
             user_config = _load_gateway_config()
@@ -5493,7 +6172,7 @@ class GatewayRunner:
             logger.warning("No adapter for platform %s in /btw task %s", source.platform, task_id)
             return
 
-        _thread_meta = {"thread_id": source.thread_id} if source.thread_id else None
+        _thread_meta = _build_source_metadata(adapter, source)
 
         try:
             user_config = _load_gateway_config()
@@ -6981,6 +7660,7 @@ class GatewayRunner:
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            account_id=getattr(context.source, "account_id", "") or "",
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -7546,7 +8226,11 @@ class GatewayRunner:
             _progress_thread_id = source.thread_id or event_message_id
         else:
             _progress_thread_id = source.thread_id
-        _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _progress_metadata = _build_source_metadata(
+            self.adapters.get(source.platform) if source.platform in self.adapters else None,
+            source,
+            thread_id=_progress_thread_id,
+        ) if source.platform in self.adapters else ({"thread_id": _progress_thread_id} if _progress_thread_id else None)
 
         async def send_progress_messages():
             if not progress_queue:
@@ -7603,12 +8287,15 @@ class GatewayRunner:
 
                     if can_edit and progress_msg_id is not None:
                         # Try to edit the existing progress message
-                        full_text = "\n".join(progress_lines)
-                        result = await adapter.edit_message(
-                            chat_id=source.chat_id,
-                            message_id=progress_msg_id,
-                            content=full_text,
-                        )
+                        full_text = _render_progress_content(adapter, progress_lines)
+                        _edit_kwargs = {
+                            "chat_id": source.chat_id,
+                            "message_id": progress_msg_id,
+                            "content": full_text,
+                        }
+                        if source.platform == Platform.FEISHU and _progress_metadata:
+                            _edit_kwargs["metadata"] = _progress_metadata
+                        result = await adapter.edit_message(**_edit_kwargs)
                         if not result.success:
                             _err = (getattr(result, "error", "") or "").lower()
                             if "flood" in _err or "retry after" in _err:
@@ -7624,7 +8311,7 @@ class GatewayRunner:
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
+                            full_text = _render_progress_content(adapter, progress_lines)
                             result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
                         else:
                             # Editing unsupported: send just this line
@@ -7655,13 +8342,16 @@ class GatewayRunner:
                             break
                     # Final edit with all remaining tools (only if editing works)
                     if can_edit and progress_lines and progress_msg_id:
-                        full_text = "\n".join(progress_lines)
+                        full_text = _render_progress_content(adapter, progress_lines)
                         try:
-                            await adapter.edit_message(
-                                chat_id=source.chat_id,
-                                message_id=progress_msg_id,
-                                content=full_text,
-                            )
+                            _edit_kwargs = {
+                                "chat_id": source.chat_id,
+                                "message_id": progress_msg_id,
+                                "content": full_text,
+                            }
+                            if source.platform == Platform.FEISHU and _progress_metadata:
+                                _edit_kwargs["metadata"] = _progress_metadata
+                            await adapter.edit_message(**_edit_kwargs)
                         except Exception:
                             pass
                     return
@@ -7707,7 +8397,11 @@ class GatewayRunner:
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
-        _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _status_thread_metadata = (
+            _build_source_metadata(_status_adapter, source, thread_id=_progress_thread_id)
+            if _status_adapter
+            else ({"thread_id": _progress_thread_id} if _progress_thread_id else None)
+        )
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter:
@@ -7808,33 +8502,59 @@ class GatewayRunner:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                     _adapter = self.adapters.get(source.platform)
                     if _adapter:
-                        # Platforms that don't support editing sent messages
-                        # (e.g. WeChat) must not show a cursor in intermediate
-                        # sends — the cursor would be permanently visible because
-                        # it can never be edited away.  Use an empty cursor for
-                        # such platforms so streaming still delivers the final
-                        # response, just without the typing indicator.
-                        _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                        _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
-                        # Some Matrix clients render the streaming cursor
-                        # as a visible tofu/white-box artifact.  Keep
-                        # streaming text on Matrix, but suppress the cursor.
-                        if source.platform == Platform.MATRIX:
-                            _effective_cursor = ""
-                        _consumer_cfg = StreamConsumerConfig(
-                            edit_interval=_scfg.edit_interval,
-                            buffer_threshold=_scfg.buffer_threshold,
-                            cursor=_effective_cursor,
-                        )
-                        _stream_consumer = GatewayStreamConsumer(
-                            adapter=_adapter,
-                            chat_id=source.chat_id,
-                            config=_consumer_cfg,
-                            metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
-                        )
-                        if _want_stream_deltas:
-                            _stream_delta_cb = _stream_consumer.on_delta
-                        stream_consumer_holder[0] = _stream_consumer
+                        _adapter_stream_cfg = None
+                        if hasattr(_adapter, "get_stream_consumer_config"):
+                            try:
+                                _adapter_stream_cfg = _adapter.get_stream_consumer_config(
+                                    default_edit_interval=_scfg.edit_interval,
+                                    default_buffer_threshold=_scfg.buffer_threshold,
+                                    default_cursor=_scfg.cursor,
+                                )
+                            except Exception as _adapter_cfg_err:
+                                logger.debug("Could not load adapter stream config: %s", _adapter_cfg_err)
+                        if isinstance(_adapter_stream_cfg, dict) and not _adapter_stream_cfg.get("enabled", True):
+                            _adapter_stream_cfg = None
+                            _stream_consumer = None
+                            _stream_delta_cb = None
+                            stream_consumer_holder[0] = None
+                        elif isinstance(_adapter_stream_cfg, dict):
+                            _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
+                            _effective_cursor = str(_adapter_stream_cfg.get("cursor", _scfg.cursor))
+                            if not _adapter_supports_edit or source.platform == Platform.MATRIX:
+                                _effective_cursor = ""
+                            _consumer_cfg = StreamConsumerConfig(
+                                edit_interval=float(_adapter_stream_cfg.get("edit_interval", _scfg.edit_interval)),
+                                buffer_threshold=int(_adapter_stream_cfg.get("buffer_threshold", _scfg.buffer_threshold)),
+                                cursor=_effective_cursor,
+                            )
+                            _stream_consumer = GatewayStreamConsumer(
+                                adapter=_adapter,
+                                chat_id=source.chat_id,
+                                config=_consumer_cfg,
+                                metadata=_build_source_metadata(_adapter, source, thread_id=_progress_thread_id),
+                            )
+                            if _want_stream_deltas:
+                                _stream_delta_cb = _stream_consumer.on_delta
+                            stream_consumer_holder[0] = _stream_consumer
+                        else:
+                            _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
+                            _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
+                            if source.platform == Platform.MATRIX:
+                                _effective_cursor = ""
+                            _consumer_cfg = StreamConsumerConfig(
+                                edit_interval=_scfg.edit_interval,
+                                buffer_threshold=_scfg.buffer_threshold,
+                                cursor=_effective_cursor,
+                            )
+                            _stream_consumer = GatewayStreamConsumer(
+                                adapter=_adapter,
+                                chat_id=source.chat_id,
+                                config=_consumer_cfg,
+                                metadata=_build_source_metadata(_adapter, source, thread_id=_progress_thread_id),
+                            )
+                            if _want_stream_deltas:
+                                _stream_delta_cb = _stream_consumer.on_delta
+                            stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
@@ -8240,7 +8960,9 @@ class GatewayRunner:
                     return
                 await asyncio.sleep(0.05)
 
-        stream_task = asyncio.create_task(_start_stream_consumer())
+        stream_task = None
+        if self.adapters.get(source.platform) is not None:
+            stream_task = asyncio.create_task(_start_stream_consumer())
         
         # Track this agent as running for this session (for interrupt support)
         # We do this in a callback after the agent is created

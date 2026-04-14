@@ -822,7 +822,9 @@ class AIAgent:
         # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
         # (which creates a new AIAgent per message) won't duplicate handlers.
         from hermes_logging import setup_logging, setup_verbose_logging
-        setup_logging(hermes_home=_hermes_home)
+        # 运行期重新读取 HERMES_HOME，避免测试或 profile 切换后仍写入
+        # 模块导入时缓存的旧目录。
+        setup_logging(hermes_home=get_hermes_home())
 
         if self.verbose_logging:
             setup_verbose_logging()
@@ -6113,7 +6115,10 @@ class AIAgent:
                 preserve_dots=self._anthropic_preserve_dots(),
                 context_length=ctx_len,
                 base_url=getattr(self, "_anthropic_base_url", None),
-                fast_mode=(self.request_overrides or {}).get("speed") == "fast",
+                # 某些单元测试会通过 __new__ 构造最小 agent，再直接调用
+                # _build_api_kwargs()。这里必须对 request_overrides 缺失保持健壮，
+                # 否则 API 参数构建会在进入真实逻辑前提前崩溃。
+                fast_mode=(getattr(self, "request_overrides", None) or {}).get("speed") == "fast",
             )
 
         if self.api_mode == "codex_responses":
@@ -8314,6 +8319,15 @@ class AIAgent:
                         from unittest.mock import Mock
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
+                    if _use_streaming:
+                        _stream_client = getattr(self, "client", None)
+                        if self.api_mode == "codex_responses" and not hasattr(_stream_client, "responses"):
+                            _use_streaming = False
+                        elif self.api_mode == "chat_completions":
+                            _chat_obj = getattr(_stream_client, "chat", None)
+                            _completions = getattr(_chat_obj, "completions", None) if _chat_obj is not None else None
+                            if _completions is None:
+                                _use_streaming = False
 
                     if _use_streaming:
                         response = self._interruptible_streaming_api_call(

@@ -1,0 +1,533 @@
+"""飞书工具 scope 映射与自动授权辅助。
+
+这一层负责两件事：
+
+1. 维护工具动作到飞书 user scope 的映射。
+2. 在飞书网关会话里，工具执行前根据当前用户的本地授权状态判断是否需要
+   自动发起授权卡片。
+
+这里故意把“scope 识别”和“具体业务 API 调用”解耦，避免每个工具都重复拼接
+授权逻辑，也方便后续继续对齐官方插件的 auto-auth / scope merge / 重放机制。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+
+from tools.feishu.client import FeishuAPIError, get_app_granted_scopes
+from tools.feishu.runtime import (
+    get_active_feishu_adapter,
+    get_current_feishu_account_id,
+    register_pending_feishu_tool_replay,
+    require_feishu_session,
+)
+from tools.registry import tool_error
+
+logger = logging.getLogger(__name__)
+
+
+# 与官方插件 tool-scopes.ts 保持同粒度的工具动作键。
+TOOL_SCOPES: Dict[str, List[str]] = {
+    "feishu_bitable_app.create": ["base:app:create"],
+    "feishu_bitable_app.get": ["base:app:read"],
+    "feishu_bitable_app.list": ["space:document:retrieve"],
+    "feishu_bitable_app.patch": ["base:app:update"],
+    "feishu_bitable_app.copy": ["base:app:copy"],
+    "feishu_bitable_app_table.create": ["base:table:create"],
+    "feishu_bitable_app_table.list": ["base:table:read"],
+    "feishu_bitable_app_table.patch": ["base:table:update"],
+    "feishu_bitable_app_table.batch_create": ["base:table:create"],
+    "feishu_bitable_app_table_field.create": ["base:field:create"],
+    "feishu_bitable_app_table_field.list": ["base:field:read"],
+    "feishu_bitable_app_table_field.update": ["base:field:read", "base:field:update"],
+    "feishu_bitable_app_table_field.delete": ["base:field:delete"],
+    "feishu_bitable_app_table_record.create": ["base:record:create"],
+    "feishu_bitable_app_table_record.update": ["base:record:update"],
+    "feishu_bitable_app_table_record.delete": ["base:record:delete"],
+    "feishu_bitable_app_table_record.batch_create": ["base:record:create"],
+    "feishu_bitable_app_table_record.batch_update": ["base:record:update"],
+    "feishu_bitable_app_table_record.batch_delete": ["base:record:delete"],
+    "feishu_bitable_app_table_record.list": ["base:record:retrieve"],
+    "feishu_bitable_app_table_view.create": ["base:view:write_only"],
+    "feishu_bitable_app_table_view.get": ["base:view:read"],
+    "feishu_bitable_app_table_view.list": ["base:view:read"],
+    "feishu_bitable_app_table_view.patch": ["base:view:write_only"],
+    "feishu_calendar_calendar.list": ["calendar:calendar:read"],
+    "feishu_calendar_calendar.get": ["calendar:calendar:read"],
+    "feishu_calendar_calendar.primary": ["calendar:calendar:read"],
+    "feishu_calendar_event.create": ["calendar:calendar.event:create", "calendar:calendar.event:update"],
+    "feishu_calendar_event.list": ["calendar:calendar.event:read"],
+    "feishu_calendar_event.get": ["calendar:calendar.event:read"],
+    "feishu_calendar_event.patch": ["calendar:calendar.event:update"],
+    "feishu_calendar_event.delete": ["calendar:calendar.event:delete"],
+    "feishu_calendar_event.search": ["calendar:calendar.event:read"],
+    "feishu_calendar_event.reply": ["calendar:calendar.event:reply"],
+    "feishu_calendar_event.instances": ["calendar:calendar.event:read"],
+    "feishu_calendar_event.instance_view": ["calendar:calendar.event:read"],
+    "feishu_calendar_event_attendee.create": ["calendar:calendar.event:update"],
+    "feishu_calendar_event_attendee.list": ["calendar:calendar.event:read"],
+    "feishu_calendar_freebusy.list": ["calendar:calendar.free_busy:read"],
+    "feishu_chat.search": ["im:chat:read"],
+    "feishu_chat.get": ["im:chat:read"],
+    "feishu_chat_members.default": ["im:chat.members:read"],
+    "feishu_drive_file.list": ["space:document:retrieve"],
+    "feishu_drive_file.get_meta": ["drive:drive.metadata:readonly"],
+    "feishu_drive_file.copy": ["docs:document:copy"],
+    "feishu_drive_file.move": ["space:document:move"],
+    "feishu_drive_file.delete": ["space:document:delete"],
+    "feishu_drive_file.upload": ["drive:file:upload"],
+    "feishu_drive_file.download": ["drive:file:download"],
+    "feishu_doc_media.download": ["board:whiteboard:node:read", "docs:document.media:download"],
+    "feishu_doc_media.insert": ["docx:document:write_only", "docs:document.media:upload"],
+    "feishu_doc_comments.list": ["wiki:node:read", "docs:document.comment:read"],
+    "feishu_doc_comments.list_replies": ["wiki:node:read", "docs:document.comment:read"],
+    "feishu_doc_comments.create": ["wiki:node:read", "docs:document.comment:create"],
+    "feishu_doc_comments.reply": ["wiki:node:read", "docs:document.comment:create"],
+    "feishu_doc_comments.patch": ["docs:document.comment:update"],
+    "feishu_fetch_doc.default": ["docx:document:readonly", "wiki:node:read"],
+    "feishu_create_doc.default": [
+        "board:whiteboard:node:create",
+        "docx:document:create",
+        "docx:document:readonly",
+        "docx:document:write_only",
+        "wiki:node:create",
+        "wiki:node:read",
+        "docs:document.media:upload",
+    ],
+    "feishu_update_doc.default": [
+        "board:whiteboard:node:create",
+        "docx:document:create",
+        "docx:document:readonly",
+        "docx:document:write_only",
+    ],
+    "feishu_im_user_get_messages.default": [
+        "im:chat:read",
+        "im:message:readonly",
+        "im:message.group_msg:get_as_user",
+        "im:message.p2p_msg:get_as_user",
+        "contact:contact.base:readonly",
+        "contact:user.base:readonly",
+    ],
+    "feishu_im_user_get_thread_messages.default": [
+        "im:chat:read",
+        "im:message:readonly",
+        "im:message.group_msg:get_as_user",
+        "im:message.p2p_msg:get_as_user",
+        "contact:contact.base:readonly",
+        "contact:user.base:readonly",
+    ],
+    "feishu_im_user_search_messages.default": [
+        "im:chat:read",
+        "im:message:readonly",
+        "im:message.group_msg:get_as_user",
+        "im:message.p2p_msg:get_as_user",
+        "contact:contact.base:readonly",
+        "contact:user.base:readonly",
+        "search:message",
+    ],
+    "feishu_im_user_message.send": ["im:message", "im:message.send_as_user"],
+    "feishu_im_user_message.reply": ["im:message", "im:message.send_as_user"],
+    "feishu_im_user_fetch_resource.default": [
+        "im:message.group_msg:get_as_user",
+        "im:message.p2p_msg:get_as_user",
+        "im:message:readonly",
+    ],
+    "feishu_sheet.info": ["sheets:spreadsheet.meta:read", "sheets:spreadsheet:read"],
+    "feishu_sheet.read": ["sheets:spreadsheet.meta:read", "sheets:spreadsheet:read"],
+    "feishu_sheet.write": [
+        "sheets:spreadsheet.meta:read",
+        "sheets:spreadsheet:read",
+        "sheets:spreadsheet:create",
+        "sheets:spreadsheet:write_only",
+    ],
+    "feishu_sheet.append": [
+        "sheets:spreadsheet.meta:read",
+        "sheets:spreadsheet:read",
+        "sheets:spreadsheet:create",
+        "sheets:spreadsheet:write_only",
+    ],
+    "feishu_sheet.find": ["sheets:spreadsheet.meta:read", "sheets:spreadsheet:read"],
+    "feishu_sheet.create": [
+        "sheets:spreadsheet.meta:read",
+        "sheets:spreadsheet:read",
+        "sheets:spreadsheet:create",
+        "sheets:spreadsheet:write_only",
+    ],
+    "feishu_sheet.export": ["docs:document:export"],
+    "feishu_task_task.create": ["task:task:write", "task:task:writeonly"],
+    "feishu_task_task.get": ["task:task:read", "task:task:write"],
+    "feishu_task_task.list": ["task:task:read", "task:task:write"],
+    "feishu_task_task.patch": ["task:task:write", "task:task:writeonly"],
+    "feishu_task_tasklist.create": ["task:tasklist:write"],
+    "feishu_task_tasklist.get": ["task:tasklist:read", "task:tasklist:write"],
+    "feishu_task_tasklist.list": ["task:tasklist:read", "task:tasklist:write"],
+    "feishu_task_tasklist.tasks": ["task:tasklist:read", "task:tasklist:write"],
+    "feishu_task_tasklist.patch": ["task:tasklist:write"],
+    "feishu_task_tasklist.add_members": ["task:tasklist:write"],
+    "feishu_task_comment.create": ["task:comment:write"],
+    "feishu_task_comment.list": ["task:comment:read", "task:comment:write"],
+    "feishu_task_comment.get": ["task:comment:read", "task:comment:write"],
+    "feishu_task_section.create": ["task:task"],
+    "feishu_task_section.get": ["task:task"],
+    "feishu_task_section.list": ["task:task"],
+    "feishu_task_section.patch": ["task:task"],
+    "feishu_task_section.tasks": ["task:task"],
+    "feishu_task_subtask.create": ["task:task:write"],
+    "feishu_task_subtask.list": ["task:task:read", "task:task:write"],
+    "feishu_wiki_space.list": ["wiki:space:retrieve"],
+    "feishu_wiki_space.get": ["wiki:space:read"],
+    "feishu_wiki_space.create": ["wiki:space:write_only"],
+    "feishu_wiki_space_node.list": ["wiki:node:retrieve"],
+    "feishu_wiki_space_node.get": ["wiki:node:read"],
+    "feishu_wiki_space_node.create": ["wiki:node:create"],
+    "feishu_wiki_space_node.move": ["wiki:node:move"],
+    "feishu_wiki_space_node.copy": ["wiki:node:copy"],
+}
+
+SENSITIVE_SCOPES = {
+    "im:message.send_as_user",
+    "space:document:delete",
+    "calendar:calendar.event:delete",
+    "base:table:delete",
+}
+
+REQUIRED_APP_SCOPES: List[str] = [
+    "contact:contact.base:readonly",
+    "docx:document:readonly",
+    "im:chat:read",
+    "im:chat:update",
+    "im:message.group_at_msg:readonly",
+    "im:message.p2p_msg:readonly",
+    "im:message.pins:read",
+    "im:message.pins:write_only",
+    "im:message.reactions:read",
+    "im:message.reactions:write_only",
+    "im:message:readonly",
+    "im:message:recall",
+    "im:message:send_as_bot",
+    "im:message:send_multi_users",
+    "im:message:send_sys_msg",
+    "im:message:update",
+    "im:resource",
+    "application:application:self_manage",
+    "cardkit:card:write",
+    "cardkit:card:read",
+]
+
+
+def _run_async(coro):
+    """在同步工具 handler 中安全执行协程。"""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, coro)
+            return future.result(timeout=30)
+    return asyncio.run(coro)
+
+
+def _normalize_scopes(scopes: List[str]) -> List[str]:
+    """去重并保持顺序稳定，保证卡片和状态判断可预期。"""
+    result: List[str] = []
+    seen: set[str] = set()
+    for item in scopes:
+        scope = str(item or "").strip()
+        if not scope or scope in seen:
+            continue
+        seen.add(scope)
+        result.append(scope)
+    return result
+
+
+def get_scope_action_key(tool_name: str, action: Optional[str] = None) -> str:
+    """将工具名和动作归一为统一 key。
+
+    大部分飞书工具是 action 型；少数工具没有 action 字段，使用 default。
+    """
+    normalized_tool = str(tool_name or "").strip()
+    normalized_action = str(action or "").strip().lower() or "default"
+    return f"{normalized_tool}.{normalized_action}"
+
+
+def get_required_scopes(tool_name: str, action: Optional[str] = None) -> List[str]:
+    """返回某个工具动作要求的全部 user scopes。"""
+    return list(TOOL_SCOPES.get(get_scope_action_key(tool_name, action), []))
+
+
+def get_missing_scopes(tool_name: str, action: Optional[str] = None, granted_scopes: Optional[List[str]] = None) -> List[str]:
+    """根据已授权 scope 计算仍然缺失的权限。"""
+    required = get_required_scopes(tool_name, action)
+    granted = {str(item or "").strip() for item in granted_scopes or [] if str(item or "").strip()}
+    return [scope for scope in required if scope not in granted]
+
+
+def split_sensitive_scopes(scopes: List[str]) -> Tuple[List[str], List[str]]:
+    """区分普通权限与高敏感权限，便于后续做分批授权。"""
+    safe_scopes: List[str] = []
+    sensitive_scopes: List[str] = []
+    for scope in _normalize_scopes(scopes):
+        if scope in SENSITIVE_SCOPES:
+            sensitive_scopes.append(scope)
+        else:
+            safe_scopes.append(scope)
+    return safe_scopes, sensitive_scopes
+
+
+def ensure_authorization(
+    *,
+    tool_name: str,
+    action: Optional[str],
+    title: Optional[str] = None,
+    reason: Optional[str] = None,
+    force_request: bool = False,
+    override_scopes: Optional[List[str]] = None,
+    tool_args: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """在飞书网关会话里自动检查用户授权状态。
+
+    返回：
+    - `None`：说明无需拦截，工具可继续执行。
+    - JSON string：说明已发起授权请求，调用方应直接返回该结果。
+
+    当前阶段只在“存在飞书会话 + 存在活跃适配器”时拦截。这样不会破坏 CLI
+    或其他离线环境中直接使用 tenant token 的既有行为。
+    """
+    required_scopes = _normalize_scopes(list(override_scopes or [])) or get_required_scopes(tool_name, action)
+    if not required_scopes:
+        return None
+
+    try:
+        session = require_feishu_session()
+        adapter = get_active_feishu_adapter()
+    except Exception:
+        return None
+
+    user_open_id = str(session.get("user_id", "") or "").strip()
+    chat_id = str(session.get("chat_id", "") or "").strip()
+    if not user_open_id or not chat_id:
+        return None
+    replay_id = ""
+    if tool_args is not None:
+        try:
+            replay_id = register_pending_feishu_tool_replay(
+                tool_name=tool_name,
+                args=tool_args,
+                session=session,
+            )
+        except Exception:
+            logger.debug("failed to register pending Feishu tool replay", exc_info=True)
+
+    account_id = session.get("account_id") or None
+    if account_id:
+        status = adapter.get_authorization_status(
+            user_open_id,
+            required_scopes,
+            account_id=account_id,
+        )
+    else:
+        status = adapter.get_authorization_status(user_open_id, required_scopes)
+    if status.get("authorized") and not force_request:
+        return None
+
+    missing_scopes = _normalize_scopes(list(status.get("missing_scopes") or []))
+    if force_request and not missing_scopes:
+        missing_scopes = list(required_scopes)
+    if not missing_scopes:
+        return None
+
+    safe_scopes, sensitive_scopes = split_sensitive_scopes(missing_scopes)
+    request_scopes = safe_scopes + sensitive_scopes
+    if not request_scopes:
+        return None
+
+    action_name = str(action or "").strip().lower() or "default"
+    title_text = str(title or "").strip() or "Feishu Authorization Required"
+    if reason:
+        reason_text = str(reason).strip()
+    else:
+        reason_text = (
+            f"The tool `{tool_name}` action `{action_name}` needs additional Feishu user permissions "
+            "before it can continue."
+        )
+        if sensitive_scopes:
+            reason_text += " Some requested scopes are sensitive and should be reviewed carefully."
+
+    result = _run_async(
+        adapter.send_oauth_request_card(
+            chat_id=chat_id,
+            scopes=request_scopes,
+            reason=reason_text,
+            title=title_text,
+            metadata={
+                "thread_id": session.get("thread_id") or None,
+                "account_id": session.get("account_id") or None,
+                "requester_open_id": user_open_id,
+                "tool_name": tool_name,
+                "action": action_name,
+                "replay_id": replay_id or None,
+            },
+        )
+    )
+    if not result.success:
+        logger.error(
+            "feishu authorization card send failed: tool=%s action=%s user_open_id=%s error=%s",
+            tool_name,
+            action_name,
+            user_open_id,
+            result.error,
+        )
+        return tool_error(result.error or "Failed to send Feishu authorization card.")
+
+    raw_response = result.raw_response if isinstance(result.raw_response, dict) else {}
+    return json.dumps(
+        {
+            "status": "pending_authorization",
+            "tool": tool_name,
+            "action": action_name,
+            "user_open_id": user_open_id,
+            "requested_scopes": required_scopes,
+            "missing_scopes": missing_scopes,
+            "safe_scopes": safe_scopes,
+            "sensitive_scopes": sensitive_scopes,
+            "message_id": result.message_id,
+            "request_id": raw_response.get("request_id"),
+            "replay_id": replay_id,
+        },
+        ensure_ascii=False,
+    )
+
+
+def get_missing_app_scopes(required_scopes: List[str]) -> List[str]:
+    """计算当前应用尚未开通的 scopes。
+
+    如果无法查询应用权限，交由调用方决定如何降级。
+    """
+    granted = set(get_app_granted_scopes())
+    return [scope for scope in _normalize_scopes(required_scopes) if scope not in granted]
+
+
+def handle_authorization_error(
+    exc: Exception,
+    *,
+    tool_name: str,
+    action: Optional[str],
+    title: Optional[str] = None,
+    tool_args: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """将飞书服务端权限错误转换为更可执行的结果。
+
+    - 99991679: 用户未授权或授权不足 → 自动发授权卡
+    - 99991672: 应用未开通权限 → 返回结构化 app_scope_missing
+    """
+    if not isinstance(exc, FeishuAPIError):
+        return None
+
+    required_scopes = get_required_scopes(tool_name, action)
+    if exc.code == 99991679:
+        missing_scopes = _normalize_scopes(exc.missing_scopes or required_scopes)
+        return ensure_authorization(
+            tool_name=tool_name,
+            action=action,
+            title=title,
+            reason="The Feishu API reported that the current user still needs more permissions.",
+            force_request=True,
+            override_scopes=missing_scopes,
+            tool_args=tool_args,
+        )
+
+    if exc.code == 99991672:
+        account_id = None
+        owner_open_id = ""
+        requester_open_id = ""
+        replay_id = ""
+        request_created = False
+        request_id = ""
+        message_id = ""
+        try:
+            from tools.feishu.client import get_app_info
+
+            account_id = get_current_feishu_account_id() or None
+            app_info = get_app_info(account_id=account_id)
+            owner_open_id = str(app_info.get("effective_owner_open_id", "") or "").strip()
+        except Exception:
+            owner_open_id = ""
+        try:
+            session = require_feishu_session()
+            requester_open_id = str(session.get("user_id", "") or "").strip()
+            account_id = account_id or session.get("account_id") or None
+            if tool_args is not None:
+                replay_id = register_pending_feishu_tool_replay(
+                    tool_name=tool_name,
+                    args=tool_args,
+                    session=session,
+                )
+        except Exception:
+            requester_open_id = ""
+
+        try:
+            missing_app_scopes = get_missing_app_scopes(required_scopes) or _normalize_scopes(exc.missing_scopes or required_scopes)
+        except Exception:
+            missing_app_scopes = _normalize_scopes(exc.missing_scopes or required_scopes)
+        try:
+            session = require_feishu_session()
+            adapter = get_active_feishu_adapter()
+            result = _run_async(
+                adapter.send_app_scope_request_card(
+                    chat_id=str(session.get("chat_id", "") or "").strip(),
+                    scopes=missing_app_scopes,
+                    reason=(
+                        "The Feishu API reported that the application is missing app scopes for this action."
+                    ),
+                    title="Feishu App Authorization Required",
+                    metadata={
+                        "thread_id": session.get("thread_id") or None,
+                        "account_id": account_id,
+                        "owner_open_id": owner_open_id,
+                        "requester_open_id": requester_open_id,
+                        "tool_name": tool_name,
+                        "action": str(action or "").strip().lower() or "default",
+                        "replay_id": replay_id or None,
+                    },
+                )
+            )
+            if result.success:
+                request_created = True
+                message_id = str(result.message_id or "").strip()
+                raw_response = result.raw_response if isinstance(result.raw_response, dict) else {}
+                request_id = str(raw_response.get("request_id", "") or "").strip()
+        except Exception:
+            logger.debug("failed to create Feishu app-scope request card", exc_info=True)
+        is_owner = bool(owner_open_id and requester_open_id and owner_open_id == requester_open_id)
+        resolution_command = "/feishu auth batch" if is_owner else ""
+        resolution_hint = (
+            "Run `/feishu auth batch` in the current Feishu chat after the app owner grants the missing app scopes."
+            if is_owner
+            else "Ask the Feishu app owner to grant the missing app scopes and then run `/feishu auth batch` in chat."
+        )
+        return tool_error(
+            f"Feishu app scopes are missing for {tool_name}.{str(action or 'default').strip().lower() or 'default'}.",
+            error_type="app_scope_missing",
+            code=exc.code,
+            missing_app_scopes=missing_app_scopes,
+            requested_scopes=required_scopes,
+            owner_open_id=owner_open_id,
+            requester_open_id=requester_open_id,
+            requester_is_owner=is_owner,
+            resolution_command=resolution_command,
+            resolution_hint=resolution_hint,
+            account_id=account_id,
+            request_created=request_created,
+            request_id=request_id,
+            message_id=message_id,
+            replay_id=replay_id,
+        )
+
+    return None

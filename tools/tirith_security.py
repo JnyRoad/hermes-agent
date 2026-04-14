@@ -352,7 +352,9 @@ def _install_tirith(*, log_failures: bool = True) -> tuple[str | None, str]:
                     if ".." in member.name:
                         continue
                     member.name = "tirith"
-                    tar.extract(member, tmpdir)
+                    # 仅解压单个已校验成员，且显式指定过滤策略，避免 Python 3.14
+                    # 对 tar.extract 默认行为变更带来的弃用告警。
+                    tar.extract(member, tmpdir, filter="data")
                     break
             else:
                 log("tirith binary not found in archive")
@@ -612,7 +614,17 @@ def check_command_security(command: str) -> dict:
     if not cfg["tirith_enabled"]:
         return {"action": "allow", "findings": [], "summary": ""}
 
-    tirith_path = _resolve_tirith_path(cfg["tirith_path"])
+    # 运行时检查必须是非阻塞的。默认 "tirith" 场景不能走
+    # _resolve_tirith_path()，否则它可能触发同步下载，导致网关审批线程
+    # 在发送告警前就卡死。这里先触发后台安装，再回落到配置路径，让缺失
+    # 二进制走现有 OSError fail-open / fail-closed 语义。
+    configured_path = cfg["tirith_path"]
+    if _is_explicit_path(configured_path):
+        tirith_path = _resolve_tirith_path(configured_path)
+        if not tirith_path:
+            tirith_path = os.path.expanduser(configured_path)
+    else:
+        tirith_path = ensure_installed(log_failures=False) or configured_path
     timeout = cfg["tirith_timeout"]
     fail_open = cfg["tirith_fail_open"]
 

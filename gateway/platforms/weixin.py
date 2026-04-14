@@ -796,7 +796,6 @@ def _pack_markdown_blocks_for_weixin(content: str, max_length: int) -> List[str]
         packed.append(current)
     return packed
 
-
 def _split_text_for_weixin_delivery(
     content: str, max_length: int, split_per_line: bool = False,
 ) -> List[str]:
@@ -1542,12 +1541,12 @@ class WeixinAdapter(BasePlatformAdapter):
     async def send_image_file(
         self,
         chat_id: str,
-        path: str,
+        image_path: str,
         caption: str = "",
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        return await self.send_document(chat_id, file_path=path, caption=caption, metadata=metadata)
+        return await self.send_document(chat_id, image_path, caption=caption, metadata=metadata)
 
     async def send_document(
         self,

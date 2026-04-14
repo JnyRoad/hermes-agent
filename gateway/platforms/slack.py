@@ -578,6 +578,12 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             client = self._get_client(chat_id) if chat_id else self._app.client
             result = await client.users_info(user=user_id)
+            # 部分测试会把 Slack client 留在默认 AsyncMock 状态，await 后得到的
+            # 结果不是 dict。若继续访问 .get()，会触发未等待协程告警。
+            # 这里把非结构化返回视为查询失败，直接回退到 user_id。
+            if not isinstance(result, dict):
+                self._user_name_cache[user_id] = user_id
+                return user_id
             user = result.get("user", {})
             # Prefer display_name → real_name → user_id
             profile = user.get("profile", {})

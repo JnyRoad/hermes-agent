@@ -13,6 +13,7 @@ Regression tests for two bugs in WhatsAppAdapter.connect():
 """
 
 import asyncio
+import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -38,6 +39,33 @@ class _AsyncCM:
         return False
 
 
+async def _async_noop(*args, **kwargs):
+    return None
+
+
+def _create_task_stub(coro, *args, **kwargs):
+    """Synchronously consume scheduled coroutines to avoid leaked awaitables in tests."""
+    if asyncio.iscoroutine(coro):
+        coro.close()
+    return MagicMock()
+
+
+class _CancelledTask:
+    """Minimal awaitable task stub that raises CancelledError when awaited."""
+
+    def __init__(self):
+        self.cancel = MagicMock()
+
+    def done(self):
+        return False
+
+    def __await__(self):
+        async def _raise_cancelled():
+            raise asyncio.CancelledError()
+
+        return _raise_cancelled().__await__()
+
+
 def _make_adapter():
     """Create a WhatsAppAdapter with test attributes (bypass __init__)."""
     from gateway.platforms.whatsapp import WhatsAppAdapter
@@ -47,7 +75,9 @@ def _make_adapter():
     adapter.config = MagicMock()
     adapter._bridge_port = 19876
     adapter._bridge_script = "/tmp/test-bridge.js"
-    adapter._session_path = Path("/tmp/test-wa-session")
+    # xdist 并行执行时不能共用固定 session_path，否则会命中真实的
+    # whatsapp-session 作用域锁，导致连接流程在进入桥接健康检查前就提前失败。
+    adapter._session_path = Path("/tmp") / f"test-wa-session-{uuid.uuid4().hex}"
     adapter._bridge_log_fh = None
     adapter._bridge_log = None
     adapter._bridge_process = None
@@ -72,9 +102,12 @@ def _mock_aiohttp(status=200, json_data=None, json_side_effect=None):
     mock_resp = MagicMock()
     mock_resp.status = status
     if json_side_effect:
-        mock_resp.json = AsyncMock(side_effect=json_side_effect)
+        async def _json():
+            raise json_side_effect
     else:
-        mock_resp.json = AsyncMock(return_value=json_data or {})
+        async def _json():
+            return json_data or {}
+    mock_resp.json = _json
 
     mock_session = MagicMock()
     mock_session.get = MagicMock(return_value=_AsyncCM(mock_resp))
@@ -95,8 +128,11 @@ def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
         patch("subprocess.run", return_value=MagicMock(returncode=0)),
         patch("subprocess.Popen", return_value=mock_proc),
         patch("builtins.open", return_value=mock_fh),
-        patch("gateway.platforms.whatsapp.asyncio.sleep", new_callable=AsyncMock),
-        patch("gateway.platforms.whatsapp.asyncio.create_task"),
+        patch("gateway.platforms.whatsapp.asyncio.sleep", new=_async_noop),
+        patch(
+            "gateway.platforms.whatsapp.asyncio.create_task",
+            new=MagicMock(side_effect=_create_task_stub),
+        ),
     ]
     if mock_client_cls is not None:
         base.append(patch("aiohttp.ClientSession", mock_client_cls))
@@ -433,7 +469,8 @@ class TestHttpSessionLifecycle:
     async def test_session_closed_on_disconnect(self):
         """disconnect() should close self._http_session."""
         adapter = _make_adapter()
-        mock_session = AsyncMock()
+        mock_session = MagicMock()
+        mock_session.close = AsyncMock()
         mock_session.closed = False
         adapter._http_session = mock_session
         adapter._poll_task = None
@@ -443,14 +480,15 @@ class TestHttpSessionLifecycle:
 
         await adapter.disconnect()
 
-        mock_session.close.assert_called_once()
+        mock_session.close.assert_awaited_once()
         assert adapter._http_session is None
 
     @pytest.mark.asyncio
     async def test_session_not_closed_when_already_closed(self):
         """disconnect() should skip close() when session is already closed."""
         adapter = _make_adapter()
-        mock_session = AsyncMock()
+        mock_session = MagicMock()
+        mock_session.close = AsyncMock()
         mock_session.closed = True
         adapter._http_session = mock_session
         adapter._poll_task = None
@@ -460,19 +498,14 @@ class TestHttpSessionLifecycle:
 
         await adapter.disconnect()
 
-        mock_session.close.assert_not_called()
+        mock_session.close.assert_not_awaited()
         assert adapter._http_session is None
 
     @pytest.mark.asyncio
     async def test_poll_task_cancelled_on_disconnect(self):
         """disconnect() should cancel the poll task."""
         adapter = _make_adapter()
-        mock_task = MagicMock()
-        mock_task.done.return_value = False
-        mock_task.cancel = MagicMock()
-        mock_future = asyncio.Future()
-        mock_future.set_exception(asyncio.CancelledError())
-        mock_task.__await__ = mock_future.__await__
+        mock_task = _CancelledTask()
         adapter._poll_task = mock_task
         adapter._http_session = None
         adapter._bridge_process = None

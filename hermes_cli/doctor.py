@@ -159,6 +159,456 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
         check_warn("Could not verify systemd linger", f"({linger_detail})")
 
 
+def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=None, account_id: str | None = None) -> dict:
+    """汇总飞书集成诊断结果，供 CLI doctor 与网关命令复用。"""
+    items: list[dict[str, str]] = []
+    issues: list[str] = []
+    resolved_account_id = str(account_id or "").strip() or None
+
+    def _record(status: str, label: str, detail: str = "") -> None:
+        items.append({"status": status, "label": label, "detail": detail})
+
+    try:
+        from gateway.config import Platform, load_gateway_config
+    except Exception as exc:
+        _record("warn", "Feishu doctor checks unavailable", f"could not import gateway config: {exc}")
+        return {"items": items, "issues": issues}
+
+    try:
+        gateway_config = load_gateway_config()
+    except Exception as exc:
+        _record("warn", "Failed to load gateway config", str(exc))
+        issues.append("Fix gateway config loading before validating Feishu integration")
+        return {"items": items, "issues": issues}
+
+    feishu_config = gateway_config.platforms.get(Platform.FEISHU)
+    env_has_feishu = bool(os.getenv("FEISHU_APP_ID") or os.getenv("FEISHU_APP_SECRET"))
+    if not feishu_config and not env_has_feishu:
+        _record("warn", "Feishu integration not configured", "optional")
+        return {"items": items, "issues": issues}
+
+    if not feishu_config:
+        _record("fail", "Feishu platform config missing", "env hints exist but platform was not initialized")
+        issues.append("Ensure FEISHU_APP_ID and FEISHU_APP_SECRET are configured correctly")
+        return {"items": items, "issues": issues}
+
+    if feishu_config.enabled:
+        _record("ok", "Feishu platform enabled")
+    else:
+        _record("warn", "Feishu platform disabled", "config present but not enabled")
+
+    app_id = str(feishu_config.extra.get("app_id", "")).strip()
+    app_secret = str(feishu_config.extra.get("app_secret", "")).strip()
+    connection_mode = str(feishu_config.extra.get("connection_mode", "websocket")).strip().lower() or "websocket"
+    domain = str(feishu_config.extra.get("domain", "feishu")).strip().lower() or "feishu"
+    raw_accounts = feishu_config.extra.get("accounts") or {}
+    enabled_accounts: list[dict[str, str]] = []
+    if isinstance(raw_accounts, dict):
+        for raw_account_id, raw_cfg in raw_accounts.items():
+            if not isinstance(raw_cfg, dict):
+                continue
+            if raw_cfg.get("enabled", True) is False:
+                continue
+            enabled_accounts.append(
+                {
+                    "account_id": str(raw_account_id or "").strip(),
+                    "app_id": str(raw_cfg.get("app_id", "") or "").strip(),
+                    "connection_mode": str(
+                        raw_cfg.get("connection_mode")
+                        or connection_mode
+                    ).strip().lower()
+                    or connection_mode,
+                    "domain": str(raw_cfg.get("domain") or domain).strip().lower() or domain,
+                    "webhook_path": str(raw_cfg.get("webhook_path", "") or "").strip(),
+                }
+            )
+
+    if app_id:
+        _record("ok", "FEISHU_APP_ID configured")
+    else:
+        _record("fail", "FEISHU_APP_ID missing")
+        issues.append("Set FEISHU_APP_ID for Feishu integration")
+
+    if app_secret:
+        _record("ok", "FEISHU_APP_SECRET configured")
+    else:
+        _record("fail", "FEISHU_APP_SECRET missing")
+        issues.append("Set FEISHU_APP_SECRET for Feishu integration")
+
+    if connection_mode in {"websocket", "webhook"}:
+        _record("ok", f"Connection mode: {connection_mode}")
+    else:
+        _record("warn", f"Unknown connection mode: {connection_mode}", "expected websocket or webhook")
+        issues.append("Set gateway.feishu.extra.connection_mode to websocket or webhook")
+
+    reply_mode = str(feishu_config.extra.get("reply_mode", "auto") or "auto").strip().lower() or "auto"
+    streaming_enabled = bool(feishu_config.extra.get("streaming", True))
+    block_streaming_enabled = bool(feishu_config.extra.get("block_streaming", True))
+    block_streaming_coalesce_ms = int(feishu_config.extra.get("block_streaming_coalesce_ms", 600) or 600)
+    _record(
+        "info",
+        "Feishu reply and streaming settings",
+        (
+            f"reply_mode={reply_mode} "
+            f"streaming={str(streaming_enabled).lower()} "
+            f"block_streaming={str(block_streaming_enabled).lower()} "
+            f"coalesce_ms={block_streaming_coalesce_ms}"
+        ),
+    )
+    if streaming_enabled:
+        effective_delivery = "streaming in-place updates enabled"
+    elif reply_mode == "card":
+        effective_delivery = "static card-style replies without streaming updates"
+    elif reply_mode == "text":
+        effective_delivery = "static text replies without streaming updates"
+    else:
+        effective_delivery = "static auto-mode replies without streaming updates"
+    if block_streaming_enabled:
+        effective_delivery += f"; coalesced edits at {block_streaming_coalesce_ms}ms when progress updates are emitted"
+    _record("info", "Feishu effective delivery mode", effective_delivery)
+
+    if enabled_accounts:
+        total_accounts = 1 + len(enabled_accounts)
+        _record("ok", f"Feishu accounts configured: {total_accounts}", "primary + enabled secondary accounts")
+        for item in enabled_accounts:
+            detail = f"app_id={item['app_id'] or 'missing'} mode={item['connection_mode']} domain={item['domain']}"
+            if item["webhook_path"]:
+                detail += f" path={item['webhook_path']}"
+            _record("info", f"Account `{item['account_id']}`", detail)
+        if total_accounts > 1:
+            secondary_modes = {
+                str(item.get("connection_mode", "") or connection_mode).strip().lower() or connection_mode
+                for item in enabled_accounts
+            }
+            if connection_mode == "websocket" and secondary_modes == {"websocket"}:
+                _record("ok", "Multi-account websocket routing enabled", f"{total_accounts} accounts")
+            elif connection_mode == "webhook" and secondary_modes == {"webhook"}:
+                _record("ok", "Multi-account webhook routing enabled", f"{total_accounts} accounts")
+            else:
+                mixed_modes = ", ".join(sorted({connection_mode, *secondary_modes}))
+                _record(
+                    "info",
+                    "Feishu multi-account mixed transport",
+                    f"configured modes: {mixed_modes}",
+                )
+
+    if adapter is not None and hasattr(adapter, "get_transport_account_status"):
+        try:
+            transport_statuses = list(adapter.get_transport_account_status() or [])
+            if transport_statuses:
+                detail = ", ".join(
+                    (
+                        f"{str(item.get('account_id', '') or 'default')}="
+                        f"{str(item.get('runtime_state', '') or 'unknown')}/"
+                        f"{str(item.get('connection_mode', '') or 'unknown')}"
+                    )
+                    for item in transport_statuses
+                )
+                _record("info", "Feishu runtime transport status", detail)
+                transport_errors = [
+                    (
+                        f"{str(item.get('account_id', '') or 'default')}="
+                        f"{str(item.get('last_error', '') or '').strip()}"
+                    )
+                    for item in transport_statuses
+                    if str(item.get("last_error", "") or "").strip()
+                ]
+                if transport_errors:
+                    _record(
+                        "warn",
+                        "Feishu runtime transport errors",
+                        "; ".join(transport_errors),
+                    )
+                    issues.append(
+                        "Resolve Feishu runtime transport errors before relying on live chat delivery or directory refresh"
+                    )
+        except Exception as exc:
+            _record("warn", "Feishu runtime transport status unavailable", str(exc))
+
+    if domain in {"feishu", "lark"}:
+        _record("ok", f"Feishu domain: {domain}")
+    else:
+        _record("warn", f"Unknown Feishu domain: {domain}", "expected feishu or lark")
+
+    try:
+        from gateway.channel_directory import load_directory
+
+        raw_directory_settings = feishu_config.extra.get("directory") if isinstance(feishu_config.extra.get("directory"), dict) else {}
+        include_config_users = raw_directory_settings.get("include_config_users")
+        include_config_groups = raw_directory_settings.get("include_config_groups")
+        include_live_users = raw_directory_settings.get("include_live_users")
+        include_live_groups = raw_directory_settings.get("include_live_groups")
+        live_limit = raw_directory_settings.get("live_limit", 50)
+        live_page_size = raw_directory_settings.get("live_page_size", 50)
+        global_directory_detail = (
+            f"config_users={include_config_users if include_config_users is not None else 'default'} "
+            f"config_groups={include_config_groups if include_config_groups is not None else 'default'} "
+            f"users={include_live_users if include_live_users is not None else 'default'} "
+            f"groups={include_live_groups if include_live_groups is not None else 'default'} "
+            f"limit={live_limit} page_size={live_page_size}"
+        )
+        _record(
+            "info",
+            "Feishu directory settings",
+            global_directory_detail,
+        )
+        if adapter is not None and hasattr(adapter, "_get_account_live_directory_settings"):
+            inspected_accounts: list[str] = []
+            if resolved_account_id:
+                inspected_accounts.append(resolved_account_id)
+            else:
+                inspected_accounts.append("default")
+                inspected_accounts.extend(
+                    item["account_id"]
+                    for item in enabled_accounts
+                    if item.get("account_id") and item["account_id"] != "default"
+                )
+            seen_accounts: set[str] = set()
+            for inspected_account in inspected_accounts:
+                normalized_account = str(inspected_account or "default").strip() or "default"
+                if normalized_account in seen_accounts:
+                    continue
+                seen_accounts.add(normalized_account)
+                try:
+                    account_settings = adapter._get_account_live_directory_settings(normalized_account) or {}
+                except Exception as exc:
+                    _record(
+                        "warn",
+                        f"Feishu directory policy ({normalized_account}) unavailable",
+                        str(exc),
+                    )
+                    continue
+                config_users = bool(account_settings.get("include_config_users"))
+                config_groups = bool(account_settings.get("include_config_groups"))
+                live_users = bool(account_settings.get("include_live_users"))
+                live_groups = bool(account_settings.get("include_live_groups"))
+                account_detail = (
+                    f"config_users={str(config_users).lower()} "
+                    f"config_groups={str(config_groups).lower()} "
+                    f"users={str(live_users).lower()} "
+                    f"groups={str(live_groups).lower()} "
+                    f"limit={account_settings.get('live_limit', live_limit)} "
+                    f"page_size={account_settings.get('live_page_size', live_page_size)}"
+                )
+                _record("info", f"Feishu directory policy ({normalized_account})", account_detail)
+                if not any([config_users, config_groups, live_users, live_groups]):
+                    _record(
+                        "warn",
+                        f"Feishu directory disabled for account ({normalized_account})",
+                        "no config-based or live directory sources are enabled",
+                    )
+                    issues.append(
+                        f"Enable at least one Feishu directory source for account `{normalized_account}`"
+                    )
+
+        directory = load_directory()
+        feishu_entries = directory.get("platforms", {}).get("feishu", []) or []
+        if feishu_entries:
+            source_counts: dict[str, int] = {}
+            account_counts: dict[str, int] = {}
+            for item in feishu_entries:
+                if not isinstance(item, dict):
+                    continue
+                source = str(item.get("source", "") or "unknown").strip() or "unknown"
+                account_key = str(item.get("account_id", "") or "default").strip() or "default"
+                source_counts[source] = source_counts.get(source, 0) + 1
+                account_counts[account_key] = account_counts.get(account_key, 0) + 1
+            source_detail = ", ".join(f"{key}={value}" for key, value in sorted(source_counts.items()))
+            account_detail = ", ".join(f"{key}={value}" for key, value in sorted(account_counts.items()))
+            _record("ok", f"Feishu cached directory targets: {len(feishu_entries)}", source_detail)
+            _record("info", "Feishu cached directory accounts", account_detail)
+        else:
+            _record("warn", "Feishu cached directory is empty", "directory refresh has not discovered any Feishu targets yet")
+
+        if adapter is not None and hasattr(adapter, "search_channel_directory_entries"):
+            _record("ok", "Feishu live directory search fallback available")
+        else:
+            _record("info", "Feishu live directory search fallback unavailable", "chat doctor can only inspect cached directory entries")
+    except Exception as exc:
+        _record("warn", "Feishu directory diagnostics unavailable", str(exc))
+
+    if connection_mode == "webhook":
+        verification_token = str(feishu_config.extra.get("verification_token", "")).strip()
+        encrypt_key = str(feishu_config.extra.get("encrypt_key", "")).strip()
+        if verification_token:
+            _record("ok", "FEISHU_VERIFICATION_TOKEN configured")
+        else:
+            _record("warn", "FEISHU_VERIFICATION_TOKEN missing", "recommended for webhook verification")
+            issues.append("Set FEISHU_VERIFICATION_TOKEN when using Feishu webhook mode")
+        if encrypt_key:
+            _record("ok", "FEISHU_ENCRYPT_KEY configured")
+        else:
+            _record("warn", "FEISHU_ENCRYPT_KEY missing", "recommended when event encryption is enabled")
+    else:
+        _record("info", "Webhook-only checks skipped in websocket mode")
+
+    if feishu_config.home_channel and feishu_config.home_channel.chat_id:
+        _record("ok", "Feishu home channel configured")
+    else:
+        _record("info", "Feishu home channel not set")
+
+    if gateway_config.get_unauthorized_dm_behavior(Platform.FEISHU) == "pair":
+        _record("ok", "Unauthorized DM behavior: pair")
+    else:
+        _record("warn", "Unauthorized DM behavior: ignore", "users must be allowed elsewhere")
+
+    try:
+        import lark_oapi  # noqa: F401
+
+        _record("ok", "lark-oapi SDK")
+    except ImportError:
+        _record("warn", "lark-oapi SDK not installed", "Feishu runtime adapter will be unavailable")
+        issues.append(f"Install lark-oapi: {_python_install_cmd()} lark-oapi")
+        return {"items": items, "issues": issues}
+
+    try:
+        from tools.feishu.client import get_app_granted_scopes, get_app_granted_scopes_by_token_type, get_app_info
+        from tools.feishu.scopes import REQUIRED_APP_SCOPES
+
+        granted_scopes = get_app_granted_scopes()
+        _record("ok", f"Feishu app scopes: {len(granted_scopes)} granted")
+        if "application:application:self_manage" in granted_scopes:
+            _record("ok", "App self-manage scope available")
+        else:
+            _record("warn", "App self-manage scope missing", "cannot reliably query current Feishu app permissions")
+            issues.append("Grant application:application:self_manage to improve Feishu scope diagnostics")
+
+        missing_required_app_scopes = [scope for scope in REQUIRED_APP_SCOPES if scope not in set(granted_scopes)]
+        if missing_required_app_scopes:
+            preview = ", ".join(missing_required_app_scopes[:5])
+            if len(missing_required_app_scopes) > 5:
+                preview += ", ..."
+            _record(
+                "warn",
+                f"Feishu required app scopes missing: {len(missing_required_app_scopes)}",
+                preview,
+            )
+            issues.append(
+                "Grant the missing Feishu app scopes to stabilize chat commands, cards, and auto-authorization flows"
+            )
+        else:
+            _record("ok", "Feishu required app scopes configured")
+
+        app_info = get_app_info(account_id=resolved_account_id)
+        owner_open_id = str(app_info.get("effective_owner_open_id", "") or "").strip()
+        if owner_open_id:
+            _record("ok", "Feishu app owner detected", owner_open_id)
+        else:
+            _record("warn", "Feishu app owner unavailable", "owner-only onboarding checks will be limited")
+            issues.append("Resolve Feishu app owner detection before relying on owner-only onboarding")
+
+        granted_user_scopes = list(get_app_granted_scopes_by_token_type("user", account_id=resolved_account_id))
+        _record("info", f"Feishu user scopes granted: {len(granted_user_scopes)}")
+        if not granted_user_scopes:
+            _record(
+                "warn",
+                "Feishu user scopes not granted to app yet",
+                "batch authorization cannot proceed until the app is granted user-token scopes",
+            )
+            issues.append("Grant the required Feishu user scopes first, then retry `/feishu auth batch`")
+        if granted_scopes and "offline_access" not in set(granted_scopes):
+            _record(
+                "warn",
+                "Feishu OAuth prerequisite missing",
+                "offline_access is not granted, so user authorization flows cannot complete",
+            )
+            issues.append("Grant offline_access so `/feishu auth batch` and automatic OAuth flows can complete")
+        onboarding_blockers: list[str] = []
+        if not owner_open_id:
+            onboarding_blockers.append("app owner unavailable")
+        if not granted_user_scopes:
+            onboarding_blockers.append("no app-granted user scopes")
+        if granted_scopes and "offline_access" not in set(granted_scopes):
+            onboarding_blockers.append("offline_access missing")
+        if onboarding_blockers:
+            _record(
+                "warn",
+                "Feishu owner onboarding readiness blocked",
+                ", ".join(onboarding_blockers),
+            )
+        else:
+            _record(
+                "ok",
+                "Feishu owner onboarding prerequisites ready",
+                "owner detection, offline_access, and app-granted user scopes are available",
+            )
+    except Exception as exc:
+        if isinstance(exc, Exception) and exc.__class__.__name__ == "FeishuAPIError" and getattr(exc, "code", None) == 99991672:
+            _record("warn", "Unable to query Feishu app scopes", "application:application:self_manage is missing")
+            issues.append("Grant application:application:self_manage so Hermes can inspect Feishu app permissions")
+        else:
+            _record("warn", "Feishu app scope check failed", str(exc))
+
+    if adapter is not None and user_open_id:
+        auth_status = {}
+        try:
+            resolved_account_id = str(account_id or "").strip() or None
+            if resolved_account_id:
+                auth_status = adapter.get_authorization_status(user_open_id, account_id=resolved_account_id)
+            else:
+                auth_status = adapter.get_authorization_status(user_open_id)
+            granted_scopes = list(auth_status.get("granted_scopes") or [])
+            if granted_scopes:
+                preview = ", ".join(granted_scopes[:5])
+                label = "Current user authorization"
+                if resolved_account_id:
+                    label += f" ({resolved_account_id})"
+                _record("ok", f"{label}: {len(granted_scopes)} granted", preview)
+            else:
+                label = "Current user authorization not granted yet"
+                if resolved_account_id:
+                    label += f" ({resolved_account_id})"
+                _record("info", label)
+        except Exception as exc:
+            _record("warn", "Current user authorization status unavailable", str(exc))
+
+        try:
+            owner_info = get_app_info(account_id=resolved_account_id)
+            owner_open_id = str(owner_info.get("effective_owner_open_id", "") or "").strip()
+            granted_user_scopes = list(
+                get_app_granted_scopes_by_token_type("user", account_id=resolved_account_id)
+            )
+            if owner_open_id:
+                if owner_open_id == user_open_id:
+                    _record("ok", "Current user is Feishu app owner")
+                    if granted_user_scopes:
+                        granted_scope_set = set(auth_status.get("granted_scopes") or [])
+                        missing_owner_scopes = [scope for scope in granted_user_scopes if scope not in granted_scope_set]
+                        if missing_owner_scopes:
+                            _record(
+                                "warn",
+                                "Owner batch authorization recommended",
+                                f"{len(missing_owner_scopes)} user scopes still missing locally",
+                            )
+                            issues.append("Run `/feishu auth batch` as the app owner to authorize remaining user scopes")
+                else:
+                    _record("info", "Current user is not the Feishu app owner", owner_open_id)
+                    issues.append("Ask the Feishu app owner to run `/feishu auth batch` if owner-only onboarding is required")
+        except Exception as exc:
+            _record("warn", "Feishu owner diagnostics unavailable", str(exc))
+
+    return {"items": items, "issues": issues}
+
+
+def _check_feishu_integration(issues: list[str]) -> None:
+    """检查飞书集成的关键配置是否完整。"""
+    print()
+    print(color("◆ Feishu Integration", Colors.CYAN, Colors.BOLD))
+    report = collect_feishu_doctor_report()
+    for item in report["items"]:
+        detail = item.get("detail", "")
+        wrapped_detail = f"({detail})" if detail else ""
+        if item.get("status") == "ok":
+            check_ok(item.get("label", ""), wrapped_detail)
+        elif item.get("status") == "fail":
+            check_fail(item.get("label", ""), wrapped_detail)
+        elif item.get("status") == "info":
+            check_info(item.get("label", "") if not wrapped_detail else f"{item.get('label', '')} {wrapped_detail}")
+        else:
+            check_warn(item.get("label", ""), wrapped_detail)
+    issues.extend(report["issues"])
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
@@ -512,6 +962,7 @@ def run_doctor(args):
             pass
 
     _check_gateway_service_linger(issues)
+    _check_feishu_integration(issues)
     
     # =========================================================================
     # Check: External tools

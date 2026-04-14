@@ -118,6 +118,7 @@ _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+_FEISHU_COMMENT_TARGET_RE = re.compile(r"^feishu-comment://([^/]+)/([^/]+)/([^/?#]+)$")
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -169,9 +170,13 @@ _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30          # max seconds to read request
 _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses before WARNING log
 _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
 _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup window (15 min)
+_FEISHU_AUTH_REQUEST_TTL_SECONDS = 30 * 60         # authorization/app-scope card lifetime (30 min)
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 _FEISHU_ACK_EMOJI = "OK"
+_FEISHU_COMMENT_SCAN_MAX_PAGES = 5
+_FEISHU_COMMENT_PAGE_SIZE = 100
+_FEISHU_COMMENT_REPLY_PAGE_SIZE = 50
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -184,7 +189,6 @@ _ONBOARD_OPEN_URLS = {
 }
 _REGISTRATION_PATH = "/oauth/v1/app/registration"
 _ONBOARD_REQUEST_TIMEOUT_S = 10
-
 # ---------------------------------------------------------------------------
 # Fallback display strings
 # ---------------------------------------------------------------------------
@@ -274,6 +278,8 @@ class FeishuAdapterSettings:
     encrypt_key: str
     verification_token: str
     group_policy: str
+    allow_from: frozenset[str]
+    group_allow_from: frozenset[str]
     allowed_group_users: frozenset[str]
     bot_open_id: str
     bot_user_id: str
@@ -294,6 +300,36 @@ class FeishuAdapterSettings:
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
+    require_mention: bool = True
+    respond_to_mention_all: bool = True
+    reply_mode: str = "auto"
+    dm_policy: str = "open"
+    thread_session: bool = False
+    workspace_tools_enabled: bool = True
+    streaming_cards_enabled: bool = True
+    block_streaming_enabled: bool = True
+    block_streaming_coalesce_ms: int = 600
+    accounts: Dict[str, "FeishuAccountSettings"] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FeishuAccountSettings:
+    """飞书账号级配置，供多账号 webhook 路由与归属校验使用。"""
+
+    account_id: str
+    app_id: str
+    app_secret: str
+    domain_name: str
+    connection_mode: str
+    encrypt_key: str
+    verification_token: str
+    bot_open_id: str
+    bot_user_id: str
+    bot_name: str
+    webhook_path: str
+    webhook_port: int
+    webhook_host: str
+    enabled: bool = True
 
 
 @dataclass
@@ -303,6 +339,9 @@ class FeishuGroupRule:
     policy: str  # "open" | "allowlist" | "blacklist" | "admin_only" | "disabled"
     allowlist: set[str] = field(default_factory=set)
     blacklist: set[str] = field(default_factory=set)
+    enabled: Optional[bool] = None
+    require_mention: Optional[bool] = None
+    respond_to_mention_all: Optional[bool] = None
 
 
 @dataclass
@@ -310,6 +349,141 @@ class FeishuBatchState:
     events: Dict[str, MessageEvent] = field(default_factory=dict)
     tasks: Dict[str, asyncio.Task] = field(default_factory=dict)
     counts: Dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class FeishuPendingQuestion:
+    """等待用户点击回答的问题卡状态。"""
+
+    question_id: str
+    chat_id: str
+    message_id: str
+    question: str
+    options: List[str]
+    header: str
+    note: str = ""
+    thread_id: str = ""
+    account_id: str = ""
+
+
+@dataclass
+class FeishuPendingOAuthRequest:
+    """等待用户确认已完成后台授权的授权提示状态。"""
+
+    request_id: str
+    chat_id: str
+    message_id: str
+    scopes: List[str]
+    reason: str
+    title: str
+    thread_id: str = ""
+    requester_open_id: str = ""
+    account_id: str = ""
+    tool_name: str = ""
+    tool_action: str = "default"
+    replay_id: str = ""
+    replay_ids: List[str] = field(default_factory=list)
+    expires_at: float = 0.0
+
+
+@dataclass
+class FeishuPendingAppScopeRequest:
+    """等待应用所有者完成 app scope 配置的卡片状态。"""
+
+    request_id: str
+    chat_id: str
+    message_id: str
+    scopes: List[str]
+    reason: str
+    title: str
+    owner_open_id: str = ""
+    requester_open_id: str = ""
+    thread_id: str = ""
+    account_id: str = ""
+    tool_name: str = ""
+    tool_action: str = "default"
+    replay_id: str = ""
+    replay_ids: List[str] = field(default_factory=list)
+    expires_at: float = 0.0
+
+
+@dataclass
+class FeishuAuthorizationGrant:
+    """记录某个飞书用户在当前应用上的已确认授权范围。"""
+
+    user_open_id: str
+    scopes: List[str]
+    updated_at: float
+    updated_by: str = ""
+    source: str = "manual_confirm"
+
+
+def _merge_replay_ids(*values: Any) -> List[str]:
+    """Normalize replay identifiers into a stable de-duplicated list."""
+    result: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        candidates = value if isinstance(value, list) else [value]
+        for candidate in candidates:
+            replay_id = str(candidate or "").strip()
+            if not replay_id or replay_id in seen:
+                continue
+            seen.add(replay_id)
+            result.append(replay_id)
+    return result
+
+
+def _new_auth_request_expire_at() -> float:
+    """Return the absolute expiry time for a new pending authorization request."""
+    return time.time() + _FEISHU_AUTH_REQUEST_TTL_SECONDS
+
+
+@dataclass(frozen=True)
+class FeishuDirectoryEntry:
+    """Normalized Feishu directory entry used by the channel directory cache."""
+
+    id: str
+    name: str
+    type: str
+    source: str
+    account_id: str = "default"
+
+
+@dataclass(frozen=True)
+class FeishuCommentEventContext:
+    """Resolved context for one Feishu document comment-thread event."""
+
+    file_token: str
+    file_type: str
+    comment_id: str
+    reply_id: str = ""
+    document_title: str = ""
+    quoted_text: str = ""
+    root_comment_text: str = ""
+    active_text: str = ""
+    event_type: str = "add_comment"
+    reply_chain_lines: List[str] = field(default_factory=list)
+    is_mentioned: bool = False
+    is_whole_comment: bool = False
+    prompt: str = ""
+    preview: str = ""
+
+    def to_payload(self) -> Dict[str, str]:
+        return {
+            "file_token": self.file_token,
+            "file_type": self.file_type,
+            "comment_id": self.comment_id,
+            "reply_id": self.reply_id,
+            "document_title": self.document_title,
+            "quoted_text": self.quoted_text,
+            "root_comment_text": self.root_comment_text,
+            "active_text": self.active_text,
+            "event_type": self.event_type,
+            "preview": self.preview,
+            "is_mentioned": "true" if self.is_mentioned else "false",
+            "is_whole_comment": "true" if self.is_whole_comment else "false",
+            "prompt": self.prompt,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +497,191 @@ def _escape_markdown_text(text: str) -> str:
 
 def _to_boolean(value: Any) -> bool:
     return value is True or value == 1 or value == "true"
+
+
+def _coerce_optional_bool(value: Any) -> Optional[bool]:
+    """把可选布尔配置统一规范成 True/False/None。"""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return None
+
+
+def _build_feishu_comment_target(*, file_type: str, file_token: str, comment_id: str) -> str:
+    """把评论线程目标编码成适配器内部 chat_id，复用网关现有 send 流水线。"""
+    return f"feishu-comment://{file_type}/{file_token}/{comment_id}"
+
+
+def _extract_comment_plain_text(elements: Any) -> str:
+    """从飞书评论元素数组中提取可读文本。"""
+    parts: List[str] = []
+    for item in elements or []:
+        if isinstance(item, SimpleNamespace):
+            item = vars(item)
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type", "") or "").strip().lower()
+        if kind == "text_run":
+            text_run = item.get("text_run")
+            if isinstance(text_run, SimpleNamespace):
+                text_run = vars(text_run)
+            if isinstance(text_run, dict):
+                text = str(text_run.get("text", "") or "").strip()
+                if text:
+                    parts.append(text)
+            continue
+        if kind == "person":
+            person = item.get("person")
+            if isinstance(person, SimpleNamespace):
+                person = vars(person)
+            if isinstance(person, dict):
+                mention_name = str(person.get("name", "") or person.get("user_id", "") or "").strip()
+                if mention_name:
+                    parts.append(f"@{mention_name}")
+            continue
+        if kind == "docs_link":
+            docs_link = item.get("docs_link")
+            if isinstance(docs_link, SimpleNamespace):
+                docs_link = vars(docs_link)
+            if isinstance(docs_link, dict):
+                link_text = str(docs_link.get("url", "") or "").strip()
+                if link_text:
+                    parts.append(link_text)
+    return " ".join(part for part in parts if part).strip()
+
+
+def _infer_is_whole_comment(*, explicit_is_whole: Any = None, quoted_text: str = "") -> bool:
+    """Infer whether a document comment targets the whole document."""
+    if explicit_is_whole is not None:
+        return bool(explicit_is_whole)
+    return not str(quoted_text or "").strip()
+
+
+def _build_comment_reply_chain_lines(replies: List[Dict[str, Any]], target_reply_id: str) -> List[str]:
+    """Return only the replies that happened before the triggering reply.
+
+    Comment-thread prompts should not include replies that were posted after the
+    triggering reply, otherwise the agent may read future context that the user
+    had not seen at event time. When the target reply cannot be found, fall
+    back to all non-empty replies so the prompt still remains actionable.
+    """
+    normalized_target_reply_id = str(target_reply_id or "").strip()
+    if not normalized_target_reply_id:
+        return []
+
+    reply_chain_lines: List[str] = []
+    target_found = False
+    for item in replies:
+        if not isinstance(item, dict):
+            continue
+        current_reply_id = str(item.get("reply_id", "") or "").strip()
+        if current_reply_id == normalized_target_reply_id:
+            target_found = True
+            break
+        reply_author = str((((item.get("user_id") or {}).get("open_id")) or "")).strip() or "unknown"
+        current_text = _extract_comment_plain_text((item.get("content") or {}).get("elements", []))
+        if current_text:
+            reply_chain_lines.append(f"[{reply_author}]: {current_text}")
+
+    if target_found:
+        return reply_chain_lines
+
+    fallback_lines: List[str] = []
+    for item in replies:
+        if not isinstance(item, dict):
+            continue
+        reply_author = str((((item.get("user_id") or {}).get("open_id")) or "")).strip() or "unknown"
+        current_text = _extract_comment_plain_text((item.get("content") or {}).get("elements", []))
+        if current_text:
+            fallback_lines.append(f"[{reply_author}]: {current_text}")
+    return fallback_lines
+
+
+def _classify_tool_progress_line(line: str) -> tuple[str, str]:
+    """Classify gateway tool-progress lines into Feishu-friendly status buckets."""
+    normalized_line = str(line or "").strip()
+    if not normalized_line:
+        return "other", ""
+
+    if normalized_line.startswith(("✅", "✔️", "☑️")):
+        return "completed", normalized_line
+    if normalized_line.startswith(("❌", "⚠️", "🛑")):
+        return "failed", normalized_line
+    if normalized_line.startswith(("⏳", "🔄", "🟡")):
+        return "running", normalized_line
+    return "running", normalized_line
+
+
+def _extract_tool_progress_name(line: str) -> str:
+    """Extract a stable tool name from one rendered progress line."""
+    normalized_line = str(line or "").strip()
+    if not normalized_line:
+        return ""
+
+    stripped_line = re.sub(r"^[^\w]+", "", normalized_line)
+    match = re.match(r"(?P<tool>[A-Za-z0-9_]+)", stripped_line)
+    if not match:
+        return ""
+    return str(match.group("tool") or "").strip()
+
+
+def _summarize_tool_progress_names(lines: List[str], *, limit: int = 3) -> str:
+    """Build a compact tool-name frequency summary for recent progress lines."""
+    counts: Dict[str, int] = {}
+    for line in lines:
+        tool_name = _extract_tool_progress_name(line)
+        if not tool_name:
+            continue
+        counts[tool_name] = counts.get(tool_name, 0) + 1
+
+    if not counts:
+        return ""
+
+    ranked_items = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    parts = [
+        f"{tool_name} ×{count}" if count > 1 else tool_name
+        for tool_name, count in ranked_items[:limit]
+    ]
+    return ", ".join(parts)
+
+
+def _extract_feishu_error_code(value: Any) -> Optional[int]:
+    """Best-effort extraction for Feishu-style numeric error codes.
+
+    Reply APIs may surface withdrawn/missing targets either as structured SDK
+    responses or as raised exceptions. Normalizing both forms lets the adapter
+    reuse the same reply-to-chat fallback semantics across outbound paths.
+    """
+    if value is None:
+        return None
+
+    direct_code = getattr(value, "code", None)
+    if direct_code is not None:
+        try:
+            return int(direct_code)
+        except (TypeError, ValueError):
+            pass
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    match = re.search(r"(?:^|[\s\[(=:])(?P<code>\d{6})(?:$|[\s\]) ,:])", text)
+    if not match:
+        return None
+    try:
+        return int(match.group("code"))
+    except (TypeError, ValueError):
+        return None
 
 
 def _is_style_enabled(style: Dict[str, Any] | None, key: str) -> bool:
@@ -384,13 +743,17 @@ def _strip_markdown_to_plain_text(text: str) -> str:
     """
     from gateway.platforms.helpers import strip_markdown
     plain = text.replace("\r\n", "\n")
+    plain = re.sub(r"\\([\\`*_{}\[\]()#+\-!|>~])", r"\1", plain)
     plain = _MARKDOWN_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2).strip()})", plain)
     plain = re.sub(r"^>\s?", "", plain, flags=re.MULTILINE)
+    plain = re.sub(r"^\s*[-*]\s+", "", plain, flags=re.MULTILINE)
+    plain = re.sub(r"^\s*\d+\.\s+", "", plain, flags=re.MULTILINE)
     plain = re.sub(r"^\s*---+\s*$", "---", plain, flags=re.MULTILINE)
     plain = re.sub(r"~~([^~\n]+)~~", r"\1", plain)
     plain = re.sub(r"<u>([\s\S]*?)</u>", r"\1", plain)
     plain = strip_markdown(plain)
-    return plain
+    plain = re.sub(r"\n{3,}", "\n\n", plain)
+    return _WHITESPACE_RE.sub(" ", plain).strip()
 
 
 def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -> Optional[int]:
@@ -954,14 +1317,21 @@ def _unique_lines(lines: List[str]) -> List[str]:
     return unique
 
 
-def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
+def _run_official_feishu_ws_client(ws_client: Any, adapter: Any, account_id: str = "default") -> None:
     """Run the official Lark WS client in its own thread-local event loop."""
     import lark_oapi.ws.client as ws_client_module
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     ws_client_module.loop = loop
-    adapter._ws_thread_loop = loop
+    ws_thread_loops = getattr(adapter, "_ws_thread_loops_by_account", None)
+    if isinstance(ws_thread_loops, dict):
+        ws_thread_loops[account_id] = loop
+    if account_id == "default" or getattr(adapter, "_ws_thread_loop", None) is None:
+        adapter._ws_thread_loop = loop
+    report_state = getattr(adapter, "_set_transport_runtime_state", None)
+    if callable(report_state):
+        report_state(account_id, "connecting")
 
     original_connect = ws_client_module.websockets.connect
     original_configure = getattr(ws_client, "_configure", None)
@@ -995,8 +1365,15 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     _apply_runtime_ws_overrides()
     try:
         ws_client.start()
-    except Exception:
-        pass
+    except Exception as exc:
+        if callable(report_state):
+            report_state(account_id, "error", error=str(exc))
+        logger.warning(
+            "[Feishu] Websocket transport for account %s exited with error: %s",
+            account_id,
+            exc,
+            exc_info=True,
+        )
     finally:
         ws_client_module.websockets.connect = original_connect
         if original_configure is not None:
@@ -1014,7 +1391,19 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
             loop.close()
         except Exception:
             pass
-        adapter._ws_thread_loop = None
+        ws_thread_loops = getattr(adapter, "_ws_thread_loops_by_account", None)
+        if isinstance(ws_thread_loops, dict):
+            ws_thread_loops.pop(account_id, None)
+        if getattr(adapter, "_ws_thread_loop", None) is loop:
+            adapter._ws_thread_loop = None
+        if callable(report_state):
+            active_states = {"error", "disconnecting"}
+            current_state = None
+            get_state = getattr(adapter, "_transport_runtime_state_by_account", None)
+            if isinstance(get_state, dict):
+                current_state = str(get_state.get(account_id) or "").strip().lower() or None
+            if current_state not in active_states:
+                report_state(account_id, "disconnected")
 
 
 def check_feishu_requirements() -> bool:
@@ -1041,16 +1430,24 @@ class FeishuAdapter(BasePlatformAdapter):
         self._settings = self._load_settings(config.extra or {})
         self._apply_settings(self._settings)
         self._client: Optional[Any] = None
+        self._clients_by_account: Dict[str, Any] = {}
         self._ws_client: Optional[Any] = None
         self._ws_future: Optional[asyncio.Future] = None
         self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ws_clients_by_account: Dict[str, Any] = {}
+        self._ws_futures_by_account: Dict[str, asyncio.Future] = {}
+        self._ws_thread_loops_by_account: Dict[str, asyncio.AbstractEventLoop] = {}
+        self._transport_runtime_state_by_account: Dict[str, str] = {}
+        self._transport_runtime_error_by_account: Dict[str, str] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._webhook_runner: Optional[Any] = None
         self._webhook_site: Optional[Any] = None
         self._event_handler: Optional[Any] = None
+        self._event_handlers_by_account: Dict[str, Any] = {}
         self._seen_message_ids: Dict[str, float] = {}  # message_id → seen_at (time.time())
         self._seen_message_order: List[str] = []
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
+        self._oauth_state_path = get_hermes_home() / "feishu_oauth_state.json"
         self._dedup_lock = threading.Lock()
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
@@ -1062,6 +1459,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
         self._message_text_cache: Dict[str, Optional[str]] = {}
         self._app_lock_identity: Optional[str] = None
+        self._app_lock_identities: List[str] = []
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
         self._pending_text_batch_tasks = self._text_batch_state.tasks
@@ -1072,7 +1470,12 @@ class FeishuAdapter(BasePlatformAdapter):
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
+        self._pending_questions: Dict[str, FeishuPendingQuestion] = {}
+        self._pending_oauth_requests: Dict[str, FeishuPendingOAuthRequest] = {}
+        self._pending_app_scope_requests: Dict[str, FeishuPendingAppScopeRequest] = {}
+        self._authorization_grants: Dict[str, Dict[str, FeishuAuthorizationGrant]] = {}
         self._load_seen_message_ids()
+        self._load_authorization_grants()
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
@@ -1083,10 +1486,20 @@ class FeishuAdapter(BasePlatformAdapter):
             for chat_id, rule_cfg in raw_group_rules.items():
                 if not isinstance(rule_cfg, dict):
                     continue
+                raw_allowlist = rule_cfg.get("allowlist")
+                if raw_allowlist is None:
+                    raw_allowlist = rule_cfg.get("allow_from", [])
                 group_rules[str(chat_id)] = FeishuGroupRule(
                     policy=str(rule_cfg.get("policy", "open")).strip().lower(),
-                    allowlist=set(str(u).strip() for u in rule_cfg.get("allowlist", []) if str(u).strip()),
+                    allowlist=set(str(u).strip() for u in raw_allowlist if str(u).strip()),
                     blacklist=set(str(u).strip() for u in rule_cfg.get("blacklist", []) if str(u).strip()),
+                    enabled=_coerce_optional_bool(rule_cfg.get("enabled")),
+                    require_mention=_coerce_optional_bool(
+                        rule_cfg.get("require_mention", rule_cfg.get("requireMention"))
+                    ),
+                    respond_to_mention_all=_coerce_optional_bool(
+                        rule_cfg.get("respond_to_mention_all", rule_cfg.get("respondToMentionAll"))
+                    ),
                 )
 
         # Bot-level admins
@@ -1095,6 +1508,66 @@ class FeishuAdapter(BasePlatformAdapter):
 
         # Default group policy (for groups not in group_rules)
         default_group_policy = str(extra.get("default_group_policy", "")).strip().lower()
+        raw_allow_from = extra.get("allow_from", [])
+        allow_from = frozenset(str(u).strip() for u in raw_allow_from if str(u).strip())
+        raw_group_allow_from = extra.get("group_allow_from", [])
+        group_allow_from = frozenset(str(u).strip() for u in raw_group_allow_from if str(u).strip())
+
+        def _build_account_settings(account_id: str, account_extra: Dict[str, Any]) -> FeishuAccountSettings:
+            """解析单个飞书账号配置，并继承顶层默认值。"""
+            return FeishuAccountSettings(
+                account_id=account_id,
+                app_id=str(account_extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")).strip(),
+                app_secret=str(account_extra.get("app_secret") or os.getenv("FEISHU_APP_SECRET", "")).strip(),
+                domain_name=str(
+                    account_extra.get("domain") or extra.get("domain") or os.getenv("FEISHU_DOMAIN", "feishu")
+                ).strip().lower(),
+                connection_mode=str(
+                    account_extra.get("connection_mode")
+                    or extra.get("connection_mode")
+                    or os.getenv("FEISHU_CONNECTION_MODE", "websocket")
+                ).strip().lower(),
+                encrypt_key=str(account_extra.get("encrypt_key") or os.getenv("FEISHU_ENCRYPT_KEY", "")).strip(),
+                verification_token=str(
+                    account_extra.get("verification_token") or os.getenv("FEISHU_VERIFICATION_TOKEN", "")
+                ).strip(),
+                bot_open_id=str(account_extra.get("bot_open_id") or os.getenv("FEISHU_BOT_OPEN_ID", "")).strip(),
+                bot_user_id=str(account_extra.get("bot_user_id") or os.getenv("FEISHU_BOT_USER_ID", "")).strip(),
+                bot_name=str(account_extra.get("bot_name") or os.getenv("FEISHU_BOT_NAME", "")).strip(),
+                webhook_host=str(
+                    account_extra.get("webhook_host")
+                    or extra.get("webhook_host")
+                    or os.getenv("FEISHU_WEBHOOK_HOST", _DEFAULT_WEBHOOK_HOST)
+                ).strip(),
+                webhook_port=int(
+                    account_extra.get("webhook_port")
+                    or extra.get("webhook_port")
+                    or os.getenv("FEISHU_WEBHOOK_PORT", str(_DEFAULT_WEBHOOK_PORT))
+                ),
+                webhook_path=(
+                    str(
+                        account_extra.get("webhook_path")
+                        or extra.get("webhook_path")
+                        or os.getenv("FEISHU_WEBHOOK_PATH", _DEFAULT_WEBHOOK_PATH)
+                    ).strip()
+                    or _DEFAULT_WEBHOOK_PATH
+                ),
+                enabled=_to_boolean(account_extra.get("enabled", True)),
+            )
+
+        account_settings: Dict[str, FeishuAccountSettings] = {}
+        raw_accounts = extra.get("accounts") or {}
+        if isinstance(raw_accounts, dict):
+            for account_id, account_cfg in raw_accounts.items():
+                if not isinstance(account_cfg, dict):
+                    continue
+                parsed = _build_account_settings(str(account_id).strip(), account_cfg)
+                if parsed.enabled and parsed.app_id and parsed.app_secret:
+                    account_settings[parsed.account_id] = parsed
+
+        primary_account = _build_account_settings("default", extra)
+        if primary_account.app_id and primary_account.app_secret:
+            account_settings.setdefault(primary_account.account_id, primary_account)
 
         return FeishuAdapterSettings(
             app_id=str(extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")).strip(),
@@ -1105,7 +1578,9 @@ class FeishuAdapter(BasePlatformAdapter):
             ).strip().lower(),
             encrypt_key=os.getenv("FEISHU_ENCRYPT_KEY", "").strip(),
             verification_token=os.getenv("FEISHU_VERIFICATION_TOKEN", "").strip(),
-            group_policy=os.getenv("FEISHU_GROUP_POLICY", "allowlist").strip().lower(),
+            group_policy=str(extra.get("group_policy") or os.getenv("FEISHU_GROUP_POLICY", "allowlist")).strip().lower(),
+            allow_from=allow_from,
+            group_allow_from=group_allow_from,
             allowed_group_users=frozenset(
                 item.strip()
                 for item in os.getenv("FEISHU_ALLOWED_USERS", "").split(",")
@@ -1152,6 +1627,22 @@ class FeishuAdapter(BasePlatformAdapter):
             admins=admins,
             default_group_policy=default_group_policy,
             group_rules=group_rules,
+            require_mention=_to_boolean(extra.get("require_mention", extra.get("requireMention", True))),
+            respond_to_mention_all=_to_boolean(
+                extra.get("respond_to_mention_all", extra.get("respondToMentionAll", True))
+            ),
+            reply_mode=str(extra.get("reply_mode", "auto")).strip().lower() or "auto",
+            dm_policy=str(extra.get("dm_policy", "open")).strip().lower() or "open",
+            thread_session=_to_boolean(extra.get("thread_session")),
+            workspace_tools_enabled=_to_boolean(extra.get("tools_enabled", True)),
+            streaming_cards_enabled=_to_boolean(extra.get("streaming", True)),
+            block_streaming_enabled=_to_boolean(extra.get("block_streaming", True)),
+            block_streaming_coalesce_ms=_coerce_required_int(
+                extra.get("block_streaming_coalesce_ms"),
+                default=600,
+                min_value=50,
+            ),
+            accounts=account_settings,
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1162,10 +1653,14 @@ class FeishuAdapter(BasePlatformAdapter):
         self._encrypt_key = settings.encrypt_key
         self._verification_token = settings.verification_token
         self._group_policy = settings.group_policy
+        self._allow_from = set(settings.allow_from)
+        self._group_allow_from = set(settings.group_allow_from)
         self._allowed_group_users = set(settings.allowed_group_users)
         self._admins = set(settings.admins)
         self._default_group_policy = settings.default_group_policy or settings.group_policy
         self._group_rules = settings.group_rules
+        self._require_mention = settings.require_mention
+        self._respond_to_mention_all = settings.respond_to_mention_all
         self._bot_open_id = settings.bot_open_id
         self._bot_user_id = settings.bot_user_id
         self._bot_name = settings.bot_name
@@ -1182,28 +1677,110 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_reconnect_interval = settings.ws_reconnect_interval
         self._ws_ping_interval = settings.ws_ping_interval
         self._ws_ping_timeout = settings.ws_ping_timeout
+        self._reply_mode = settings.reply_mode
+        self._dm_policy = settings.dm_policy
+        self._thread_session = settings.thread_session
+        self._workspace_tools_enabled = settings.workspace_tools_enabled
+        self._streaming_cards_enabled = settings.streaming_cards_enabled
+        self._block_streaming_enabled = settings.block_streaming_enabled
+        self._block_streaming_coalesce_ms = settings.block_streaming_coalesce_ms
+        self._accounts = dict(settings.accounts)
+        self._account_by_app_id = {
+            account.app_id: account for account in self._accounts.values() if account.app_id
+        }
+        self._accounts_by_webhook_path = {
+            account.webhook_path: account
+            for account in self._accounts.values()
+            if account.webhook_path
+        }
+        self._bot_open_ids = {
+            account.bot_open_id for account in self._accounts.values() if account.bot_open_id
+        }
+        self._bot_user_ids = {
+            account.bot_user_id for account in self._accounts.values() if account.bot_user_id
+        }
+        self._bot_names = {
+            account.bot_name for account in self._accounts.values() if account.bot_name
+        }
 
-    def _build_event_handler(self) -> Any:
+    def _build_event_handler(self, account: Optional[FeishuAccountSettings] = None) -> Any:
         if EventDispatcherHandler is None:
             return None
-        return (
-            EventDispatcherHandler.builder(
-                self._encrypt_key,
-                self._verification_token,
-            )
-            .register_p2_im_message_message_read_v1(self._on_message_read_event)
-            .register_p2_im_message_receive_v1(self._on_message_event)
-            .register_p2_im_message_reaction_created_v1(
-                lambda data: self._on_reaction_event("im.message.reaction.created_v1", data)
-            )
-            .register_p2_im_message_reaction_deleted_v1(
-                lambda data: self._on_reaction_event("im.message.reaction.deleted_v1", data)
-            )
-            .register_p2_card_action_trigger(self._on_card_action_trigger)
-            .register_p2_im_chat_member_bot_added_v1(self._on_bot_added_to_chat)
-            .register_p2_im_chat_member_bot_deleted_v1(self._on_bot_removed_from_chat)
-            .build()
+        encrypt_key = (account.encrypt_key if account and account.encrypt_key else self._encrypt_key)
+        verification_token = (
+            account.verification_token if account and account.verification_token else self._verification_token
         )
+        builder = EventDispatcherHandler.builder(
+            encrypt_key,
+            verification_token,
+        )
+        builder = builder.register_p2_im_message_message_read_v1(self._on_message_read_event)
+        builder = builder.register_p2_im_message_receive_v1(self._on_message_event)
+        builder = builder.register_p2_im_message_reaction_created_v1(
+            lambda data: self._on_reaction_event("im.message.reaction.created_v1", data)
+        )
+        builder = builder.register_p2_im_message_reaction_deleted_v1(
+            lambda data: self._on_reaction_event("im.message.reaction.deleted_v1", data)
+        )
+        builder = builder.register_p2_card_action_trigger(self._on_card_action_trigger)
+        if hasattr(builder, "register_p2_drive_notice_comment_add_v1"):
+            builder = builder.register_p2_drive_notice_comment_add_v1(self._on_comment_event)
+        if hasattr(builder, "register_p2_im_chat_member_bot_added_v1"):
+            builder = builder.register_p2_im_chat_member_bot_added_v1(self._on_bot_added_to_chat)
+        if hasattr(builder, "register_p2_im_chat_member_bot_deleted_v1"):
+            builder = builder.register_p2_im_chat_member_bot_deleted_v1(self._on_bot_removed_from_chat)
+        return builder.build()
+
+    def _resolve_account_for_request(self, payload: Dict[str, Any], request: Any = None) -> Optional[FeishuAccountSettings]:
+        """根据 app_id 或 webhook path 解析当前请求所属的飞书账号。"""
+        header = payload.get("header") or {}
+        incoming_app_id = str(header.get("app_id") or payload.get("app_id") or "").strip()
+        if incoming_app_id:
+            return self._account_by_app_id.get(incoming_app_id)
+        request_path = str(getattr(request, "path", "") or "").strip()
+        if request_path:
+            return self._accounts_by_webhook_path.get(request_path)
+        return self._account_by_app_id.get(self._app_id)
+
+    @staticmethod
+    def _inject_event_account(data: Any, account: Optional[FeishuAccountSettings]) -> Any:
+        """把解析出的账号信息挂到事件对象上，供后续路由与自消息过滤使用。"""
+        if account is None:
+            return data
+        try:
+            setattr(data, "_hermes_feishu_account_id", account.account_id)
+            setattr(data, "_hermes_feishu_app_id", account.app_id)
+            event = getattr(data, "event", None)
+            if event is not None:
+                setattr(event, "_hermes_feishu_account_id", account.account_id)
+                setattr(event, "_hermes_feishu_app_id", account.app_id)
+                notice_meta = getattr(event, "notice_meta", None)
+                if notice_meta is not None:
+                    setattr(notice_meta, "_hermes_feishu_account_id", account.account_id)
+                    setattr(notice_meta, "_hermes_feishu_app_id", account.app_id)
+        except Exception:
+            logger.debug("[Feishu] Failed to attach account metadata to event", exc_info=True)
+        return data
+
+    @staticmethod
+    def _extract_event_account_id(data: Any) -> Optional[str]:
+        """从事件对象中提取账号标识。"""
+        event = getattr(data, "event", None)
+        for candidate in (
+            getattr(data, "_hermes_feishu_account_id", None),
+            getattr(event, "_hermes_feishu_account_id", None),
+            getattr(getattr(event, "notice_meta", None), "_hermes_feishu_account_id", None),
+        ):
+            if candidate:
+                return str(candidate)
+        return None
+
+    def _resolve_client(self, account_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> Any:
+        """根据账号标识选择飞书客户端，未命中时回退主账号。"""
+        resolved_account_id = str(
+            (metadata or {}).get("account_id") or account_id or "default"
+        ).strip()
+        return self._clients_by_account.get(resolved_account_id) or self._client
 
     async def connect(self) -> bool:
         """Connect to Feishu/Lark."""
@@ -1219,25 +1796,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._connection_mode,
             )
             return False
-
         try:
-            self._app_lock_identity = self._app_id
-            acquired, existing = acquire_scoped_lock(
-                _FEISHU_APP_LOCK_SCOPE,
-                self._app_lock_identity,
-                metadata={"platform": self.platform.value},
-            )
+            acquired = await self._acquire_app_locks()
             if not acquired:
-                owner_pid = existing.get("pid") if isinstance(existing, dict) else None
-                message = (
-                    "Another local Hermes gateway is already using this Feishu app_id"
-                    + (f" (PID {owner_pid})." if owner_pid else ".")
-                    + " Stop the other gateway before starting a second Feishu websocket client."
-                )
-                logger.error("[Feishu] %s", message)
-                self._set_fatal_error("feishu_app_lock", message, retryable=False)
                 return False
-
             self._loop = asyncio.get_running_loop()
             await self._connect_with_retry()
             self._mark_connected()
@@ -1256,39 +1818,66 @@ class FeishuAdapter(BasePlatformAdapter):
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()
+        if self._ws_futures_by_account:
+            logger.info(
+                "[Feishu] Disconnecting websocket transports for accounts: %s",
+                ", ".join(sorted(self._ws_futures_by_account.keys())),
+            )
+            for account_id in list(self._ws_futures_by_account.keys()):
+                self._set_transport_runtime_state(account_id, "disconnecting")
         self._disable_websocket_auto_reconnect()
+        for account in self._accounts.values():
+            if account.enabled and account.connection_mode == "webhook":
+                self._set_transport_runtime_state(account.account_id, "disconnecting")
         await self._stop_webhook_server()
 
-        ws_thread_loop = self._ws_thread_loop
-        if ws_thread_loop is not None and not ws_thread_loop.is_closed():
-            logger.debug("[Feishu] Cancelling websocket thread tasks and stopping loop")
+        for account_id, ws_thread_loop in list(self._ws_thread_loops_by_account.items()):
+            if ws_thread_loop is None or ws_thread_loop.is_closed():
+                continue
+            logger.debug("[Feishu] Cancelling websocket thread tasks and stopping loop for account %s", account_id)
 
-            def cancel_all_tasks() -> None:
-                tasks = [t for t in asyncio.all_tasks(ws_thread_loop) if not t.done()]
-                logger.debug("[Feishu] Found %d pending tasks in websocket thread", len(tasks))
+            def cancel_all_tasks(target_loop: asyncio.AbstractEventLoop = ws_thread_loop) -> None:
+                tasks = [t for t in asyncio.all_tasks(target_loop) if not t.done()]
+                logger.debug("[Feishu] Found %d pending websocket tasks", len(tasks))
                 for task in tasks:
                     task.cancel()
-                ws_thread_loop.call_later(0.1, ws_thread_loop.stop)
+                stop_fn = getattr(target_loop, "stop", None)
+                if callable(stop_fn):
+                    target_loop.call_later(0.1, stop_fn)
 
             ws_thread_loop.call_soon_threadsafe(cancel_all_tasks)
 
-        ws_future = self._ws_future
-        if ws_future is not None:
+        for account_id, ws_future in list(self._ws_futures_by_account.items()):
+            if ws_future is None:
+                continue
             try:
-                logger.debug("[Feishu] Waiting for websocket thread to exit (timeout=10s)")
+                logger.debug("[Feishu] Waiting for websocket thread to exit (timeout=10s) for account %s", account_id)
                 await asyncio.wait_for(asyncio.shield(ws_future), timeout=10.0)
-                logger.debug("[Feishu] Websocket thread exited cleanly")
+                logger.debug("[Feishu] Websocket thread exited cleanly for account %s", account_id)
             except asyncio.TimeoutError:
-                logger.warning("[Feishu] Websocket thread did not exit within 10s - may be stuck")
+                logger.warning("[Feishu] Websocket thread did not exit within 10s for account %s", account_id)
             except asyncio.CancelledError:
-                logger.debug("[Feishu] Websocket thread cancelled during disconnect")
+                logger.debug("[Feishu] Websocket thread cancelled during disconnect for account %s", account_id)
             except Exception as exc:
-                logger.debug("[Feishu] Websocket thread exited with error: %s", exc, exc_info=True)
+                logger.debug(
+                    "[Feishu] Websocket thread exited with error for account %s: %s",
+                    account_id,
+                    exc,
+                    exc_info=True,
+                )
 
         self._ws_future = None
         self._ws_thread_loop = None
+        self._ws_clients_by_account.clear()
+        self._ws_futures_by_account.clear()
+        self._ws_thread_loops_by_account.clear()
         self._loop = None
         self._event_handler = None
+        self._event_handlers_by_account.clear()
+        self._clients_by_account.clear()
+        for account in self._accounts.values():
+            if account.enabled:
+                self._set_transport_runtime_state(account.account_id, "disconnected")
         self._persist_seen_message_ids()
         await self._release_app_lock()
 
@@ -1309,14 +1898,15 @@ class FeishuAdapter(BasePlatformAdapter):
         self._pending_media_batches.clear()
 
     def _disable_websocket_auto_reconnect(self) -> None:
-        if self._ws_client is None:
-            return
-        try:
-            setattr(self._ws_client, "_auto_reconnect", False)
-        except Exception:
-            pass
-        finally:
-            self._ws_client = None
+        for ws_client in list(self._ws_clients_by_account.values()) or ([self._ws_client] if self._ws_client else []):
+            if ws_client is None:
+                continue
+            try:
+                setattr(ws_client, "_auto_reconnect", False)
+            except Exception:
+                pass
+        self._ws_client = None
+        self._ws_clients_by_account.clear()
 
     async def _stop_webhook_server(self) -> None:
         if self._webhook_runner is None:
@@ -1339,7 +1929,8 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a Feishu message."""
-        if not self._client:
+        client = self._resolve_client(metadata=metadata)
+        if not client:
             return SendResult(success=False, error="Not connected")
 
         formatted = self.format_message(content)
@@ -1393,16 +1984,19 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_id: str,
         message_id: str,
         content: str,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent Feishu text/post message."""
-        if not self._client:
+        client = self._resolve_client(metadata=metadata)
+        if not client:
             return SendResult(success=False, error="Not connected")
 
+        msg_type = "text"
         try:
             msg_type, payload = self._build_outbound_payload(content)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
-            response = await asyncio.to_thread(self._client.im.v1.message.update, request)
+            response = await asyncio.to_thread(client.im.v1.message.update, request)
             result = self._finalize_send_result(response, "update failed")
             if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
                 logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
@@ -1411,12 +2005,27 @@ class FeishuAdapter(BasePlatformAdapter):
                     content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
                 )
                 fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
-                fallback_response = await asyncio.to_thread(self._client.im.v1.message.update, fallback_request)
+                fallback_response = await asyncio.to_thread(client.im.v1.message.update, fallback_request)
                 result = self._finalize_send_result(fallback_response, "update failed")
             if result.success:
                 result.message_id = message_id
             return result
         except Exception as exc:
+            if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc) or ""):
+                logger.warning("[Feishu] Post update raised invalid payload error; falling back to plain text")
+                try:
+                    fallback_body = self._build_update_message_body(
+                        msg_type="text",
+                        content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
+                    )
+                    fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
+                    fallback_response = await asyncio.to_thread(client.im.v1.message.update, fallback_request)
+                    fallback_result = self._finalize_send_result(fallback_response, "update failed")
+                    if fallback_result.success:
+                        fallback_result.message_id = message_id
+                    return fallback_result
+                except Exception as fallback_exc:
+                    exc = fallback_exc
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
@@ -1484,17 +2093,692 @@ class FeishuAdapter(BasePlatformAdapter):
                     "session_key": session_key,
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
+                    "account_id": str((metadata or {}).get("account_id") or "").strip(),
                 }
             return result
         except Exception as exc:
             logger.warning("[Feishu] send_exec_approval failed: %s", exc)
             return SendResult(success=False, error=str(exc))
 
+    async def send_question_card(
+        self,
+        *,
+        chat_id: str,
+        question: str,
+        options: List[str],
+        header: str = "Question from Hermes",
+        note: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """发送多选问题卡片并记录等待态。
+
+        该卡片通过按钮回调把用户选择重新注入当前会话，避免工具层自行维护消息总线。
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        question_id = f"fq_{uuid.uuid4().hex[:12]}"
+        actions = []
+        for index, option in enumerate(options[:5]):
+            actions.append(
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": option},
+                    "type": "primary" if index == 0 else "default",
+                    "value": {
+                        "hermes_action": "answer_question",
+                        "question_id": question_id,
+                        "answer": option,
+                    },
+                }
+            )
+
+        elements: List[Dict[str, Any]] = [
+            {"tag": "markdown", "content": question},
+        ]
+        if note:
+            elements.append({"tag": "markdown", "content": note})
+        elements.append({"tag": "action", "actions": actions})
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": header, "tag": "plain_text"},
+                "template": "blue",
+            },
+            "elements": elements,
+        }
+
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=json.dumps(card, ensure_ascii=False),
+                reply_to=None,
+                metadata=metadata,
+            )
+            result = self._finalize_send_result(response, "send_question_card failed")
+            if result.success:
+                self._pending_questions[question_id] = FeishuPendingQuestion(
+                    question_id=question_id,
+                    chat_id=chat_id,
+                    message_id=result.message_id or "",
+                    question=question,
+                    options=list(options[:5]),
+                    header=header,
+                    note=note,
+                    thread_id=str((metadata or {}).get("thread_id") or "").strip(),
+                    account_id=str((metadata or {}).get("account_id") or "").strip(),
+                )
+                result.raw_response = {
+                    **(result.raw_response if isinstance(result.raw_response, dict) else {}),
+                    "question_id": question_id,
+                }
+            return result
+        except Exception as exc:
+            logger.warning("[Feishu] send_question_card failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def send_oauth_request_card(
+        self,
+        *,
+        chat_id: str,
+        scopes: List[str],
+        reason: str,
+        title: str = "Feishu Authorization Required",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """发送人工确认式授权提示卡片。
+
+        当前实现不直接驱动 OAuth 回跳，而是把所需 scopes 明确展示给用户，
+        用户在后台完成授权后点击按钮，系统再把确认消息注入会话继续执行。
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        def _build_oauth_body(scope_items: List[str], reason_text: str) -> str:
+            scope_lines = "\n".join(f"- `{scope}`" for scope in scope_items)
+            return (
+                f"{reason_text}\n\n"
+                "Please complete the required Feishu app authorization in the developer console, "
+                "then click the confirmation button below.\n\n"
+                f"Required scopes:\n{scope_lines}"
+            )
+
+        request_id = f"fo_{uuid.uuid4().hex[:12]}"
+        scopes = self._normalize_scope_list(scopes)
+        metadata = dict(metadata or {})
+        thread_id = str(metadata.get("thread_id", "") or "").strip()
+        requester_open_id = str(metadata.get("requester_open_id", "") or "").strip()
+        account_id = str(metadata.get("account_id", "") or "").strip()
+        tool_name = str(metadata.get("tool_name", "") or "").strip()
+        tool_action = str(metadata.get("action", "") or "").strip().lower() or "default"
+        replay_id = str(metadata.get("replay_id", "") or "").strip()
+        replay_ids = _merge_replay_ids(metadata.get("replay_ids"), replay_id)
+
+        for state in list(self._pending_oauth_requests.values()):
+            if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                self._discard_pending_tool_replays(list(_merge_replay_ids(state.replay_ids, state.replay_id)))
+                self._pending_oauth_requests.pop(state.request_id, None)
+                continue
+            if state.chat_id != chat_id:
+                continue
+            if (state.thread_id or "") != thread_id:
+                continue
+            if requester_open_id and state.requester_open_id and state.requester_open_id != requester_open_id:
+                continue
+            merged_scopes = self._normalize_scope_list([*state.scopes, *scopes])
+            merged_reason = state.reason
+            if reason and reason != state.reason:
+                merged_reason = f"{state.reason}\n\nAdditional requested scopes were needed by a later action."
+            await self._update_interactive_card(
+                message_id=state.message_id,
+                title=state.title or title,
+                body_markdown=_build_oauth_body(merged_scopes, merged_reason),
+                template="orange",
+                button_actions=[
+                    self._build_card_button(
+                        label="I Finished Authorization",
+                        button_type="primary",
+                        value={
+                            "hermes_action": "complete_oauth",
+                            "request_id": state.request_id,
+                        },
+                    ),
+                    self._build_card_button(
+                        label="Cancel for Now",
+                        value={
+                            "hermes_action": "cancel_oauth",
+                            "request_id": state.request_id,
+                        },
+                    ),
+                    self._build_card_button(
+                        label="Decline Request",
+                        button_type="danger",
+                        value={
+                            "hermes_action": "decline_oauth",
+                            "request_id": state.request_id,
+                        },
+                    ),
+                ],
+                account_id=account_id or state.account_id or None,
+            )
+            state.scopes = merged_scopes
+            state.reason = merged_reason
+            state.title = state.title or title
+            if account_id:
+                state.account_id = state.account_id or account_id
+            if tool_name:
+                state.tool_name = state.tool_name or tool_name
+            if tool_action:
+                state.tool_action = state.tool_action or tool_action
+            merged_replay_ids = _merge_replay_ids(state.replay_ids, state.replay_id, replay_ids)
+            state.replay_ids = merged_replay_ids
+            state.replay_id = merged_replay_ids[0] if merged_replay_ids else ""
+            state.expires_at = _new_auth_request_expire_at()
+            return SendResult(
+                success=True,
+                message_id=state.message_id,
+                raw_response={"request_id": state.request_id, "merged": True},
+            )
+
+        for state in list(self._pending_oauth_requests.values()):
+            if state.chat_id != chat_id:
+                continue
+            if (state.thread_id or "") != thread_id:
+                continue
+            if account_id and (state.account_id or "") and state.account_id != account_id:
+                continue
+            await self._supersede_auth_request_card(
+                state=state,
+                resolved_account_id=account_id or state.account_id or None,
+                superseded_by_label="a newer requester authorization card",
+            )
+            self._pending_oauth_requests.pop(state.request_id, None)
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": title, "tag": "plain_text"},
+                "template": "orange",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": _build_oauth_body(scopes, reason),
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        self._build_card_button(
+                            label="I Finished Authorization",
+                            button_type="primary",
+                            value={
+                                "hermes_action": "complete_oauth",
+                                "request_id": request_id,
+                            },
+                        ),
+                        self._build_card_button(
+                            label="Cancel for Now",
+                            value={
+                                "hermes_action": "cancel_oauth",
+                                "request_id": request_id,
+                            },
+                        ),
+                        self._build_card_button(
+                            label="Decline Request",
+                            button_type="danger",
+                            value={
+                                "hermes_action": "decline_oauth",
+                                "request_id": request_id,
+                            },
+                        ),
+                    ],
+                },
+            ],
+        }
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=json.dumps(card, ensure_ascii=False),
+                reply_to=None,
+                metadata=metadata,
+            )
+            result = self._finalize_send_result(response, "send_oauth_request_card failed")
+            if result.success:
+                self._pending_oauth_requests[request_id] = FeishuPendingOAuthRequest(
+                    request_id=request_id,
+                    chat_id=chat_id,
+                    message_id=result.message_id or "",
+                    scopes=list(scopes),
+                    reason=reason,
+                    title=title,
+                    thread_id=thread_id,
+                    requester_open_id=requester_open_id,
+                    account_id=account_id,
+                    tool_name=tool_name,
+                    tool_action=tool_action,
+                    replay_id=replay_ids[0] if replay_ids else replay_id,
+                    replay_ids=list(replay_ids),
+                    expires_at=_new_auth_request_expire_at(),
+                )
+                result.raw_response = {
+                    **(result.raw_response if isinstance(result.raw_response, dict) else {}),
+                    "request_id": request_id,
+                }
+            return result
+        except Exception as exc:
+            logger.warning("[Feishu] send_oauth_request_card failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def send_app_scope_request_card(
+        self,
+        *,
+        chat_id: str,
+        scopes: List[str],
+        reason: str,
+        title: str = "Feishu App Authorization Required",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """发送应用级缺权提示卡片，并在 owner 确认后续接用户批量授权。"""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        def _build_app_scope_body(
+            *,
+            scope_items: List[str],
+            reason_text: str,
+            owner_id: str,
+            requester_id: str,
+        ) -> str:
+            scope_lines = "\n".join(f"- `{scope}`" for scope in scope_items)
+            owner_line = f"`{owner_id}`" if owner_id else "the Feishu app owner"
+            requester_line = f"`{requester_id}`" if requester_id else "the current requester"
+            body = (
+                f"{reason_text}\n\n"
+                "The Feishu application is still missing required app scopes. "
+                "Grant them in the developer console before Hermes retries the action.\n\n"
+                f"Missing app scopes:\n{scope_lines}\n\n"
+                f"App owner: {owner_line}\n"
+                f"Requester waiting for continuation: {requester_line}"
+            )
+            if owner_id:
+                body += (
+                    "\n\nAfter the owner grants these scopes, they can click the button below. "
+                    "Hermes will then continue with user authorization if it is still needed."
+                )
+            return body
+
+        request_id = f"fas_{uuid.uuid4().hex[:12]}"
+        scopes = self._normalize_scope_list(scopes)
+        metadata = dict(metadata or {})
+        thread_id = str(metadata.get("thread_id", "") or "").strip()
+        requester_open_id = str(metadata.get("requester_open_id", "") or "").strip()
+        owner_open_id = str(metadata.get("owner_open_id", "") or "").strip()
+        account_id = str(metadata.get("account_id", "") or "").strip()
+        tool_name = str(metadata.get("tool_name", "") or "").strip()
+        tool_action = str(metadata.get("action", "") or "").strip().lower() or "default"
+        replay_id = str(metadata.get("replay_id", "") or "").strip()
+        replay_ids = _merge_replay_ids(metadata.get("replay_ids"), replay_id)
+
+        for state in list(self._pending_app_scope_requests.values()):
+            if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                self._discard_pending_tool_replays(list(_merge_replay_ids(state.replay_ids, state.replay_id)))
+                self._pending_app_scope_requests.pop(state.request_id, None)
+                continue
+            if state.chat_id != chat_id:
+                continue
+            if (state.thread_id or "") != thread_id:
+                continue
+            if requester_open_id and state.requester_open_id and state.requester_open_id != requester_open_id:
+                continue
+            if owner_open_id and state.owner_open_id and state.owner_open_id != owner_open_id:
+                continue
+            merged_scopes = self._normalize_scope_list([*state.scopes, *scopes])
+            merged_reason = state.reason
+            if reason and reason != state.reason:
+                merged_reason = f"{state.reason}\n\nAdditional missing app scopes were reported by a later action."
+            actions: List[Dict[str, Any]] = []
+            if owner_open_id or state.owner_open_id:
+                actions.append(
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "I Granted App Scopes"},
+                        "type": "primary",
+                        "value": {
+                            "hermes_action": "complete_app_scope_request",
+                            "request_id": state.request_id,
+                        },
+                    }
+                )
+            await self._update_interactive_card(
+                message_id=state.message_id,
+                title=state.title or title,
+                body_markdown=_build_app_scope_body(
+                    scope_items=merged_scopes,
+                    reason_text=merged_reason,
+                    owner_id=owner_open_id or state.owner_open_id,
+                    requester_id=requester_open_id or state.requester_open_id,
+                ),
+                template="orange",
+                button_actions=(
+                    [
+                        self._build_card_button(
+                            label="I Granted App Scopes",
+                            button_type="primary",
+                            value={
+                                "hermes_action": "complete_app_scope_request",
+                                "request_id": state.request_id,
+                            },
+                        ),
+                        self._build_card_button(
+                            label="Cancel for Now",
+                            value={
+                                "hermes_action": "cancel_app_scope_request",
+                                "request_id": state.request_id,
+                            },
+                        ),
+                        self._build_card_button(
+                            label="Decline Request",
+                            button_type="danger",
+                            value={
+                                "hermes_action": "decline_app_scope_request",
+                                "request_id": state.request_id,
+                            },
+                        ),
+                    ]
+                    if actions
+                    else None
+                ),
+                account_id=account_id or state.account_id or None,
+            )
+            state.scopes = merged_scopes
+            state.reason = merged_reason
+            state.title = state.title or title
+            if owner_open_id:
+                state.owner_open_id = state.owner_open_id or owner_open_id
+            if requester_open_id:
+                state.requester_open_id = state.requester_open_id or requester_open_id
+            if account_id:
+                state.account_id = state.account_id or account_id
+            if tool_name:
+                state.tool_name = state.tool_name or tool_name
+            if tool_action:
+                state.tool_action = state.tool_action or tool_action
+            merged_replay_ids = _merge_replay_ids(state.replay_ids, state.replay_id, replay_ids)
+            state.replay_ids = merged_replay_ids
+            state.replay_id = merged_replay_ids[0] if merged_replay_ids else ""
+            state.expires_at = _new_auth_request_expire_at()
+            return SendResult(
+                success=True,
+                message_id=state.message_id,
+                raw_response={"request_id": state.request_id, "merged": True},
+            )
+
+        for state in list(self._pending_app_scope_requests.values()):
+            if state.chat_id != chat_id:
+                continue
+            if (state.thread_id or "") != thread_id:
+                continue
+            if account_id and (state.account_id or "") and state.account_id != account_id:
+                continue
+            await self._supersede_auth_request_card(
+                state=state,
+                resolved_account_id=account_id or state.account_id or None,
+                superseded_by_label="a newer app-scope authorization card",
+            )
+            self._pending_app_scope_requests.pop(state.request_id, None)
+
+        elements: List[Dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": _build_app_scope_body(
+                    scope_items=scopes,
+                    reason_text=reason,
+                    owner_id=owner_open_id,
+                    requester_id=requester_open_id,
+                ),
+            }
+        ]
+        if owner_open_id:
+            elements.append(
+                {
+                    "tag": "action",
+                    "actions": [
+                        self._build_card_button(
+                            label="I Granted App Scopes",
+                            button_type="primary",
+                            value={
+                                "hermes_action": "complete_app_scope_request",
+                                "request_id": request_id,
+                            },
+                        ),
+                        self._build_card_button(
+                            label="Cancel for Now",
+                            value={
+                                "hermes_action": "cancel_app_scope_request",
+                                "request_id": request_id,
+                            },
+                        ),
+                        self._build_card_button(
+                            label="Decline Request",
+                            button_type="danger",
+                            value={
+                                "hermes_action": "decline_app_scope_request",
+                                "request_id": request_id,
+                            },
+                        ),
+                    ],
+                }
+            )
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": title, "tag": "plain_text"},
+                "template": "orange",
+            },
+            "elements": elements,
+        }
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=json.dumps(card, ensure_ascii=False),
+                reply_to=None,
+                metadata=metadata,
+            )
+            result = self._finalize_send_result(response, "send_app_scope_request_card failed")
+            if result.success:
+                self._pending_app_scope_requests[request_id] = FeishuPendingAppScopeRequest(
+                    request_id=request_id,
+                    chat_id=chat_id,
+                    message_id=result.message_id or "",
+                    scopes=list(scopes),
+                    reason=reason,
+                    title=title,
+                    owner_open_id=owner_open_id,
+                    requester_open_id=requester_open_id,
+                    thread_id=thread_id,
+                    account_id=account_id,
+                    tool_name=tool_name,
+                    tool_action=tool_action,
+                    replay_id=replay_ids[0] if replay_ids else replay_id,
+                    replay_ids=list(replay_ids),
+                    expires_at=_new_auth_request_expire_at(),
+                )
+                result.raw_response = {
+                    **(result.raw_response if isinstance(result.raw_response, dict) else {}),
+                    "request_id": request_id,
+                }
+            return result
+        except Exception as exc:
+            logger.warning("[Feishu] send_app_scope_request_card failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _update_interactive_card(
+        self,
+        *,
+        message_id: str,
+        title: str,
+        body_markdown: str,
+        template: str = "green",
+        button_label: str = "",
+        button_value: Optional[Dict[str, Any]] = None,
+        button_actions: Optional[List[Dict[str, Any]]] = None,
+        account_id: Optional[str] = None,
+    ) -> None:
+        """更新交互卡片。
+
+        默认更新为只读状态；当传入按钮参数时保留可点击按钮。
+        """
+        if not message_id:
+            return
+        client = self._resolve_client(account_id=account_id)
+        if not client:
+            return
+        elements: List[Dict[str, Any]] = [
+            {"tag": "markdown", "content": body_markdown},
+        ]
+        actions: List[Dict[str, Any]] = []
+        if isinstance(button_actions, list):
+            for action in button_actions:
+                if not isinstance(action, dict):
+                    continue
+                if action.get("tag") == "button" and isinstance(action.get("value"), dict):
+                    actions.append(action)
+        if not actions and button_label and isinstance(button_value, dict):
+            actions.append(
+                {
+                    "tag": "button",
+                    "text": {"content": button_label, "tag": "plain_text"},
+                    "type": "primary",
+                    "value": button_value,
+                }
+            )
+        if actions:
+            elements.append(
+                {
+                    "tag": "action",
+                    "actions": actions,
+                }
+            )
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": title, "tag": "plain_text"},
+                "template": template,
+            },
+            "elements": elements,
+        }
+        payload = json.dumps(card, ensure_ascii=False)
+        body = self._build_update_message_body(msg_type="interactive", content=payload)
+        request = self._build_update_message_request(message_id=message_id, request_body=body)
+        await asyncio.to_thread(client.im.v1.message.update, request)
+
+    def _build_card_button(
+        self,
+        *,
+        label: str,
+        value: Dict[str, Any],
+        button_type: str = "default",
+    ) -> Dict[str, Any]:
+        """Create a stable interactive button payload."""
+        return {
+            "tag": "button",
+            "text": {"content": label, "tag": "plain_text"},
+            "type": button_type,
+            "value": value,
+        }
+
+    def _discard_pending_tool_replays(self, replay_ids: List[str]) -> None:
+        """Remove pending replay entries that are no longer intended to run."""
+        normalized = _merge_replay_ids(replay_ids)
+        if not normalized:
+            return
+        pending_replays = getattr(self, "_pending_tool_replays", None)
+        if not isinstance(pending_replays, dict):
+            return
+        for replay_id in normalized:
+            pending_replays.pop(replay_id, None)
+
+    async def _send_card_action_notice(
+        self,
+        *,
+        chat_id: str,
+        text: str,
+        account_id: Optional[str] = None,
+    ) -> None:
+        """Send a lightweight follow-up notice for stale or invalid card actions."""
+        if not chat_id or not text:
+            return
+        try:
+            await self.send(
+                chat_id,
+                text,
+                metadata={"account_id": account_id or None},
+            )
+        except Exception:
+            logger.debug("[Feishu] Failed to send card action notice", exc_info=True)
+
+    async def _expire_auth_request_card(
+        self,
+        *,
+        state: Any,
+        resolved_account_id: Optional[str],
+        expired_by_label: str,
+    ) -> None:
+        """Mark an authorization-style card as expired and discard pending replay state."""
+        self._discard_pending_tool_replays(list(_merge_replay_ids(getattr(state, "replay_ids", []), getattr(state, "replay_id", ""))))
+        await self._update_interactive_card(
+            message_id=str(getattr(state, "message_id", "") or ""),
+            title=str(getattr(state, "title", "Feishu Authorization") or "Feishu Authorization"),
+            body_markdown=(
+                f"{str(getattr(state, 'reason', '') or '').strip()}\n\n"
+                f"**Expired after:** {expired_by_label}\n"
+                "**Status:** this authorization card expired and can no longer continue the action."
+            ),
+            template="grey",
+            account_id=resolved_account_id,
+        )
+
+    async def _supersede_auth_request_card(
+        self,
+        *,
+        state: Any,
+        resolved_account_id: Optional[str],
+        superseded_by_label: str,
+    ) -> None:
+        """Mark an authorization-style card as replaced by a newer request and discard stale replay state."""
+        self._discard_pending_tool_replays(
+            list(_merge_replay_ids(getattr(state, "replay_ids", []), getattr(state, "replay_id", "")))
+        )
+        await self._update_interactive_card(
+            message_id=str(getattr(state, "message_id", "") or ""),
+            title=str(getattr(state, "title", "Feishu Authorization") or "Feishu Authorization"),
+            body_markdown=(
+                f"{str(getattr(state, 'reason', '') or '').strip()}\n\n"
+                f"**Superseded by:** {superseded_by_label}\n"
+                "**Status:** this card was replaced by a newer authorization request in the same conversation."
+            ),
+            template="grey",
+            account_id=resolved_account_id,
+        )
+
     async def _update_approval_card(
-        self, message_id: str, label: str, user_name: str, choice: str,
+        self,
+        message_id: str,
+        label: str,
+        user_name: str,
+        choice: str,
+        *,
+        account_id: Optional[str] = None,
     ) -> None:
         """Replace the approval card with a resolved status card."""
-        if not self._client or not message_id:
+        if not message_id:
+            return
+        client = self._resolve_client(account_id=account_id)
+        if not client:
             return
         icon = "❌" if choice == "deny" else "✅"
         card = {
@@ -1514,7 +2798,7 @@ class FeishuAdapter(BasePlatformAdapter):
             payload = json.dumps(card, ensure_ascii=False)
             body = self._build_update_message_body(msg_type="interactive", content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
-            await asyncio.to_thread(self._client.im.v1.message.update, request)
+            await asyncio.to_thread(client.im.v1.message.update, request)
         except Exception as exc:
             logger.warning("[Feishu] Failed to update approval card %s: %s", message_id, exc)
 
@@ -1586,7 +2870,9 @@ class FeishuAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a local image file to Feishu."""
-        if not self._client:
+        account_id = str((metadata or {}).get("account_id") or "").strip() or None
+        client = self._resolve_client(account_id=account_id, metadata=metadata)
+        if not client:
             return SendResult(success=False, error="Not connected")
         if not os.path.exists(image_path):
             return SendResult(success=False, error=f"Image file not found: {image_path}")
@@ -1603,7 +2889,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 image=image_file,
             )
             request = self._build_image_upload_request(body)
-            upload_response = await asyncio.to_thread(self._client.im.v1.image.create, request)
+            upload_response = await asyncio.to_thread(client.im.v1.image.create, request)
             image_key = self._extract_response_field(upload_response, "image_key")
             if not image_key:
                 return self._response_error_result(
@@ -1703,23 +2989,25 @@ class FeishuAdapter(BasePlatformAdapter):
             metadata=metadata,
         )
 
-    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+    async def get_chat_info(self, chat_id: str, account_id: Optional[str] = None) -> Dict[str, Any]:
         """Return real chat metadata from Feishu when available."""
         fallback = {
             "chat_id": chat_id,
             "name": chat_id,
             "type": "dm",
         }
-        if not self._client:
+        client = self._resolve_client(account_id=account_id)
+        if not client:
             return fallback
+        cache_key = f"{account_id or 'default'}:{chat_id}"
 
-        cached = self._chat_info_cache.get(chat_id)
+        cached = self._chat_info_cache.get(cache_key)
         if cached is not None:
             return dict(cached)
 
         try:
             request = self._build_get_chat_request(chat_id)
-            response = await asyncio.to_thread(self._client.im.v1.chat.get, request)
+            response = await asyncio.to_thread(client.im.v1.chat.get, request)
             if not response or getattr(response, "success", lambda: False)() is False:
                 code = getattr(response, "code", "unknown")
                 msg = getattr(response, "msg", "chat lookup failed")
@@ -1734,11 +3022,306 @@ class FeishuAdapter(BasePlatformAdapter):
                 "type": self._map_chat_type(raw_chat_type),
                 "raw_type": raw_chat_type or None,
             }
-            self._chat_info_cache[chat_id] = info
+            self._chat_info_cache[cache_key] = info
             return dict(info)
         except Exception:
             logger.warning("[Feishu] Failed to get chat info for %s", chat_id, exc_info=True)
             return fallback
+
+    def _normalize_directory_entries(self, entries: List[FeishuDirectoryEntry]) -> List[Dict[str, str]]:
+        """Convert raw directory entries into stable cache payloads."""
+        normalized: List[Dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for entry in entries:
+            entry_id = str(entry.id or "").strip()
+            entry_name = str(entry.name or entry_id).strip() or entry_id
+            entry_type = str(entry.type or "").strip() or "dm"
+            entry_source = str(entry.source or "").strip() or "config"
+            account_id = str(entry.account_id or "default").strip() or "default"
+            stored_entry_id = f"{account_id}::{entry_id}" if account_id != "default" else entry_id
+            dedup_key = (account_id, entry_id)
+            if not entry_id or dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            normalized.append(
+                {
+                    "id": stored_entry_id,
+                    "name": entry_name,
+                    "type": entry_type,
+                    "source": entry_source,
+                    "account_id": account_id,
+                }
+            )
+        return normalized
+
+    def _get_account_directory_config(self, account_id: str) -> Dict[str, Any]:
+        """Return merged config for a single Feishu account."""
+        if account_id == "default":
+            extra = dict(getattr(self.config, "extra", {}) or {})
+        else:
+            extra = dict((((getattr(self.config, "extra", {}) or {}).get("accounts") or {}).get(account_id)) or {})
+        return extra
+
+    def _get_account_live_directory_settings(self, account_id: str) -> Dict[str, Any]:
+        """Return normalized directory settings for one account.
+
+        Config-backed entries and live discovery are controlled independently so
+        operators can keep a minimal static directory, disable expensive live
+        scans for large tenants, or run fully config-only routing.
+        """
+        cfg = self._get_account_directory_config(account_id)
+        raw_settings = cfg.get("directory") if isinstance(cfg.get("directory"), dict) else {}
+        return {
+            "include_config_users": _coerce_optional_bool(raw_settings.get("include_config_users")),
+            "include_config_groups": _coerce_optional_bool(raw_settings.get("include_config_groups")),
+            "include_live_users": _coerce_optional_bool(raw_settings.get("include_live_users")),
+            "include_live_groups": _coerce_optional_bool(raw_settings.get("include_live_groups")),
+            "live_limit": _coerce_required_int(raw_settings.get("live_limit"), default=50, min_value=1),
+            "live_page_size": _coerce_required_int(raw_settings.get("live_page_size"), default=50, min_value=1),
+        }
+
+    def _list_config_directory_entries_for_account(self, account_id: str) -> List[FeishuDirectoryEntry]:
+        """Enumerate users and groups from static Feishu config for one account."""
+        cfg = self._get_account_directory_config(account_id)
+        settings = self._get_account_live_directory_settings(account_id)
+        entries: List[FeishuDirectoryEntry] = []
+        if settings["include_config_users"] is not False:
+            user_ids: set[str] = set()
+            for raw_entry in cfg.get("allow_from", []) or []:
+                user_id = str(raw_entry or "").strip()
+                if not user_id or user_id == "*":
+                    continue
+                user_ids.add(user_id)
+            for raw_entry in ((cfg.get("dms") or {}) if isinstance(cfg.get("dms"), dict) else {}):
+                user_id = str(raw_entry or "").strip()
+                if user_id:
+                    user_ids.add(user_id)
+            for user_id in sorted(user_ids):
+                entries.append(
+                    FeishuDirectoryEntry(
+                        id=user_id,
+                        name=user_id,
+                        type="dm",
+                        source="config",
+                        account_id=account_id,
+                    )
+                )
+
+        if settings["include_config_groups"] is not False:
+            group_ids: set[str] = set()
+            for raw_entry in cfg.get("group_allow_from", []) or []:
+                group_id = str(raw_entry or "").strip()
+                if not group_id or group_id == "*":
+                    continue
+                group_ids.add(group_id)
+            raw_groups = cfg.get("groups") or {}
+            if isinstance(raw_groups, dict):
+                for group_id in raw_groups:
+                    normalized_group_id = str(group_id or "").strip()
+                    if normalized_group_id and normalized_group_id != "*":
+                        group_ids.add(normalized_group_id)
+            for group_id in sorted(group_ids):
+                entries.append(
+                    FeishuDirectoryEntry(
+                        id=group_id,
+                        name=group_id,
+                        type="group",
+                        source="config",
+                        account_id=account_id,
+                    )
+                )
+        return entries
+
+    def _list_live_directory_entries_for_account(self, account_id: str, limit: int = 50) -> List[FeishuDirectoryEntry]:
+        """Enumerate users and chats from Feishu APIs for one account.
+
+        This is best-effort only. Failures must not break the directory refresh path,
+        so callers always merge these results with static config/session discovery.
+        """
+        from tools.feishu.client import feishu_api_request
+
+        entries: List[FeishuDirectoryEntry] = []
+        if limit <= 0:
+            return entries
+        settings = self._get_account_live_directory_settings(account_id)
+        include_live_users = settings["include_live_users"] is not False
+        include_live_groups = settings["include_live_groups"] is not False
+        effective_limit = min(limit, int(settings["live_limit"]))
+        page_size = min(int(settings["live_page_size"]), effective_limit, 100)
+        if page_size <= 0:
+            return entries
+
+        def _collect_paginated_items(path: str, *, params: Dict[str, Any], page_limit: int) -> List[Dict[str, Any]]:
+            """Fetch paginated Feishu directory resources up to the requested limit."""
+            items: List[Dict[str, Any]] = []
+            page_token = ""
+            while len(items) < page_limit:
+                request_params = dict(params)
+                remaining = page_limit - len(items)
+                request_params["page_size"] = min(int(request_params.get("page_size") or page_size), remaining, 100)
+                if page_token:
+                    request_params["page_token"] = page_token
+                payload = feishu_api_request(
+                    "GET",
+                    path,
+                    params=request_params,
+                    account_id=account_id,
+                )
+                data = payload.get("data") or {}
+                raw_items = data.get("items") or []
+                for item in raw_items:
+                    if isinstance(item, dict):
+                        items.append(item)
+                    if len(items) >= page_limit:
+                        break
+                has_more = bool(data.get("has_more"))
+                page_token = str(data.get("page_token", "") or "").strip()
+                if not has_more or not page_token:
+                    break
+            return items[:page_limit]
+
+        if include_live_users:
+            try:
+                for item in _collect_paginated_items(
+                    "/open-apis/contact/v3/users",
+                    params={"user_id_type": "open_id", "page_size": page_size},
+                    page_limit=effective_limit,
+                ):
+                    open_id = str(item.get("open_id", "") or "").strip()
+                    if not open_id:
+                        continue
+                    entries.append(
+                        FeishuDirectoryEntry(
+                            id=open_id,
+                            name=str(item.get("name", "") or open_id).strip() or open_id,
+                            type="dm",
+                            source="live",
+                            account_id=account_id,
+                        )
+                    )
+            except Exception:
+                logger.debug("[Feishu] Failed to list live user directory for account %s", account_id, exc_info=True)
+
+        if include_live_groups:
+            try:
+                for item in _collect_paginated_items(
+                    "/open-apis/im/v1/chats",
+                    params={"page_size": page_size},
+                    page_limit=effective_limit,
+                ):
+                    chat_id = str(item.get("chat_id", "") or "").strip()
+                    if not chat_id:
+                        continue
+                    entries.append(
+                        FeishuDirectoryEntry(
+                            id=chat_id,
+                            name=str(item.get("name", "") or chat_id).strip() or chat_id,
+                            type="group",
+                            source="live",
+                            account_id=account_id,
+                        )
+                    )
+            except Exception:
+                logger.debug("[Feishu] Failed to list live group directory for account %s", account_id, exc_info=True)
+
+        return entries
+
+    def build_channel_directory_entries(self, *, include_live: bool = True, limit_per_account: int = 50) -> List[Dict[str, str]]:
+        """Build Feishu directory entries for the shared gateway channel directory cache.
+
+        Directory entries include account IDs so outbound name resolution can route
+        across multiple configured Feishu accounts without guessing.
+        """
+        entries: List[FeishuDirectoryEntry] = []
+        account_ids = [
+            account.account_id
+            for account in sorted(self._accounts.values(), key=lambda account: (account.account_id != "default", account.account_id))
+            if account.enabled
+        ] or ["default"]
+        for account_id in account_ids:
+            entries.extend(self._list_config_directory_entries_for_account(account_id))
+            if include_live:
+                live_settings = self._get_account_live_directory_settings(account_id)
+                effective_limit = min(limit_per_account, int(live_settings["live_limit"]))
+                entries.extend(self._list_live_directory_entries_for_account(account_id, limit=effective_limit))
+        return self._normalize_directory_entries(entries)
+
+    def search_channel_directory_entries(self, query: str, *, limit_per_account: int = 10) -> List[Dict[str, str]]:
+        """Search Feishu users and chats on demand for directory resolution.
+
+        This path complements the periodic cached directory refresh. It is used
+        when Hermes needs to resolve a Feishu target by name but the local cache
+        does not contain a match yet.
+        """
+        from tools.feishu.client import feishu_api_request
+
+        normalized_query = str(query or "").strip()
+        if not normalized_query:
+            return []
+
+        entries: List[FeishuDirectoryEntry] = []
+        account_ids = [
+            account.account_id
+            for account in sorted(self._accounts.values(), key=lambda account: (account.account_id != "default", account.account_id))
+            if account.enabled
+        ] or ["default"]
+        for account_id in account_ids:
+            settings = self._get_account_live_directory_settings(account_id)
+            per_account_limit = min(max(limit_per_account, 1), int(settings["live_limit"]))
+            if settings["include_live_users"] is not False:
+                try:
+                    user_payload = feishu_api_request(
+                        "GET",
+                        "/open-apis/search/v1/user",
+                        params={"query": normalized_query, "page_size": str(min(per_account_limit, 50))},
+                        account_id=account_id,
+                    )
+                    for item in ((user_payload.get("data") or {}).get("users") or []):
+                        if not isinstance(item, dict):
+                            continue
+                        user = item.get("user_info") if isinstance(item.get("user_info"), dict) else item
+                        open_id = str((user or {}).get("open_id", "") or "").strip()
+                        if not open_id:
+                            continue
+                        entries.append(
+                            FeishuDirectoryEntry(
+                                id=open_id,
+                                name=str((user or {}).get("name", "") or open_id).strip() or open_id,
+                                type="dm",
+                                source="live_search",
+                                account_id=account_id,
+                            )
+                        )
+                except Exception:
+                    logger.debug("[Feishu] Failed to search live user directory for account %s", account_id, exc_info=True)
+
+            if settings["include_live_groups"] is not False:
+                try:
+                    chat_payload = feishu_api_request(
+                        "GET",
+                        "/open-apis/im/v1/chats/search",
+                        params={"query": normalized_query, "page_size": str(min(per_account_limit, 50)), "user_id_type": "open_id"},
+                        account_id=account_id,
+                    )
+                    for item in ((chat_payload.get("data") or {}).get("items") or []):
+                        if not isinstance(item, dict):
+                            continue
+                        chat_id = str(item.get("chat_id", "") or "").strip()
+                        if not chat_id:
+                            continue
+                        entries.append(
+                            FeishuDirectoryEntry(
+                                id=chat_id,
+                                name=str(item.get("name", "") or chat_id).strip() or chat_id,
+                                type="group",
+                                source="live_search",
+                                account_id=account_id,
+                            )
+                        )
+                except Exception:
+                    logger.debug("[Feishu] Failed to search live chat directory for account %s", account_id, exc_info=True)
+
+        return self._normalize_directory_entries(entries)
 
     def format_message(self, content: str) -> str:
         """Feishu text messages are plain text by default."""
@@ -1780,6 +3363,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
         chat_type = getattr(message, "chat_type", "p2p")
         chat_id = getattr(message, "chat_id", "") or ""
+        if chat_type == "p2p" and not self._allow_dm_message(sender_id):
+            logger.debug("[Feishu] Dropping DM that failed dm_policy gate: %s", message_id)
+            return
         if chat_type != "p2p" and not self._should_accept_group_message(message, sender_id, chat_id):
             logger.debug("[Feishu] Dropping group message that failed mention/policy gate: %s", message_id)
             return
@@ -1844,6 +3430,18 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         future.add_done_callback(self._log_background_failure)
 
+    def _on_comment_event(self, data: Any) -> None:
+        """Route Drive comment webhook events onto the adapter loop."""
+        loop = self._loop
+        if loop is None or bool(getattr(loop, "is_closed", lambda: False)()):
+            logger.warning("[Feishu] Dropping comment event before adapter loop is ready")
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self._handle_comment_event(data),
+            loop,
+        )
+        future.add_done_callback(self._log_background_failure)
+
     def _on_card_action_trigger(self, data: Any) -> Any:
         """Schedule Feishu card actions on the adapter loop and acknowledge immediately."""
         loop = self._loop
@@ -1859,19 +3457,270 @@ class FeishuAdapter(BasePlatformAdapter):
             return None
         return P2CardActionTriggerResponse()
 
+    @staticmethod
+    def _build_comment_event_context(
+        file_token: str,
+        file_type: str,
+        comment_id: str,
+        reply_id: Optional[str] = None,
+        account_id: Optional[str] = None,
+        is_mentioned: bool = False,
+    ) -> Optional[FeishuCommentEventContext]:
+        """Resolve structured context for one document comment-thread event."""
+        from tools.feishu.client import feishu_api_request
+
+        document_title = ""
+        try:
+            meta_payload = feishu_api_request(
+                "POST",
+                "/open-apis/drive/v1/metas/batch_query",
+                json_body={"request_docs": [{"doc_token": file_token, "doc_type": file_type}]},
+                account_id=account_id,
+            )
+            metas = (meta_payload.get("data") or {}).get("metas") or []
+            if metas and isinstance(metas[0], dict):
+                document_title = str(
+                    metas[0].get("title")
+                    or metas[0].get("name")
+                    or metas[0].get("obj_name")
+                    or ""
+                ).strip()
+        except Exception:
+            logger.debug("[Feishu] Failed to fetch document title for %s", file_token, exc_info=True)
+
+        target_comment = None
+        comment_page_token = ""
+        comment_pages = 0
+        while comment_pages < _FEISHU_COMMENT_SCAN_MAX_PAGES and target_comment is None:
+            comment_pages += 1
+            try:
+                comment_payload = feishu_api_request(
+                    "GET",
+                    f"/open-apis/drive/v1/files/{file_token}/comments",
+                    params={
+                        "file_type": file_type,
+                        "page_size": _FEISHU_COMMENT_PAGE_SIZE,
+                        "page_token": comment_page_token,
+                    },
+                    account_id=account_id,
+                )
+            except Exception:
+                logger.debug("[Feishu] Failed to list comments for %s", file_token, exc_info=True)
+                return None
+
+            comment_data = comment_payload.get("data") or {}
+            comment_items = comment_data.get("items") or []
+            for item in comment_items:
+                if isinstance(item, dict) and str(item.get("comment_id", "")).strip() == comment_id:
+                    target_comment = item
+                    break
+            if target_comment is not None:
+                break
+            if not comment_data.get("has_more"):
+                break
+            comment_page_token = str(comment_data.get("page_token", "") or "").strip()
+            if not comment_page_token:
+                break
+        if not isinstance(target_comment, dict):
+            document_label = f'"{document_title}"' if document_title else f"{file_type} document {file_token}"
+            fallback_prompt = (
+                f"The user added a comment in {document_label}.\n"
+                "This is a Feishu document comment-thread event, not a Feishu IM conversation.\n"
+                f"file_token: {file_token}\n"
+                f"file_type: {file_type}\n"
+                f"comment_id: {comment_id}\n"
+                f"Primary document tools: feishu_fetch_doc(file_token={file_token}, file_type={file_type}), "
+                f"feishu_doc_comments(file_token={file_token}, file_type={file_type}), "
+                f"feishu_update_doc(file_token={file_token}).\n"
+                "Reply in the current comment thread.\n"
+                "If you already reply through a dedicated tool, end your final response with NO_REPLY."
+            )
+            return FeishuCommentEventContext(
+                file_token=file_token,
+                file_type=file_type,
+                comment_id=comment_id,
+                document_title=document_title,
+                quoted_text="",
+                root_comment_text="",
+                active_text="",
+                event_type="add_comment",
+                reply_chain_lines=[],
+                is_mentioned=is_mentioned,
+                is_whole_comment=True,
+                prompt=fallback_prompt,
+                preview=f"comment in {document_label}",
+            )
+
+        root_replies = (((target_comment.get("reply_list") or {}).get("replies")) or [])
+        root_comment_text = (
+            _extract_comment_plain_text(root_replies[0].get("content", {}).get("elements", []))
+            if root_replies
+            else ""
+        )
+
+        reply_text = ""
+        reply_chain_lines: List[str] = []
+        if reply_id:
+            reply_items: List[Dict[str, Any]] = []
+            reply_page_token = ""
+            reply_pages = 0
+            while reply_pages < _FEISHU_COMMENT_SCAN_MAX_PAGES:
+                reply_pages += 1
+                try:
+                    reply_payload = feishu_api_request(
+                        "GET",
+                        f"/open-apis/drive/v1/files/{file_token}/comments/{comment_id}/replies",
+                        params={
+                            "file_type": file_type,
+                            "page_size": _FEISHU_COMMENT_REPLY_PAGE_SIZE,
+                            "page_token": reply_page_token,
+                        },
+                        account_id=account_id,
+                    )
+                except Exception:
+                    logger.debug("[Feishu] Failed to list comment replies for %s", comment_id, exc_info=True)
+                    break
+                reply_data = reply_payload.get("data") or {}
+                for item in reply_data.get("items") or []:
+                    if isinstance(item, dict):
+                        reply_items.append(item)
+                if not reply_data.get("has_more"):
+                    break
+                reply_page_token = str(reply_data.get("page_token", "") or "").strip()
+                if not reply_page_token:
+                    break
+            reply_chain_lines = _build_comment_reply_chain_lines(reply_items, reply_id)
+            for item in reply_items:
+                if not isinstance(item, dict):
+                    continue
+                current_reply_id = str(item.get("reply_id", "")).strip()
+                current_text = _extract_comment_plain_text((item.get("content") or {}).get("elements", []))
+                if current_reply_id == reply_id:
+                    reply_text = current_text
+                    continue
+
+        quoted_text = str(target_comment.get("quote", "") or "").strip()
+        is_whole_comment = _infer_is_whole_comment(
+            explicit_is_whole=target_comment.get("is_whole"),
+            quoted_text=quoted_text,
+        )
+        active_text = reply_text or root_comment_text
+        action_label = "reply" if reply_id else "comment"
+        event_type = "add_reply" if reply_id else "add_comment"
+        document_label = f'"{document_title}"' if document_title else f"{file_type} document {file_token}"
+        first_line = (
+            f"The user added a {action_label} in {document_label}: {active_text}"
+            if active_text
+            else f"The user added a {action_label} in {document_label}."
+        )
+        prompt_lines = [first_line]
+        if reply_id and root_comment_text and root_comment_text != active_text:
+            prompt_lines.append(f"Original comment: {root_comment_text}")
+        if quoted_text:
+            prompt_lines.append(f"Quoted content: {quoted_text}")
+        if is_mentioned:
+            prompt_lines.append("This comment mentioned you.")
+        if is_whole_comment:
+            prompt_lines.append("This is a whole-document comment without a local quoted anchor.")
+        if reply_chain_lines:
+            prompt_lines.append("Reply chain context:")
+            prompt_lines.extend(reply_chain_lines)
+        prompt_lines.extend(
+            [
+                f"Event type: {event_type}",
+                f"file_token: {file_token}",
+                f"file_type: {file_type}",
+                f"comment_id: {comment_id}",
+            ]
+        )
+        if reply_id:
+            prompt_lines.append(f"reply_id: {reply_id}")
+        prompt_lines.extend(
+            [
+                (
+                    f"Primary document target: file_token={file_token}, file_type={file_type}. "
+                    f"Use feishu_fetch_doc with this target to read the document."
+                ),
+                (
+                    f"If you need the comment thread, use feishu_doc_comments with "
+                    f"file_token={file_token} and file_type={file_type}."
+                ),
+                (
+                    f"If the request requires editing document content, use feishu_update_doc "
+                    f"against file_token={file_token} before replying."
+                ),
+            ]
+        )
+        prompt_lines.extend(
+            [
+                "This is a Feishu document comment-thread event, not a Feishu IM conversation. Your final text reply will be posted automatically to the current comment thread.",
+                "If you need to inspect the comment thread itself, prefer the Feishu Drive comment tools before answering from memory.",
+                "If the comment asks you to modify the document, first use the relevant Feishu document tools to make the change instead of replying with only a plan.",
+                "If the quoted content identifies a local section, treat it as the primary edit or reading anchor before falling back to broader document context.",
+                "For requests like summarize, explain, rewrite, continue, review, or translate this section, treat the quoted content as the primary local scope instead of defaulting to the whole document.",
+                "If the quoted content is not enough, read nearby context with Feishu document tools before answering, and do not guess document content from the comment alone.",
+                "When document edits fail or you cannot locate the anchor, explain the failure clearly in the comment thread.",
+                "If this is a reading task such as summarization, explanation, extraction, or translation, you may directly output the final answer text after confirming the local context.",
+                "Keep the user-visible reply in the same language as the user's comment or reply unless they explicitly ask for another language.",
+                "If you already completed the user-visible response through a Feishu comment tool, end your final response with NO_REPLY to avoid a duplicate automatic reply.",
+                "If the comment does not require any user-visible action, end your final response with NO_REPLY.",
+            ]
+        )
+        preview_document_label = document_title or f"{file_type}:{file_token}"
+        preview_subject = active_text or quoted_text or root_comment_text or "comment event"
+        preview = f"{event_type} in {preview_document_label}: {preview_subject[:120]}"
+        return FeishuCommentEventContext(
+            file_token=file_token,
+            file_type=file_type,
+            comment_id=comment_id,
+            reply_id=reply_id or "",
+            document_title=document_title,
+            quoted_text=quoted_text,
+            root_comment_text=root_comment_text,
+            active_text=active_text,
+            event_type=event_type,
+            reply_chain_lines=reply_chain_lines,
+            is_mentioned=is_mentioned,
+            is_whole_comment=is_whole_comment,
+            prompt="\n".join(prompt_lines),
+            preview=preview,
+        )
+
+    @staticmethod
+    def _resolve_comment_event_context(
+        file_token: str,
+        file_type: str,
+        comment_id: str,
+        reply_id: Optional[str] = None,
+        account_id: Optional[str] = None,
+        is_mentioned: bool = False,
+    ) -> Optional[Dict[str, str]]:
+        """Backward-compatible wrapper for legacy tests and callers."""
+        context = FeishuAdapter._build_comment_event_context(
+            file_token=file_token,
+            file_type=file_type,
+            comment_id=comment_id,
+            reply_id=reply_id,
+            account_id=account_id,
+            is_mentioned=is_mentioned,
+        )
+        return context.to_payload() if context is not None else None
+
     async def _handle_reaction_event(self, event_type: str, data: Any) -> None:
         """Fetch the reacted-to message; if it was sent by this bot, emit a synthetic text event."""
-        if not self._client:
-            return
         event = getattr(data, "event", None)
         message_id = str(getattr(event, "message_id", "") or "")
         if not message_id:
+            return
+        account_id = self._extract_event_account_id(data)
+        client = self._resolve_client(account_id=account_id)
+        if not client:
             return
 
         # Fetch the target message to verify it was sent by us and to obtain chat context.
         try:
             request = self._build_get_message_request(message_id)
-            response = await asyncio.to_thread(self._client.im.v1.message.get, request)
+            response = await asyncio.to_thread(client.im.v1.message.get, request)
             if not response or not getattr(response, "success", lambda: False)():
                 return
             items = getattr(getattr(response, "data", None), "items", None) or []
@@ -1895,9 +3744,8 @@ class FeishuAdapter(BasePlatformAdapter):
         emoji_type = str(getattr(reaction_type_obj, "emoji_type", "") or "UNKNOWN")
         action = "added" if "created" in event_type else "removed"
         synthetic_text = f"reaction:{action}:{emoji_type}"
-
-        sender_profile = await self._resolve_sender_profile(user_id_obj)
-        chat_info = await self.get_chat_info(chat_id)
+        sender_profile = await self._resolve_sender_profile(user_id_obj, account_id=account_id)
+        chat_info = await self.get_chat_info(chat_id, account_id=account_id)
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -1906,6 +3754,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=None,
             user_id_alt=sender_profile["user_id_alt"],
+            account_id=account_id,
         )
         synthetic_event = MessageEvent(
             text=synthetic_text,
@@ -1917,6 +3766,188 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
         await self._handle_message_with_guards(synthetic_event)
+
+    async def _handle_comment_event(self, data: Any) -> None:
+        """把飞书文档评论事件转成 synthetic message 进入 agent。"""
+        event = getattr(data, "event", None)
+        notice_meta = getattr(event, "notice_meta", None) or event
+        if not event or not notice_meta:
+            logger.debug("[Feishu] Dropping malformed comment event: missing event payload")
+            return
+
+        file_token = str(getattr(notice_meta, "file_token", "") or getattr(event, "file_token", "") or "").strip()
+        file_type = str(getattr(notice_meta, "file_type", "") or getattr(event, "file_type", "") or "").strip()
+        comment_id = str(getattr(event, "comment_id", "") or "").strip()
+        reply_id = str(getattr(event, "reply_id", "") or "").strip()
+        sender_open_id = str(
+            getattr(notice_meta, "from_user_id", "") or getattr(event, "from_user_id", "") or ""
+        ).strip()
+        is_mentioned = bool(
+            getattr(notice_meta, "is_mentioned", None)
+            if getattr(notice_meta, "is_mentioned", None) is not None
+            else getattr(event, "is_mention", False)
+        )
+        if not file_token or not file_type or not comment_id or not sender_open_id:
+            logger.debug("[Feishu] Dropping malformed comment event: missing token/comment/sender")
+            return
+        if sender_open_id == self._bot_open_id or sender_open_id in getattr(self, "_bot_open_ids", set()):
+            logger.debug("[Feishu] Dropping self-authored comment event on %s", file_token)
+            return
+        if not self._allow_dm_message(SimpleNamespace(open_id=sender_open_id, user_id=None)):
+            logger.debug("[Feishu] Dropping comment event that failed dm_policy gate: %s", comment_id)
+            return
+        if not is_mentioned:
+            logger.debug("[Feishu] Dropping comment event without bot mention: %s", comment_id)
+            return
+
+        dedup_key = f"comment:{comment_id}:{reply_id or 'root'}"
+        if self._is_duplicate(dedup_key):
+            logger.debug("[Feishu] Dropping duplicate comment event: %s", dedup_key)
+            return
+
+        account_id = self._extract_event_account_id(data)
+        context = await asyncio.to_thread(
+            self._build_comment_event_context,
+            file_token,
+            file_type,
+            comment_id,
+            reply_id or None,
+            account_id,
+            is_mentioned,
+        )
+        if not context:
+            logger.debug("[Feishu] Unable to resolve comment context for %s", comment_id)
+            return
+
+        sender_profile = await self._resolve_sender_profile(
+            SimpleNamespace(open_id=sender_open_id, user_id=None),
+            account_id=account_id,
+        )
+        source = self.build_source(
+            chat_id=_build_feishu_comment_target(
+                file_type=context.file_type,
+                file_token=context.file_token,
+                comment_id=context.comment_id,
+            ),
+            chat_name=context.document_title or f"Feishu Comment {context.file_token}",
+            chat_type="dm",
+            user_id=sender_profile["user_id"] or sender_open_id,
+            user_name=sender_profile["user_name"],
+            thread_id=context.comment_id,
+            user_id_alt=sender_profile["user_id_alt"],
+            account_id=account_id,
+        )
+        synthetic_event = MessageEvent(
+            text=context.prompt,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=data,
+            message_id=dedup_key,
+            timestamp=datetime.now(),
+        )
+        logger.info(
+            "[Feishu] Routing document comment %s on %s as synthetic event",
+            context.comment_id,
+            context.file_token,
+        )
+        await self._handle_message_with_guards(synthetic_event)
+
+    async def _execute_pending_tool_replay(
+        self,
+        *,
+        state: FeishuPendingOAuthRequest,
+        requester_open_id: str,
+    ) -> Dict[str, Any]:
+        """授权完成后直接重放原始工具调用，并把结果回发到当前会话。
+
+        这里走工具注册表的同步 dispatch，避免重新进入完整 agent 循环。
+        目标是把“缺权限 -> 授权 -> 重放”闭环收敛到平台侧，而不是再依赖模型理解
+        提示文本后自行重试一次。
+        """
+        replay_ids = _merge_replay_ids(getattr(state, "replay_ids", []), getattr(state, "replay_id", ""))
+        if not replay_ids:
+            return {"replayed": False, "had_failure": False, "results": []}
+        pending_replays = getattr(self, "_pending_tool_replays", None)
+        if not isinstance(pending_replays, dict):
+            return {"replayed": False, "had_failure": False, "results": []}
+
+        from tools.registry import registry
+
+        replay_results: List[Dict[str, Any]] = []
+        replayed_any = False
+        had_failure = False
+        for replay_id in replay_ids:
+            replay = pending_replays.pop(replay_id, None)
+            if not isinstance(replay, dict):
+                replay_results.append(
+                    {
+                        "replay_id": replay_id,
+                        "tool_name": "",
+                        "status": "missing",
+                        "result": {"error": "Pending replay state was not found."},
+                    }
+                )
+                had_failure = True
+                continue
+
+            tool_name = str(replay.get("tool_name", "") or "").strip()
+            args = replay.get("args") if isinstance(replay.get("args"), dict) else {}
+            if not tool_name:
+                replay_results.append(
+                    {
+                        "replay_id": replay_id,
+                        "tool_name": "",
+                        "status": "invalid",
+                        "result": {"error": "Pending replay tool name was missing."},
+                    }
+                )
+                had_failure = True
+                continue
+
+            result_text = await asyncio.to_thread(registry.dispatch, tool_name, args, task_id=None, user_task=None)
+            try:
+                parsed = json.loads(result_text)
+            except Exception:
+                parsed = {"raw_result": result_text}
+            status = "ok"
+            if isinstance(parsed, dict) and parsed.get("error"):
+                status = "error"
+                had_failure = True
+                pending_replays[replay_id] = replay
+            replay_results.append(
+                {
+                    "replay_id": replay_id,
+                    "tool_name": tool_name,
+                    "status": status,
+                    "result": parsed,
+                }
+            )
+            replayed_any = True
+
+        if not replay_results:
+            return {"replayed": False, "had_failure": had_failure, "results": []}
+
+        body_header = "Feishu authorized tool replay completed."
+        if had_failure:
+            body_header = "Feishu authorized tool replay completed with issues."
+        body = (
+            f"{body_header}\n\n"
+            f"Authorized user: `{requester_open_id}`\n\n"
+            f"Replay results:\n```json\n{json.dumps(replay_results, ensure_ascii=False, indent=2)}\n```"
+        )
+        send_result = await self.send(
+            state.chat_id,
+            body,
+            metadata={
+                "thread_id": state.thread_id or None,
+                "account_id": state.account_id or None,
+            },
+        )
+        return {
+            "replayed": bool(send_result.success and replayed_any),
+            "had_failure": had_failure,
+            "results": replay_results,
+        }
 
     def _is_card_action_duplicate(self, token: str) -> bool:
         """Return True if this card action token was already processed within the dedup window."""
@@ -1953,6 +3984,617 @@ class FeishuAdapter(BasePlatformAdapter):
         # --- Exec approval button intercept ---
         hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
         if hermes_action:
+            if hermes_action == "answer_question":
+                question_id = str(action_value.get("question_id", "") or "")
+                answer = str(action_value.get("answer", "") or "").strip()
+                state = self._pending_questions.pop(question_id, None)
+                if not state:
+                    logger.debug("[Feishu] Question %s already resolved or unknown", question_id)
+                    return
+
+                account_id = self._extract_event_account_id(data)
+                resolved_account_id = account_id or state.account_id or None
+                sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
+                user_name = sender_profile.get("user_name") or open_id
+                await self._update_interactive_card(
+                    message_id=state.message_id,
+                    title=state.header,
+                    body_markdown=(
+                        f"{state.question}\n\n"
+                        f"**Answered by:** {user_name}\n"
+                        f"**Answer:** {answer}"
+                    ),
+                    template="green",
+                    account_id=resolved_account_id,
+                )
+
+                chat_info = await self.get_chat_info(chat_id, account_id=resolved_account_id)
+                source = self.build_source(
+                    chat_id=chat_id,
+                    chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
+                    chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type="group"),
+                    user_id=sender_profile["user_id"],
+                    user_name=sender_profile["user_name"],
+                    thread_id=state.thread_id or None,
+                    user_id_alt=sender_profile["user_id_alt"],
+                    account_id=resolved_account_id,
+                )
+                synthetic_event = MessageEvent(
+                    text=f"{state.question}\nAnswer: {answer}",
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    raw_message=data,
+                    message_id=token or str(uuid.uuid4()),
+                    timestamp=datetime.now(),
+                )
+                logger.info("[Feishu] Routed question answer for %s from %s", question_id, user_name)
+                await self._handle_message_with_guards(synthetic_event)
+                return
+
+            if hermes_action == "complete_oauth":
+                request_id = str(action_value.get("request_id", "") or "")
+                state = self._pending_oauth_requests.pop(request_id, None)
+                if not state:
+                    logger.debug("[Feishu] OAuth request %s already resolved or unknown", request_id)
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=self._extract_event_account_id(data),
+                        text=(
+                            "This Feishu authorization card is no longer active. "
+                            "Create a new authorization request if you still need to continue."
+                        ),
+                    )
+                    return
+                if state.requester_open_id and state.requester_open_id != open_id:
+                    logger.warning(
+                        "[Feishu] Ignoring OAuth completion from %s for request %s owned by %s",
+                        open_id,
+                        request_id,
+                        state.requester_open_id,
+                    )
+                    self._pending_oauth_requests[request_id] = state
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=state.account_id or self._extract_event_account_id(data),
+                        text="Only the original requester can complete this Feishu authorization card.",
+                    )
+                    return
+
+                account_id = self._extract_event_account_id(data)
+                resolved_account_id = account_id or state.account_id or None
+                if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                    await self._expire_auth_request_card(
+                        state=state,
+                        resolved_account_id=resolved_account_id,
+                        expired_by_label="30 minutes",
+                    )
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=resolved_account_id,
+                        text="This Feishu authorization card expired. Create a new authorization request to continue.",
+                    )
+                    return
+                sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
+                user_name = sender_profile.get("user_name") or open_id
+                authorized_open_id = state.requester_open_id or open_id
+                self.record_authorization_grant(
+                    user_open_id=authorized_open_id,
+                    scopes=state.scopes,
+                    updated_by=open_id,
+                    source="interactive_confirm",
+                    account_id=resolved_account_id,
+                )
+                replay_status = await self._execute_pending_tool_replay(
+                    state=state,
+                    requester_open_id=authorized_open_id,
+                )
+                replay_results = replay_status.get("results") if isinstance(replay_status, dict) else []
+                replayed = bool(replay_status.get("replayed")) if isinstance(replay_status, dict) else False
+                replay_had_failure = bool(replay_status.get("had_failure")) if isinstance(replay_status, dict) else False
+                replay_count = len(replay_results) if isinstance(replay_results, list) else 0
+                success_count = sum(
+                    1
+                    for item in replay_results
+                    if isinstance(item, dict) and str(item.get("status", "")).strip().lower() == "ok"
+                )
+                failed_count = sum(
+                    1
+                    for item in replay_results
+                    if isinstance(item, dict) and str(item.get("status", "")).strip().lower() != "ok"
+                )
+                card_template = "green"
+                card_status_line = f"**Replay status:** {success_count}/{replay_count or success_count} actions completed"
+                if replay_had_failure:
+                    card_template = "orange"
+                    card_status_line = f"**Replay status:** {success_count} succeeded, {failed_count} need attention"
+                elif replay_count == 0:
+                    card_template = "blue"
+                    card_status_line = "**Replay status:** no pending actions were waiting for replay"
+                if replay_had_failure:
+                    self._pending_oauth_requests[request_id] = state
+                    await self._update_interactive_card(
+                        message_id=state.message_id,
+                        title=state.title,
+                        body_markdown=(
+                            f"{state.reason}\n\n"
+                            f"**Confirmed by:** {user_name}\n"
+                            f"**Authorized user:** {authorized_open_id}\n"
+                            f"**Scopes:** {', '.join(state.scopes)}\n"
+                            f"{card_status_line}\n"
+                            "**Next step:** retry the authorized action after reviewing the replay result details below."
+                        ),
+                        template=card_template,
+                        button_label="Retry Authorized Action",
+                        button_value={
+                            "hermes_action": "complete_oauth",
+                            "request_id": request_id,
+                        },
+                        account_id=resolved_account_id,
+                    )
+                else:
+                    await self._update_interactive_card(
+                        message_id=state.message_id,
+                        title=state.title,
+                        body_markdown=(
+                            f"{state.reason}\n\n"
+                            f"**Confirmed by:** {user_name}\n"
+                            f"**Authorized user:** {authorized_open_id}\n"
+                            f"**Scopes:** {', '.join(state.scopes)}\n"
+                            f"{card_status_line}"
+                        ),
+                        template=card_template,
+                        account_id=resolved_account_id,
+                    )
+                if replayed:
+                    logger.info(
+                        "[Feishu] Replayed authorized tool %s.%s for %s",
+                        state.tool_name or "unknown",
+                        state.tool_action or "default",
+                        authorized_open_id,
+                    )
+                    return
+
+                chat_info = await self.get_chat_info(chat_id, account_id=resolved_account_id)
+                source = self.build_source(
+                    chat_id=chat_id,
+                    chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
+                    chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type="group"),
+                    user_id=sender_profile["user_id"],
+                    user_name=sender_profile["user_name"],
+                    thread_id=None,
+                    user_id_alt=sender_profile["user_id_alt"],
+                    account_id=resolved_account_id,
+                )
+                synthetic_event = MessageEvent(
+                    text=(
+                        "Feishu authorization completed by the user. "
+                        f"Authorized user: {authorized_open_id}. "
+                        f"Confirmed scopes: {', '.join(state.scopes)}. "
+                        f"Retry tool: {state.tool_name or 'unknown'}. "
+                        f"Retry action: {state.tool_action or 'default'}."
+                    ),
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    raw_message=data,
+                    message_id=token or str(uuid.uuid4()),
+                    timestamp=datetime.now(),
+                )
+                logger.info("[Feishu] Routed OAuth completion for %s from %s", request_id, user_name)
+                await self._handle_message_with_guards(synthetic_event)
+                return
+
+            if hermes_action == "cancel_oauth":
+                request_id = str(action_value.get("request_id", "") or "")
+                state = self._pending_oauth_requests.pop(request_id, None)
+                if not state:
+                    logger.debug("[Feishu] OAuth cancel %s already resolved or unknown", request_id)
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=self._extract_event_account_id(data),
+                        text="This Feishu authorization card is already inactive.",
+                    )
+                    return
+                if state.requester_open_id and state.requester_open_id != open_id:
+                    logger.warning(
+                        "[Feishu] Ignoring OAuth cancel from %s for request %s owned by %s",
+                        open_id,
+                        request_id,
+                        state.requester_open_id,
+                    )
+                    self._pending_oauth_requests[request_id] = state
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=state.account_id or self._extract_event_account_id(data),
+                        text="Only the original requester can cancel this Feishu authorization card.",
+                    )
+                    return
+
+                account_id = self._extract_event_account_id(data)
+                resolved_account_id = account_id or state.account_id or None
+                if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                    await self._expire_auth_request_card(
+                        state=state,
+                        resolved_account_id=resolved_account_id,
+                        expired_by_label="30 minutes",
+                    )
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=resolved_account_id,
+                        text="This Feishu authorization card already expired.",
+                    )
+                    return
+                sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
+                user_name = sender_profile.get("user_name") or open_id
+                self._discard_pending_tool_replays(list(_merge_replay_ids(state.replay_ids, state.replay_id)))
+                await self._update_interactive_card(
+                    message_id=state.message_id,
+                    title=state.title,
+                    body_markdown=(
+                        f"{state.reason}\n\n"
+                        f"**Canceled by:** {user_name}\n"
+                        f"**Authorized user:** {state.requester_open_id or open_id}\n"
+                        "**Status:** authorization request canceled for now."
+                    ),
+                    template="grey",
+                    account_id=resolved_account_id,
+                )
+                return
+
+            if hermes_action == "decline_oauth":
+                request_id = str(action_value.get("request_id", "") or "")
+                state = self._pending_oauth_requests.pop(request_id, None)
+                if not state:
+                    logger.debug("[Feishu] OAuth decline %s already resolved or unknown", request_id)
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=self._extract_event_account_id(data),
+                        text="This Feishu authorization card is already inactive.",
+                    )
+                    return
+                if state.requester_open_id and state.requester_open_id != open_id:
+                    logger.warning(
+                        "[Feishu] Ignoring OAuth decline from %s for request %s owned by %s",
+                        open_id,
+                        request_id,
+                        state.requester_open_id,
+                    )
+                    self._pending_oauth_requests[request_id] = state
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=state.account_id or self._extract_event_account_id(data),
+                        text="Only the original requester can decline this Feishu authorization card.",
+                    )
+                    return
+
+                account_id = self._extract_event_account_id(data)
+                resolved_account_id = account_id or state.account_id or None
+                if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                    await self._expire_auth_request_card(
+                        state=state,
+                        resolved_account_id=resolved_account_id,
+                        expired_by_label="30 minutes",
+                    )
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=resolved_account_id,
+                        text="This Feishu authorization card already expired.",
+                    )
+                    return
+                sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
+                user_name = sender_profile.get("user_name") or open_id
+                self._discard_pending_tool_replays(list(_merge_replay_ids(state.replay_ids, state.replay_id)))
+                await self._update_interactive_card(
+                    message_id=state.message_id,
+                    title=state.title,
+                    body_markdown=(
+                        f"{state.reason}\n\n"
+                        f"**Declined by:** {user_name}\n"
+                        f"**Authorized user:** {state.requester_open_id or open_id}\n"
+                        "**Status:** the authorization request was explicitly declined."
+                    ),
+                    template="red",
+                    account_id=resolved_account_id,
+                )
+                return
+
+            if hermes_action == "complete_app_scope_request":
+                request_id = str(action_value.get("request_id", "") or "")
+                state = self._pending_app_scope_requests.pop(request_id, None)
+                if not state:
+                    logger.debug("[Feishu] App scope request %s already resolved or unknown", request_id)
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=self._extract_event_account_id(data),
+                        text=(
+                            "This Feishu app-scope card is no longer active. "
+                            "Create a new request if the authorization handoff is still needed."
+                        ),
+                    )
+                    return
+
+                if state.owner_open_id and state.owner_open_id != open_id:
+                    logger.warning(
+                        "[Feishu] Ignoring app scope completion from %s for request %s owned by %s",
+                        open_id,
+                        request_id,
+                        state.owner_open_id,
+                    )
+                    self._pending_app_scope_requests[request_id] = state
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=state.account_id or self._extract_event_account_id(data),
+                        text="Only the Feishu app owner can complete this app-scope card.",
+                    )
+                    return
+
+                account_id = self._extract_event_account_id(data)
+                resolved_account_id = account_id or state.account_id or None
+                if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                    await self._expire_auth_request_card(
+                        state=state,
+                        resolved_account_id=resolved_account_id,
+                        expired_by_label="30 minutes",
+                    )
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=resolved_account_id,
+                        text="This Feishu app-scope card expired. Create a new request if the handoff is still needed.",
+                    )
+                    return
+                sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
+                user_name = sender_profile.get("user_name") or open_id
+
+                from tools.feishu.client import get_app_granted_scopes_by_token_type
+
+                granted_user_scopes = self._normalize_scope_list(
+                    list(get_app_granted_scopes_by_token_type("user", force_refresh=True, account_id=resolved_account_id))
+                )
+                remaining_scopes = [scope for scope in state.scopes if scope not in set(granted_user_scopes)]
+                if remaining_scopes:
+                    state.scopes = remaining_scopes
+                    self._pending_app_scope_requests[request_id] = state
+                    await self._update_interactive_card(
+                        message_id=state.message_id,
+                        title=state.title,
+                        body_markdown=(
+                            f"{state.reason}\n\n"
+                            f"**Checked by:** {user_name}\n"
+                            f"**Still missing app scopes:** {', '.join(remaining_scopes)}\n\n"
+                            "Hermes could not verify that the app scopes are granted yet. "
+                            "Please confirm the developer console changes and try again."
+                        ),
+                        template="orange",
+                        button_label="I Granted App Scopes",
+                        button_value={
+                            "hermes_action": "complete_app_scope_request",
+                            "request_id": request_id,
+                        },
+                        account_id=resolved_account_id,
+                    )
+                    return
+
+                follow_up_missing_scopes: List[str] = []
+                if state.requester_open_id:
+                    status = self.get_authorization_status(
+                        state.requester_open_id,
+                        granted_user_scopes,
+                        account_id=resolved_account_id,
+                    )
+                    follow_up_missing_scopes = self._normalize_scope_list(list(status.get("missing_scopes") or []))
+                if not state.requester_open_id:
+                    await self._update_interactive_card(
+                        message_id=state.message_id,
+                        title=state.title,
+                        body_markdown=(
+                            f"{state.reason}\n\n"
+                            f"**Confirmed by owner:** {user_name}\n"
+                            f"**App scopes verified:** {', '.join(granted_user_scopes) if granted_user_scopes else 'none'}\n"
+                            "**Next step:** no requester identity was attached, so Hermes cannot continue user authorization automatically."
+                        ),
+                        template="green",
+                        account_id=resolved_account_id,
+                    )
+                    return
+
+                if not follow_up_missing_scopes:
+                    await self._update_interactive_card(
+                        message_id=state.message_id,
+                        title=state.title,
+                        body_markdown=(
+                            f"{state.reason}\n\n"
+                            f"**Confirmed by owner:** {user_name}\n"
+                            f"**App scopes verified:** {', '.join(granted_user_scopes) if granted_user_scopes else 'none'}\n"
+                            f"**Requester:** {state.requester_open_id}\n"
+                            "**Next step:** user authorization is already complete."
+                        ),
+                        template="green",
+                        account_id=resolved_account_id,
+                    )
+                    return
+
+                oauth_result = await self.send_oauth_request_card(
+                    chat_id=state.chat_id,
+                    scopes=follow_up_missing_scopes,
+                    reason=(
+                        "The Feishu app owner has granted the missing app scopes. "
+                        "Complete the remaining user authorization to continue the original action."
+                    ),
+                    title="Feishu Batch Authorization Required",
+                    metadata={
+                        "thread_id": state.thread_id or None,
+                        "account_id": resolved_account_id,
+                        "requester_open_id": state.requester_open_id,
+                        "tool_name": state.tool_name,
+                        "action": state.tool_action,
+                        "replay_id": state.replay_id or None,
+                        "replay_ids": list(_merge_replay_ids(state.replay_ids, state.replay_id)),
+                    },
+                )
+                if not oauth_result.success:
+                    self._pending_app_scope_requests[request_id] = state
+                    await self._update_interactive_card(
+                        message_id=state.message_id,
+                        title=state.title,
+                        body_markdown=(
+                            f"{state.reason}\n\n"
+                            f"**Confirmed by owner:** {user_name}\n"
+                            f"**App scopes verified:** {', '.join(granted_user_scopes) if granted_user_scopes else 'none'}\n"
+                            f"**Next user auth scopes:** {', '.join(follow_up_missing_scopes)}\n\n"
+                            f"Hermes failed to create the follow-up user authorization card: {oauth_result.error or 'unknown error'}"
+                        ),
+                        template="orange",
+                        button_label="Retry Authorization Handoff",
+                        button_value={
+                            "hermes_action": "complete_app_scope_request",
+                            "request_id": request_id,
+                        },
+                        account_id=resolved_account_id,
+                    )
+                    return
+
+                await self._update_interactive_card(
+                    message_id=state.message_id,
+                    title=state.title,
+                    body_markdown=(
+                        f"{state.reason}\n\n"
+                        f"**Confirmed by owner:** {user_name}\n"
+                        f"**App scopes verified:** {', '.join(granted_user_scopes) if granted_user_scopes else 'none'}\n"
+                        f"**Next user auth scopes:** {', '.join(follow_up_missing_scopes)}\n"
+                        "**Next step:** Hermes sent the follow-up user authorization card in this chat."
+                    ),
+                    template="blue",
+                    account_id=resolved_account_id,
+                )
+                logger.info(
+                    "[Feishu] Promoted app scope request %s to user authorization for %s",
+                    request_id,
+                    state.requester_open_id,
+                )
+                return
+
+            if hermes_action == "cancel_app_scope_request":
+                request_id = str(action_value.get("request_id", "") or "")
+                state = self._pending_app_scope_requests.pop(request_id, None)
+                if not state:
+                    logger.debug("[Feishu] App scope cancel %s already resolved or unknown", request_id)
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=self._extract_event_account_id(data),
+                        text="This Feishu app-scope card is already inactive.",
+                    )
+                    return
+
+                if state.owner_open_id and state.owner_open_id != open_id:
+                    logger.warning(
+                        "[Feishu] Ignoring app scope cancel from %s for request %s owned by %s",
+                        open_id,
+                        request_id,
+                        state.owner_open_id,
+                    )
+                    self._pending_app_scope_requests[request_id] = state
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=state.account_id or self._extract_event_account_id(data),
+                        text="Only the Feishu app owner can cancel this app-scope card.",
+                    )
+                    return
+
+                account_id = self._extract_event_account_id(data)
+                resolved_account_id = account_id or state.account_id or None
+                if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                    await self._expire_auth_request_card(
+                        state=state,
+                        resolved_account_id=resolved_account_id,
+                        expired_by_label="30 minutes",
+                    )
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=resolved_account_id,
+                        text="This Feishu app-scope card already expired.",
+                    )
+                    return
+                sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
+                user_name = sender_profile.get("user_name") or open_id
+                self._discard_pending_tool_replays(list(_merge_replay_ids(state.replay_ids, state.replay_id)))
+                await self._update_interactive_card(
+                    message_id=state.message_id,
+                    title=state.title,
+                    body_markdown=(
+                        f"{state.reason}\n\n"
+                        f"**Canceled by owner:** {user_name}\n"
+                        f"**Requester:** {state.requester_open_id or 'unknown'}\n"
+                        "**Status:** app-scope handoff canceled for now."
+                    ),
+                    template="grey",
+                    account_id=resolved_account_id,
+                )
+                return
+
+            if hermes_action == "decline_app_scope_request":
+                request_id = str(action_value.get("request_id", "") or "")
+                state = self._pending_app_scope_requests.pop(request_id, None)
+                if not state:
+                    logger.debug("[Feishu] App scope decline %s already resolved or unknown", request_id)
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=self._extract_event_account_id(data),
+                        text="This Feishu app-scope card is already inactive.",
+                    )
+                    return
+
+                if state.owner_open_id and state.owner_open_id != open_id:
+                    logger.warning(
+                        "[Feishu] Ignoring app scope decline from %s for request %s owned by %s",
+                        open_id,
+                        request_id,
+                        state.owner_open_id,
+                    )
+                    self._pending_app_scope_requests[request_id] = state
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=state.account_id or self._extract_event_account_id(data),
+                        text="Only the Feishu app owner can decline this app-scope card.",
+                    )
+                    return
+
+                account_id = self._extract_event_account_id(data)
+                resolved_account_id = account_id or state.account_id or None
+                if getattr(state, "expires_at", 0.0) and time.time() >= float(state.expires_at):
+                    await self._expire_auth_request_card(
+                        state=state,
+                        resolved_account_id=resolved_account_id,
+                        expired_by_label="30 minutes",
+                    )
+                    await self._send_card_action_notice(
+                        chat_id=chat_id,
+                        account_id=resolved_account_id,
+                        text="This Feishu app-scope card already expired.",
+                    )
+                    return
+                sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+                sender_profile = await self._resolve_sender_profile(sender_id, account_id=resolved_account_id)
+                user_name = sender_profile.get("user_name") or open_id
+                self._discard_pending_tool_replays(list(_merge_replay_ids(state.replay_ids, state.replay_id)))
+                await self._update_interactive_card(
+                    message_id=state.message_id,
+                    title=state.title,
+                    body_markdown=(
+                        f"{state.reason}\n\n"
+                        f"**Declined by owner:** {user_name}\n"
+                        f"**Requester:** {state.requester_open_id or 'unknown'}\n"
+                        "**Status:** the app-scope authorization handoff was explicitly declined."
+                    ),
+                    template="red",
+                    account_id=resolved_account_id,
+                )
+                return
+
             approval_id = action_value.get("approval_id")
             state = self._approval_state.pop(approval_id, None)
             if not state:
@@ -1976,8 +4618,9 @@ class FeishuAdapter(BasePlatformAdapter):
             label = label_map.get(choice, "Resolved")
 
             # Resolve sender name for the status card
+            account_id = self._extract_event_account_id(data)
             sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
-            sender_profile = await self._resolve_sender_profile(sender_id)
+            sender_profile = await self._resolve_sender_profile(sender_id, account_id=account_id)
             user_name = sender_profile.get("user_name") or open_id
 
             # Resolve the approval — unblocks the agent thread
@@ -1992,7 +4635,13 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.error("Failed to resolve gateway approval from Feishu button: %s", exc)
 
             # Update the card to show the decision
-            await self._update_approval_card(state.get("message_id", ""), label, user_name, choice)
+            await self._update_approval_card(
+                state.get("message_id", ""),
+                label,
+                user_name,
+                choice,
+                account_id=self._extract_event_account_id(data) or str(state.get("account_id", "") or "").strip() or None,
+            )
             return
 
         synthetic_text = f"/card {action_tag}"
@@ -2002,9 +4651,10 @@ class FeishuAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        account_id = self._extract_event_account_id(data)
         sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
-        sender_profile = await self._resolve_sender_profile(sender_id)
-        chat_info = await self.get_chat_info(chat_id)
+        sender_profile = await self._resolve_sender_profile(sender_id, account_id=account_id)
+        chat_info = await self.get_chat_info(chat_id, account_id=account_id)
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -2013,6 +4663,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=None,
             user_id_alt=sender_profile["user_id_alt"],
+            account_id=account_id,
         )
         synthetic_event = MessageEvent(
             text=synthetic_text,
@@ -2051,12 +4702,13 @@ class FeishuAdapter(BasePlatformAdapter):
         async with chat_lock:
             message_id = event.message_id
             if message_id:
-                await self._add_ack_reaction(message_id)
+                await self._add_ack_reaction(message_id, account_id=getattr(event.source, "account_id", None))
             await self.handle_message(event)
 
-    async def _add_ack_reaction(self, message_id: str) -> Optional[str]:
+    async def _add_ack_reaction(self, message_id: str, *, account_id: Optional[str] = None) -> Optional[str]:
         """Add a persistent ACK emoji reaction to signal the message was received."""
-        if not self._client or not message_id:
+        client = self._resolve_client(account_id=account_id)
+        if not client or not message_id:
             return None
         try:
             from lark_oapi.api.im.v1 import (  # lazy import — keeps optional dep optional
@@ -2074,7 +4726,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 .request_body(body)
                 .build()
             )
-            response = await asyncio.to_thread(self._client.im.v1.message_reaction.create, request)
+            response = await asyncio.to_thread(client.im.v1.message_reaction.create, request)
             if response and getattr(response, "success", lambda: False)():
                 data = getattr(response, "data", None)
                 return getattr(data, "reaction_id", None)
@@ -2135,7 +4787,11 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_type: str,
         message_id: str,
     ) -> None:
-        text, inbound_type, media_urls, media_types = await self._extract_message_content(message)
+        account_id = self._extract_event_account_id(data)
+        text, inbound_type, media_urls, media_types = await self._extract_message_content(
+            message,
+            account_id=account_id,
+        )
         if inbound_type == MessageType.TEXT and not text and not media_urls:
             logger.debug("[Feishu] Ignoring unsupported or empty message type: %s", getattr(message, "message_type", ""))
             return
@@ -2148,7 +4804,11 @@ class FeishuAdapter(BasePlatformAdapter):
             or getattr(message, "upper_message_id", None)
             or None
         )
-        reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
+        reply_to_text = (
+            await self._fetch_message_text(reply_to_message_id, account_id=account_id)
+            if reply_to_message_id
+            else None
+        )
 
         logger.info(
             "[Feishu] Inbound %s message received: id=%s type=%s chat_id=%s text=%r media=%d",
@@ -2161,8 +4821,8 @@ class FeishuAdapter(BasePlatformAdapter):
         )
 
         chat_id = getattr(message, "chat_id", "") or ""
-        chat_info = await self.get_chat_info(chat_id)
-        sender_profile = await self._resolve_sender_profile(sender_id)
+        chat_info = await self.get_chat_info(chat_id, account_id=account_id)
+        sender_profile = await self._resolve_sender_profile(sender_id, account_id=account_id)
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -2171,6 +4831,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=getattr(message, "thread_id", None) or None,
             user_id_alt=sender_profile["user_id_alt"],
+            account_id=account_id,
         )
         normalized = MessageEvent(
             text=text,
@@ -2330,15 +4991,31 @@ class FeishuAdapter(BasePlatformAdapter):
             return [FeishuAdapter._namespace_from_mapping(item) for item in value]
         return value
 
+    @staticmethod
+    def _web_response(*, status: int, text: str) -> Any:
+        """构造 webhook 文本响应，并兼容测试中的轻量 mock。"""
+        response = web.Response(status=status, text=text)
+        if not isinstance(getattr(response, "status", None), int):
+            try:
+                response.status = status
+            except Exception:
+                pass
+        return response
+
+    @staticmethod
+    def _web_json_response(payload: Dict[str, Any], *, status: int = 200) -> Any:
+        """构造 webhook JSON 响应，并兼容测试中的轻量 mock。"""
+        response = web.json_response(payload, status=status)
+        if not isinstance(getattr(response, "status", None), int):
+            try:
+                response.status = status
+            except Exception:
+                pass
+        return response
+
     async def _handle_webhook_request(self, request: Any) -> Any:
         remote_ip = (getattr(request, "remote", None) or "unknown")
-
-        # Rate limiting — composite key: app_id:path:remote_ip (matches openclaw key structure).
-        rate_key = f"{self._app_id}:{self._webhook_path}:{remote_ip}"
-        if not self._check_webhook_rate_limit(rate_key):
-            logger.warning("[Feishu] Webhook rate limit exceeded for %s", remote_ip)
-            self._record_webhook_anomaly(remote_ip, "429")
-            return web.Response(status=429, text="Too Many Requests")
+        request_path = str(getattr(request, "path", "") or self._webhook_path)
 
         # Content-Type guard — Feishu always sends application/json.
         headers = getattr(request, "headers", {}) or {}
@@ -2346,14 +5023,14 @@ class FeishuAdapter(BasePlatformAdapter):
         if content_type and content_type != "application/json":
             logger.warning("[Feishu] Webhook rejected: unexpected Content-Type %r from %s", content_type, remote_ip)
             self._record_webhook_anomaly(remote_ip, "415")
-            return web.Response(status=415, text="Unsupported Media Type")
+            return self._web_response(status=415, text="Unsupported Media Type")
 
         # Body size guard — reject early via Content-Length when present.
         content_length = getattr(request, "content_length", None)
         if content_length is not None and content_length > _FEISHU_WEBHOOK_MAX_BODY_BYTES:
             logger.warning("[Feishu] Webhook body too large (%d bytes) from %s", content_length, remote_ip)
             self._record_webhook_anomaly(remote_ip, "413")
-            return web.Response(status=413, text="Request body too large")
+            return self._web_response(status=413, text="Request body too large")
 
         try:
             body_bytes: bytes = await asyncio.wait_for(
@@ -2363,51 +5040,84 @@ class FeishuAdapter(BasePlatformAdapter):
         except asyncio.TimeoutError:
             logger.warning("[Feishu] Webhook body read timed out after %ds from %s", _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS, remote_ip)
             self._record_webhook_anomaly(remote_ip, "408")
-            return web.Response(status=408, text="Request Timeout")
+            return self._web_response(status=408, text="Request Timeout")
         except Exception:
             self._record_webhook_anomaly(remote_ip, "400")
-            return web.json_response({"code": 400, "msg": "failed to read body"}, status=400)
+            return self._web_json_response({"code": 400, "msg": "failed to read body"}, status=400)
 
         if len(body_bytes) > _FEISHU_WEBHOOK_MAX_BODY_BYTES:
             logger.warning("[Feishu] Webhook body exceeds limit (%d bytes) from %s", len(body_bytes), remote_ip)
             self._record_webhook_anomaly(remote_ip, "413")
-            return web.Response(status=413, text="Request body too large")
+            return self._web_response(status=413, text="Request body too large")
 
         try:
             payload = json.loads(body_bytes.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._record_webhook_anomaly(remote_ip, "400")
-            return web.json_response({"code": 400, "msg": "invalid json"}, status=400)
+            return self._web_json_response({"code": 400, "msg": "invalid json"}, status=400)
 
         # URL verification challenge — respond before other checks so that Feishu's
         # subscription setup works even before encrypt_key is wired.
         if payload.get("type") == "url_verification":
-            return web.json_response({"challenge": payload.get("challenge", "")})
+            return self._web_json_response({"challenge": payload.get("challenge", "")})
+
+        header = payload.get("header") or {}
+        incoming_app_id = str(header.get("app_id") or payload.get("app_id") or "").strip()
+        account = self._resolve_account_for_request(payload, request)
+        resolved_app_id = account.app_id if account else self._app_id
+
+        # Rate limiting — composite key: app_id:path:remote_ip (matches openclaw key structure).
+        rate_key = f"{resolved_app_id}:{request_path}:{remote_ip}"
+        if not self._check_webhook_rate_limit(rate_key):
+            logger.warning("[Feishu] Webhook rate limit exceeded for %s", remote_ip)
+            self._record_webhook_anomaly(remote_ip, "429")
+            return self._web_response(status=429, text="Too Many Requests")
+
+        # 应用归属校验：优先按 event app_id 找账号，再校验 path 与账号归属是否一致，
+        # 避免多应用共用一台 Hermes 时把事件投递到错误账号路由。
+        if incoming_app_id and not account:
+            logger.warning(
+                "[Feishu] Webhook rejected: event app_id %s is not configured on this adapter from %s",
+                incoming_app_id,
+                remote_ip,
+            )
+            self._record_webhook_anomaly(remote_ip, "403-app")
+            return self._web_response(status=403, text="Event app_id is not configured")
+        if incoming_app_id and incoming_app_id != resolved_app_id:
+            logger.warning(
+                "[Feishu] Webhook rejected: event app_id %s does not match resolved account app_id %s from %s",
+                incoming_app_id,
+                resolved_app_id,
+                remote_ip,
+            )
+            self._record_webhook_anomaly(remote_ip, "403-app")
+            return self._web_response(status=403, text="Event app_id does not match configured app")
 
         # Verification token check — second layer of defence beyond signature (matches openclaw).
-        if self._verification_token:
-            header = payload.get("header") or {}
+        verification_token = account.verification_token if account else self._verification_token
+        if verification_token:
             incoming_token = str(header.get("token") or payload.get("token") or "")
-            if not incoming_token or not hmac.compare_digest(incoming_token, self._verification_token):
+            if not incoming_token or not hmac.compare_digest(incoming_token, verification_token):
                 logger.warning("[Feishu] Webhook rejected: invalid verification token from %s", remote_ip)
                 self._record_webhook_anomaly(remote_ip, "401-token")
-                return web.Response(status=401, text="Invalid verification token")
+                return self._web_response(status=401, text="Invalid verification token")
 
         # Timing-safe signature verification (only enforced when encrypt_key is set).
-        if self._encrypt_key and not self._is_webhook_signature_valid(request.headers, body_bytes):
+        encrypt_key = account.encrypt_key if account else self._encrypt_key
+        if encrypt_key and not self._is_webhook_signature_valid(request.headers, body_bytes, encrypt_key=encrypt_key):
             logger.warning("[Feishu] Webhook rejected: invalid signature from %s", remote_ip)
             self._record_webhook_anomaly(remote_ip, "401-sig")
-            return web.Response(status=401, text="Invalid signature")
+            return self._web_response(status=401, text="Invalid signature")
 
         if payload.get("encrypt"):
             logger.error("[Feishu] Encrypted webhook payloads are not supported by Hermes webhook mode")
             self._record_webhook_anomaly(remote_ip, "400-encrypted")
-            return web.json_response({"code": 400, "msg": "encrypted webhook payloads are not supported"}, status=400)
+            return self._web_json_response({"code": 400, "msg": "encrypted webhook payloads are not supported"}, status=400)
 
         self._clear_webhook_anomaly(remote_ip)
 
         event_type = str((payload.get("header") or {}).get("event_type") or "")
-        data = self._namespace_from_mapping(payload)
+        data = self._inject_event_account(self._namespace_from_mapping(payload), account)
         if event_type == "im.message.receive_v1":
             self._on_message_event(data)
         elif event_type == "im.message.message_read_v1":
@@ -2420,11 +5130,13 @@ class FeishuAdapter(BasePlatformAdapter):
             self._on_reaction_event(event_type, data)
         elif event_type == "card.action.trigger":
             self._on_card_action_trigger(data)
+        elif event_type == "drive.notice.comment_add_v1":
+            await self._handle_comment_event(data)
         else:
             logger.debug("[Feishu] Ignoring webhook event type: %s", event_type or "unknown")
-        return web.json_response({"code": 0, "msg": "ok"})
+        return self._web_json_response({"code": 0, "msg": "ok"})
 
-    def _is_webhook_signature_valid(self, headers: Any, body_bytes: bytes) -> bool:
+    def _is_webhook_signature_valid(self, headers: Any, body_bytes: bytes, *, encrypt_key: Optional[str] = None) -> bool:
         """Verify Feishu webhook signature using timing-safe comparison.
 
         Feishu signature algorithm:
@@ -2438,7 +5150,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return False
         try:
             body_str = body_bytes.decode("utf-8", errors="replace")
-            content = f"{timestamp}{nonce}{self._encrypt_key}{body_str}"
+            content = f"{timestamp}{nonce}{encrypt_key or self._encrypt_key}{body_str}"
             computed = hashlib.sha256(content.encode("utf-8")).hexdigest()
             return hmac.compare_digest(computed, signature)
         except Exception:
@@ -2598,7 +5310,9 @@ class FeishuAdapter(BasePlatformAdapter):
     # Message content extraction and resource download
     # =========================================================================
 
-    async def _extract_message_content(self, message: Any) -> tuple[str, MessageType, List[str], List[str]]:
+    async def _extract_message_content(
+        self, message: Any, *, account_id: Optional[str] = None
+    ) -> tuple[str, MessageType, List[str], List[str]]:
         """Extract text and cached media from a normalized Feishu message."""
         raw_content = getattr(message, "content", "") or ""
         raw_type = getattr(message, "message_type", "") or ""
@@ -2609,6 +5323,7 @@ class FeishuAdapter(BasePlatformAdapter):
         media_urls, media_types = await self._download_feishu_message_resources(
             message_id=message_id,
             normalized=normalized,
+            account_id=account_id,
         )
         inbound_type = self._resolve_normalized_message_type(normalized, media_types)
         text = normalized.text_content
@@ -2629,6 +5344,7 @@ class FeishuAdapter(BasePlatformAdapter):
         *,
         message_id: str,
         normalized: FeishuNormalizedMessage,
+        account_id: Optional[str] = None,
     ) -> tuple[List[str], List[str]]:
         media_urls: List[str] = []
         media_types: List[str] = []
@@ -2637,6 +5353,7 @@ class FeishuAdapter(BasePlatformAdapter):
             cached_path, media_type = await self._download_feishu_image(
                 message_id=message_id,
                 image_key=image_key,
+                account_id=account_id,
             )
             if cached_path:
                 media_urls.append(cached_path)
@@ -2648,6 +5365,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 file_key=media_ref.file_key,
                 resource_type=media_ref.resource_type,
                 fallback_filename=media_ref.file_name,
+                account_id=account_id,
             )
             if cached_path:
                 media_urls.append(cached_path)
@@ -2696,8 +5414,11 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Failed to inject text document content from %s", cached_path, exc_info=True)
             return ""
 
-    async def _download_feishu_image(self, *, message_id: str, image_key: str) -> tuple[str, str]:
-        if not self._client or not message_id:
+    async def _download_feishu_image(
+        self, *, message_id: str, image_key: str, account_id: Optional[str] = None
+    ) -> tuple[str, str]:
+        client = self._resolve_client(account_id=account_id)
+        if not client or not message_id:
             return "", ""
         try:
             request = self._build_message_resource_request(
@@ -2705,7 +5426,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 file_key=image_key,
                 resource_type="image",
             )
-            response = await asyncio.to_thread(self._client.im.v1.message_resource.get, request)
+            response = await asyncio.to_thread(client.im.v1.message_resource.get, request)
             if not response or not response.success():
                 logger.warning(
                     "[Feishu] Failed to download image %s: %s %s",
@@ -2734,8 +5455,10 @@ class FeishuAdapter(BasePlatformAdapter):
         file_key: str,
         resource_type: str,
         fallback_filename: str,
+        account_id: Optional[str] = None,
     ) -> tuple[str, str]:
-        if not self._client or not message_id:
+        client = self._resolve_client(account_id=account_id)
+        if not client or not message_id:
             return "", ""
 
         request_types = [resource_type]
@@ -2749,7 +5472,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     file_key=file_key,
                     resource_type=request_type,
                 )
-                response = await asyncio.to_thread(self._client.im.v1.message_resource.get, request)
+                response = await asyncio.to_thread(client.im.v1.message_resource.get, request)
                 if not response or not response.success():
                     logger.debug(
                         "[Feishu] Resource download failed for %s/%s via type=%s: %s %s",
@@ -2885,25 +5608,26 @@ class FeishuAdapter(BasePlatformAdapter):
             return "dm"
         return "group"
 
-    async def _resolve_sender_profile(self, sender_id: Any) -> Dict[str, Optional[str]]:
+    async def _resolve_sender_profile(self, sender_id: Any, *, account_id: Optional[str] = None) -> Dict[str, Optional[str]]:
         open_id = getattr(sender_id, "open_id", None) or None
         user_id = getattr(sender_id, "user_id", None) or None
         union_id = getattr(sender_id, "union_id", None) or None
         primary_id = open_id or user_id
-        display_name = await self._resolve_sender_name_from_api(primary_id or union_id)
+        display_name = await self._resolve_sender_name_from_api(primary_id or union_id, account_id=account_id)
         return {
             "user_id": primary_id,
             "user_name": display_name,
             "user_id_alt": union_id,
         }
 
-    async def _resolve_sender_name_from_api(self, sender_id: Optional[str]) -> Optional[str]:
+    async def _resolve_sender_name_from_api(self, sender_id: Optional[str], *, account_id: Optional[str] = None) -> Optional[str]:
         """Fetch the sender's display name from the Feishu contact API with a 10-minute cache.
 
         ID-type detection mirrors openclaw: ou_ → open_id, on_ → union_id, else user_id.
         Failures are silently suppressed; the message pipeline must not block on name resolution.
         """
-        if not sender_id or not self._client:
+        client = self._resolve_client(account_id=account_id)
+        if not sender_id or not client:
             return None
         trimmed = sender_id.strip()
         if not trimmed:
@@ -2923,7 +5647,7 @@ class FeishuAdapter(BasePlatformAdapter):
             else:
                 id_type = "user_id"
             request = GetUserRequest.builder().user_id(trimmed).user_id_type(id_type).build()
-            response = await asyncio.to_thread(self._client.contact.v3.user.get, request)
+            response = await asyncio.to_thread(client.contact.v3.user.get, request)
             if not response or not response.success():
                 return None
             user = getattr(getattr(response, "data", None), "user", None)
@@ -2942,14 +5666,16 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Failed to resolve sender name for %s", sender_id, exc_info=True)
         return None
 
-    async def _fetch_message_text(self, message_id: str) -> Optional[str]:
-        if not self._client or not message_id:
+    async def _fetch_message_text(self, message_id: str, *, account_id: Optional[str] = None) -> Optional[str]:
+        client = self._resolve_client(account_id=account_id)
+        if not client or not message_id:
             return None
-        if message_id in self._message_text_cache:
-            return self._message_text_cache[message_id]
+        cache_key = f"{account_id or 'default'}:{message_id}"
+        if cache_key in self._message_text_cache:
+            return self._message_text_cache[cache_key]
         try:
             request = self._build_get_message_request(message_id)
-            response = await asyncio.to_thread(self._client.im.v1.message.get, request)
+            response = await asyncio.to_thread(client.im.v1.message.get, request)
             if not response or getattr(response, "success", lambda: False)() is False:
                 code = getattr(response, "code", "unknown")
                 msg = getattr(response, "msg", "message lookup failed")
@@ -2961,7 +5687,7 @@ class FeishuAdapter(BasePlatformAdapter):
             msg_type = getattr(parent, "msg_type", "") or ""
             raw_content = getattr(body, "content", "") or ""
             text = self._extract_text_from_raw_content(msg_type=msg_type, raw_content=raw_content)
-            self._message_text_cache[message_id] = text
+            self._message_text_cache[cache_key] = text
             return text
         except Exception:
             logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
@@ -2992,23 +5718,49 @@ class FeishuAdapter(BasePlatformAdapter):
     # Group policy and mention gating
     # =========================================================================
 
-    def _allow_group_message(self, sender_id: Any, chat_id: str = "") -> bool:
-        """Per-group policy gate for non-DM traffic."""
+    @staticmethod
+    def _sender_ids(sender_id: Any) -> set[str]:
+        """统一抽取 sender 的 open_id / user_id，便于策略判断。"""
         sender_open_id = getattr(sender_id, "open_id", None)
         sender_user_id = getattr(sender_id, "user_id", None)
-        sender_ids = {sender_open_id, sender_user_id} - {None}
+        return {str(item).strip() for item in (sender_open_id, sender_user_id) if str(item or "").strip()}
+
+    def _allow_dm_message(self, sender_id: Any) -> bool:
+        """私聊策略入口。
+
+        open/pairing:
+            先允许进入网关，是否需要进一步配对由 gateway 层统一处理。
+        allowlist:
+            仅允许 allow_from 中声明的用户进入。
+        disabled:
+            完全拒绝私聊消息。
+        """
+        sender_ids = self._sender_ids(sender_id)
+        if sender_ids and self._admins and (sender_ids & self._admins):
+            return True
+        if self._dm_policy == "disabled":
+            return False
+        if self._dm_policy == "allowlist":
+            return bool(sender_ids and (sender_ids & self._allow_from))
+        return True
+
+    def _allow_group_message(self, sender_id: Any, chat_id: str = "") -> bool:
+        """Per-group policy gate for non-DM traffic."""
+        sender_ids = self._sender_ids(sender_id)
 
         if sender_ids and self._admins and (sender_ids & self._admins):
             return True
 
-        rule = self._group_rules.get(chat_id) if chat_id else None
+        rule = self._resolve_group_rule(chat_id)
         if rule:
+            if rule.enabled is False:
+                return False
             policy = rule.policy
             allowlist = rule.allowlist
             blacklist = rule.blacklist
         else:
             policy = self._default_group_policy or self._group_policy
-            allowlist = self._allowed_group_users
+            allowlist = self._group_allow_from or self._allowed_group_users
             blacklist = set()
 
         if policy == "disabled":
@@ -3024,14 +5776,31 @@ class FeishuAdapter(BasePlatformAdapter):
 
         return bool(sender_ids and (sender_ids & self._allowed_group_users))
 
+    def _resolve_group_rule(self, chat_id: str = "") -> Optional[FeishuGroupRule]:
+        """解析群配置时优先取精确 chat_id，其次退回默认的 `*` 规则。"""
+        if chat_id:
+            exact_rule = self._group_rules.get(chat_id)
+            if exact_rule is not None:
+                return exact_rule
+        return self._group_rules.get("*")
+
     def _should_accept_group_message(self, message: Any, sender_id: Any, chat_id: str = "") -> bool:
         """Require an explicit @mention before group messages enter the agent."""
         if not self._allow_group_message(sender_id, chat_id):
             return False
-        # @_all is Feishu's @everyone placeholder — always route to the bot.
+        rule = self._resolve_group_rule(chat_id)
+        require_mention = self._require_mention if rule is None or rule.require_mention is None else rule.require_mention
+        respond_to_mention_all = (
+            self._respond_to_mention_all
+            if rule is None or rule.respond_to_mention_all is None
+            else rule.respond_to_mention_all
+        )
+        if not require_mention:
+            return True
+        # @_all 是飞书的全员提醒占位符，是否放行由 respond_to_mention_all 控制。
         raw_content = getattr(message, "content", "") or ""
         if "@_all" in raw_content:
-            return True
+            return bool(respond_to_mention_all)
         mentions = getattr(message, "mentions", None) or []
         if mentions:
             return self._message_mentions_bot(mentions)
@@ -3051,11 +5820,17 @@ class FeishuAdapter(BasePlatformAdapter):
             mention_user_id = getattr(mention_id, "user_id", None)
             mention_name = (getattr(mention, "name", None) or "").strip()
 
-            if self._bot_open_id and mention_open_id == self._bot_open_id:
+            if (self._bot_open_id and mention_open_id == self._bot_open_id) or (
+                mention_open_id and mention_open_id in getattr(self, "_bot_open_ids", set())
+            ):
                 return True
-            if self._bot_user_id and mention_user_id == self._bot_user_id:
+            if (self._bot_user_id and mention_user_id == self._bot_user_id) or (
+                mention_user_id and mention_user_id in getattr(self, "_bot_user_ids", set())
+            ):
                 return True
-            if self._bot_name and mention_name == self._bot_name:
+            if (self._bot_name and mention_name == self._bot_name) or (
+                mention_name and mention_name in getattr(self, "_bot_names", set())
+            ):
                 return True
 
         return False
@@ -3067,17 +5842,24 @@ class FeishuAdapter(BasePlatformAdapter):
             return True
         if self._bot_user_id and self._bot_user_id in mentioned_ids:
             return True
+        if any(bot_open_id in mentioned_ids for bot_open_id in getattr(self, "_bot_open_ids", set())):
+            return True
+        if any(bot_user_id in mentioned_ids for bot_user_id in getattr(self, "_bot_user_ids", set())):
+            return True
         return False
 
-    async def _hydrate_bot_identity(self) -> None:
+    async def _hydrate_bot_identity(self, *, account_id: Optional[str] = None) -> None:
         """Best-effort discovery of bot identity for precise group mention gating."""
-        if not self._client:
+        client = self._resolve_client(account_id=account_id)
+        if not client:
             return
-        if any((self._bot_open_id, self._bot_user_id, self._bot_name)):
+        if account_id is None and any((self._bot_open_id, self._bot_user_id, self._bot_name)):
             return
         try:
-            request = self._build_get_application_request(app_id=self._app_id, lang="en_us")
-            response = await asyncio.to_thread(self._client.application.v6.application.get, request)
+            target_account = self._accounts.get(account_id or "default")
+            target_app_id = target_account.app_id if target_account else self._app_id
+            request = self._build_get_application_request(app_id=target_app_id, lang="en_us")
+            response = await asyncio.to_thread(client.application.v6.application.get, request)
             if not response or not response.success():
                 code = getattr(response, "code", None)
                 if code == 99991672:
@@ -3090,7 +5872,15 @@ class FeishuAdapter(BasePlatformAdapter):
             app = getattr(getattr(response, "data", None), "app", None)
             app_name = (getattr(app, "app_name", None) or "").strip()
             if app_name:
-                self._bot_name = app_name
+                if account_id and target_account:
+                    updated_account = FeishuAccountSettings(
+                        **{**target_account.__dict__, "bot_name": app_name}
+                    )
+                    self._accounts[account_id] = updated_account
+                    self._account_by_app_id[updated_account.app_id] = updated_account
+                    self._bot_names.add(app_name)
+                else:
+                    self._bot_name = app_name
         except Exception:
             logger.debug("[Feishu] Failed to hydrate bot identity", exc_info=True)
 
@@ -3137,6 +5927,192 @@ class FeishuAdapter(BasePlatformAdapter):
         except OSError:
             logger.warning("[Feishu] Failed to persist dedup state to %s", self._dedup_state_path, exc_info=True)
 
+    def _load_authorization_grants(self) -> None:
+        """从磁盘恢复当前飞书应用的本地授权状态。"""
+        try:
+            payload = json.loads(self._oauth_state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError):
+            logger.warning("[Feishu] Failed to load OAuth grant state from %s", self._oauth_state_path, exc_info=True)
+            return
+        if not isinstance(payload, dict):
+            return
+        grants_by_app: Dict[str, Dict[str, FeishuAuthorizationGrant]] = {}
+        for app_id, app_payload in payload.items():
+            app_id = str(app_id or "").strip()
+            if not app_id or not isinstance(app_payload, dict):
+                continue
+            app_grants: Dict[str, FeishuAuthorizationGrant] = {}
+            for open_id, item in app_payload.items():
+                if not isinstance(item, dict):
+                    continue
+                scopes = [str(scope).strip() for scope in item.get("scopes", []) if str(scope).strip()]
+                open_id = str(open_id or "").strip()
+                if not open_id or not scopes:
+                    continue
+                app_grants[open_id] = FeishuAuthorizationGrant(
+                    user_open_id=open_id,
+                    scopes=scopes,
+                    updated_at=float(item.get("updated_at") or 0.0),
+                    updated_by=str(item.get("updated_by", "") or ""),
+                    source=str(item.get("source", "manual_confirm") or "manual_confirm"),
+                )
+            if app_grants:
+                grants_by_app[app_id] = app_grants
+        self._authorization_grants = grants_by_app
+
+    def _persist_authorization_grants(self) -> None:
+        """把当前飞书应用的本地授权状态写回磁盘。"""
+        try:
+            self._oauth_state_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                payload = json.loads(self._oauth_state_path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    payload = {}
+            except FileNotFoundError:
+                payload = {}
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            for app_id, app_grants in sorted(self._authorization_grants.items()):
+                payload[app_id] = {
+                    open_id: {
+                        "scopes": grant.scopes,
+                        "updated_at": grant.updated_at,
+                        "updated_by": grant.updated_by,
+                        "source": grant.source,
+                    }
+                    for open_id, grant in sorted(app_grants.items())
+                }
+            self._oauth_state_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            logger.warning("[Feishu] Failed to persist OAuth grant state to %s", self._oauth_state_path, exc_info=True)
+
+    def _resolve_authorization_account_id(self, account_id: Optional[str] = None) -> str:
+        """解析授权状态所属账号，缺省时回退到当前会话或默认账号。"""
+        if account_id:
+            return str(account_id).strip() or "default"
+        try:
+            from gateway.session_context import get_session_env
+
+            session_account_id = str(get_session_env("HERMES_SESSION_ACCOUNT_ID", "") or "").strip()
+            if session_account_id:
+                return session_account_id
+        except Exception:
+            logger.debug("[Feishu] Failed to read session account id for authorization lookup", exc_info=True)
+        return "default"
+
+    def _resolve_authorization_app_id(self, account_id: Optional[str] = None) -> str:
+        """根据账号标识解析授权状态所属的飞书应用。"""
+        resolved_account_id = self._resolve_authorization_account_id(account_id)
+        account = self._accounts.get(resolved_account_id)
+        app_id = str(getattr(account, "app_id", "") or "").strip()
+        if app_id:
+            return app_id
+        return self._app_id
+
+    @staticmethod
+    def _normalize_scope_list(items: List[str]) -> List[str]:
+        """规范化 scope 列表，保持顺序并去重。"""
+        result: List[str] = []
+        seen = set()
+        for item in items:
+            scope = str(item or "").strip()
+            if not scope or scope in seen:
+                continue
+            seen.add(scope)
+            result.append(scope)
+        return result
+
+    def get_authorization_status(
+        self,
+        user_open_id: str,
+        requested_scopes: Optional[List[str]] = None,
+        account_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """查询指定用户在当前飞书应用上的授权状态。"""
+        open_id = str(user_open_id or "").strip()
+        app_id = self._resolve_authorization_app_id(account_id)
+        grant = self._authorization_grants.get(app_id, {}).get(open_id)
+        granted_scopes = list(grant.scopes) if grant else []
+        requested = self._normalize_scope_list(requested_scopes or [])
+        granted_set = set(granted_scopes)
+        missing_scopes = [scope for scope in requested if scope not in granted_set]
+        return {
+            "authorized": bool(granted_scopes) and not missing_scopes if requested else bool(granted_scopes),
+            "granted_scopes": granted_scopes,
+            "requested_scopes": requested,
+            "missing_scopes": missing_scopes,
+            "updated_at": grant.updated_at if grant else None,
+            "updated_by": grant.updated_by if grant else "",
+            "source": grant.source if grant else "",
+            "account_id": self._resolve_authorization_account_id(account_id),
+            "app_id": app_id,
+        }
+
+    def record_authorization_grant(
+        self,
+        *,
+        user_open_id: str,
+        scopes: List[str],
+        updated_by: str = "",
+        source: str = "manual_confirm",
+        account_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """记录用户已确认获得的授权范围。"""
+        open_id = str(user_open_id or "").strip()
+        if not open_id:
+            raise ValueError("user_open_id is required")
+        app_id = self._resolve_authorization_app_id(account_id)
+        app_grants = self._authorization_grants.setdefault(app_id, {})
+        existing = app_grants.get(open_id)
+        merged_scopes = self._normalize_scope_list([*(existing.scopes if existing else []), *scopes])
+        app_grants[open_id] = FeishuAuthorizationGrant(
+            user_open_id=open_id,
+            scopes=merged_scopes,
+            updated_at=time.time(),
+            updated_by=str(updated_by or "").strip(),
+            source=source,
+        )
+        self._persist_authorization_grants()
+        return self.get_authorization_status(open_id, account_id=account_id)
+
+    def revoke_authorization(
+        self,
+        user_open_id: str,
+        scopes: Optional[List[str]] = None,
+        account_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """撤销用户的全部或部分本地授权状态。"""
+        open_id = str(user_open_id or "").strip()
+        if not open_id:
+            raise ValueError("user_open_id is required")
+        app_id = self._resolve_authorization_app_id(account_id)
+        app_grants = self._authorization_grants.get(app_id, {})
+        grant = app_grants.get(open_id)
+        if not grant:
+            return self.get_authorization_status(open_id, account_id=account_id)
+        revoke_scopes = self._normalize_scope_list(scopes or [])
+        if revoke_scopes:
+            revoke_set = set(revoke_scopes)
+            remaining_scopes = [scope for scope in grant.scopes if scope not in revoke_set]
+        else:
+            remaining_scopes = []
+        if remaining_scopes:
+            app_grants[open_id] = FeishuAuthorizationGrant(
+                user_open_id=open_id,
+                scopes=remaining_scopes,
+                updated_at=time.time(),
+                updated_by=grant.updated_by,
+                source="revoke",
+            )
+        else:
+            app_grants.pop(open_id, None)
+            if not app_grants:
+                self._authorization_grants.pop(app_id, None)
+        self._persist_authorization_grants()
+        return self.get_authorization_status(open_id, account_id=account_id)
+
     def _is_duplicate(self, message_id: str) -> bool:
         now = time.time()
         ttl = _FEISHU_DEDUP_TTL_SECONDS
@@ -3157,11 +6133,127 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound payload construction and send pipeline
     # =========================================================================
 
-    def _build_outbound_payload(self, content: str) -> tuple[str, str]:
+    def _resolve_reply_mode(self, content: str) -> str:
+        """根据当前适配器配置决定出站消息形态。
+
+        text:
+            始终发送纯文本，避免富文本渲染差异。
+        card:
+            始终发送 post 结构，保证飞书内展示为富文本卡片样式。
+        auto:
+            仅在检测到 Markdown 语义时使用 post，其余走 text。
+        """
+        mode = str(self._reply_mode or "auto").strip().lower()
+        if mode == "text":
+            return "text"
+        if mode == "card":
+            return "post"
         if _MARKDOWN_HINT_RE.search(content):
+            return "post"
+        return "text"
+
+    def _build_outbound_payload(self, content: str) -> tuple[str, str]:
+        resolved_mode = self._resolve_reply_mode(content)
+        if resolved_mode == "post":
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
+
+    def get_stream_consumer_config(
+        self,
+        *,
+        default_edit_interval: float,
+        default_buffer_threshold: int,
+        default_cursor: str,
+    ) -> Dict[str, Any]:
+        """返回飞书平台定制的流式消费者配置。
+
+        这里先把已存在但未生效的飞书配置真正接入网关主链路：
+        - streaming=false 时关闭流式消费者
+        - block_streaming=true 时用飞书自己的 coalesce 时间覆盖默认编辑节流
+        - 其余参数沿用网关全局配置，避免改变非飞书平台行为
+        """
+        enabled = bool(self._streaming_cards_enabled)
+        edit_interval = float(default_edit_interval)
+        if self._block_streaming_enabled:
+            edit_interval = max(0.05, self._block_streaming_coalesce_ms / 1000.0)
+        return {
+            "enabled": enabled,
+            "edit_interval": edit_interval,
+            "buffer_threshold": int(default_buffer_threshold),
+            "cursor": default_cursor,
+        }
+
+    def format_tool_progress_content(self, progress_lines: List[str]) -> str:
+        """将工具进度渲染为飞书更易读的富文本轨迹。"""
+        cleaned_lines = [str(line).strip() for line in progress_lines if str(line).strip()]
+        if not cleaned_lines:
+            return ""
+        total_steps = len(cleaned_lines)
+        grouped_lines: Dict[str, List[str]] = {
+            "running": [],
+            "completed": [],
+            "failed": [],
+        }
+        visible_grouped_lines: Dict[str, List[str]] = {
+            "running": [],
+            "completed": [],
+            "failed": [],
+        }
+        visible_lines = cleaned_lines[-12:]
+        for line in cleaned_lines:
+            status, normalized_line = _classify_tool_progress_line(line)
+            grouped_lines.setdefault(status, []).append(normalized_line)
+        for line in visible_lines:
+            status, normalized_line = _classify_tool_progress_line(line)
+            visible_grouped_lines.setdefault(status, []).append(normalized_line)
+
+        overall_status = "recent activity"
+        if grouped_lines["running"]:
+            overall_status = "active"
+        elif grouped_lines["failed"]:
+            overall_status = "needs attention"
+        elif grouped_lines["completed"]:
+            overall_status = "completed"
+
+        rendered_lines = ["**Tool Activity**", ""]
+        rendered_lines.append(f"_Status: {overall_status}._")
+        rendered_lines.append(
+            (
+                f"_Summary: {total_steps} steps, "
+                f"{len(grouped_lines['running'])} running, "
+                f"{len(grouped_lines['completed'])} completed, "
+                f"{len(grouped_lines['failed'])} need attention._"
+            )
+        )
+        active_tool_summary = _summarize_tool_progress_names(visible_grouped_lines["running"])
+        if active_tool_summary:
+            rendered_lines.append(f"_Active tools: {active_tool_summary}._")
+        attention_tool_summary = _summarize_tool_progress_names(visible_grouped_lines["failed"])
+        if attention_tool_summary:
+            rendered_lines.append(f"_Needs attention: {attention_tool_summary}._")
+        if total_steps > len(visible_lines):
+            rendered_lines.append(f"_Showing the most recent {len(visible_lines)} steps._")
+        rendered_lines.append("")
+        if visible_grouped_lines["running"]:
+            rendered_lines.append("**Running**")
+            rendered_lines.extend(f"- {line}" for line in visible_grouped_lines["running"])
+            rendered_lines.append("")
+        if visible_grouped_lines["completed"]:
+            rendered_lines.append("**Completed**")
+            rendered_lines.extend(f"- {line}" for line in visible_grouped_lines["completed"])
+            rendered_lines.append("")
+        if visible_grouped_lines["failed"]:
+            rendered_lines.append("**Needs Attention**")
+            rendered_lines.extend(f"- {line}" for line in visible_grouped_lines["failed"])
+            rendered_lines.append("")
+        if grouped_lines["running"]:
+            rendered_lines.append("_Running tools for this request..._")
+        elif grouped_lines["failed"]:
+            rendered_lines.append("_Some tool steps need attention before the request is fully complete._")
+        else:
+            rendered_lines.append("_Recent tool activity for this request._")
+        return "\n".join(rendered_lines)
 
     async def _send_uploaded_file_message(
         self,
@@ -3174,7 +6266,8 @@ class FeishuAdapter(BasePlatformAdapter):
         file_name: Optional[str] = None,
         outbound_message_type: str = "file",
     ) -> SendResult:
-        if not self._client:
+        client = self._resolve_client(metadata=metadata)
+        if not client:
             return SendResult(success=False, error="Not connected")
         if not os.path.exists(file_path):
             return SendResult(success=False, error=f"File not found: {file_path}")
@@ -3192,7 +6285,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     file=file_obj,
                 )
                 request = self._build_file_upload_request(body)
-                upload_response = await asyncio.to_thread(self._client.im.v1.file.create, request)
+                upload_response = await asyncio.to_thread(client.im.v1.file.create, request)
             file_key = self._extract_response_field(upload_response, "file_key")
             if not file_key:
                 return self._response_error_result(
@@ -3236,6 +6329,26 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
+        client = self._resolve_client(metadata=metadata)
+        if not client:
+            raise RuntimeError("Not connected")
+        comment_target = self._parse_comment_target(chat_id)
+        if comment_target is not None:
+            normalized_comment_content = normalize_feishu_message(
+                message_type=msg_type,
+                raw_content=payload,
+            )
+            text_payload = _strip_markdown_to_plain_text(normalized_comment_content.text_content)
+            if not text_payload:
+                text_payload = str(
+                    (normalized_comment_content.metadata or {}).get("placeholder_text")
+                    or payload
+                )
+            return await self._send_comment_message(
+                comment_target=comment_target,
+                content=str(text_payload or ""),
+                metadata=metadata,
+            )
         reply_in_thread = bool((metadata or {}).get("thread_id"))
         if reply_to:
             body = self._build_reply_message_body(
@@ -3245,7 +6358,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 uuid_value=str(uuid.uuid4()),
             )
             request = self._build_reply_message_request(reply_to, body)
-            return await asyncio.to_thread(self._client.im.v1.message.reply, request)
+            return await asyncio.to_thread(client.im.v1.message.reply, request)
 
         body = self._build_create_message_body(
             receive_id=chat_id,
@@ -3254,7 +6367,65 @@ class FeishuAdapter(BasePlatformAdapter):
             uuid_value=str(uuid.uuid4()),
         )
         request = self._build_create_message_request("chat_id", body)
-        return await asyncio.to_thread(self._client.im.v1.message.create, request)
+        return await asyncio.to_thread(client.im.v1.message.create, request)
+
+    @staticmethod
+    def _parse_comment_target(chat_id: str) -> Optional[Dict[str, str]]:
+        match = _FEISHU_COMMENT_TARGET_RE.match(str(chat_id or "").strip())
+        if not match:
+            return None
+        return {
+            "file_type": match.group(1),
+            "file_token": match.group(2),
+            "comment_id": match.group(3),
+        }
+
+    async def _send_comment_message(
+        self,
+        *,
+        comment_target: Dict[str, str],
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """把最终回复发回飞书评论线程。
+
+        先尝试回复评论线程；如果接口拒绝，再退回创建新的文档评论，保证用户能收到结果。
+        """
+        normalized = str(content or "").strip()
+        if not normalized:
+            return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id=""))
+        if normalized.endswith("NO_REPLY"):
+            return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id=""))
+
+        from tools.feishu.client import feishu_api_request
+
+        file_token = comment_target["file_token"]
+        file_type = comment_target["file_type"]
+        comment_id = comment_target["comment_id"]
+        account_id = str((metadata or {}).get("account_id") or "").strip() or None
+        plain_text = _strip_markdown_to_plain_text(normalized.replace("NO_REPLY", "").strip())
+        if not plain_text:
+            return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id=""))
+        elements = [{"type": "text_run", "text_run": {"text": plain_text}}]
+        try:
+            await asyncio.to_thread(
+                feishu_api_request,
+                "POST",
+                f"/open-apis/drive/v1/files/{file_token}/comments/{comment_id}/replies",
+                params={"file_type": file_type},
+                json_body={"content": {"elements": elements}},
+                account_id=account_id,
+            )
+        except Exception:
+            await asyncio.to_thread(
+                feishu_api_request,
+                "POST",
+                f"/open-apis/drive/v1/files/{file_token}/comments",
+                params={"file_type": file_type},
+                json_body={"reply_list": {"replies": [{"content": {"elements": elements}}]}},
+                account_id=account_id,
+            )
+        return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id=f"comment:{comment_id}"))
 
     @staticmethod
     def _response_succeeded(response: Any) -> bool:
@@ -3305,6 +6476,12 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._running = False
                 self._disable_websocket_auto_reconnect()
                 self._ws_future = None
+                self._ws_futures_by_account.clear()
+                self._ws_thread_loop = None
+                self._ws_thread_loops_by_account.clear()
+                self._event_handler = None
+                self._event_handlers_by_account.clear()
+                self._clients_by_account.clear()
                 await self._stop_webhook_server()
                 if attempt >= _FEISHU_CONNECT_ATTEMPTS - 1:
                     raise
@@ -3321,27 +6498,75 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _connect_websocket(self) -> None:
         if not FEISHU_WEBSOCKET_AVAILABLE:
             raise RuntimeError("websockets not installed; websocket mode unavailable")
-        domain = FEISHU_DOMAIN if self._domain_name != "lark" else LARK_DOMAIN
-        self._client = self._build_lark_client(domain)
-        self._event_handler = self._build_event_handler()
-        if self._event_handler is None:
-            raise RuntimeError("failed to build Feishu event handler")
         loop = self._loop
         if loop is None or loop.is_closed():
             raise RuntimeError("adapter loop is not ready")
-        await self._hydrate_bot_identity()
-        self._ws_client = FeishuWSClient(
-            app_id=self._app_id,
-            app_secret=self._app_secret,
-            log_level=lark.LogLevel.INFO,
-            event_handler=self._event_handler,
-            domain=domain,
+        self._clients_by_account = {}
+        self._ws_clients_by_account = {}
+        self._ws_futures_by_account = {}
+        self._event_handlers_by_account = {}
+        websocket_accounts = [
+            account for account in self._accounts.values() if account.enabled and account.connection_mode == "websocket"
+        ]
+        websocket_accounts.sort(key=lambda account: (account.account_id != "default", account.account_id))
+        if not websocket_accounts:
+            raise RuntimeError("no enabled Feishu websocket accounts configured")
+        logger.info(
+            "[Feishu] Starting websocket transports for accounts: %s",
+            self._describe_transport_accounts(connection_mode="websocket"),
         )
-        self._ws_future = loop.run_in_executor(
-            None,
-            _run_official_feishu_ws_client,
-            self._ws_client,
-            self,
+        for account in websocket_accounts:
+            self._set_transport_runtime_state(account.account_id, "connecting")
+            account_domain = FEISHU_DOMAIN if account.domain_name != "lark" else LARK_DOMAIN
+            client = (
+                self._build_lark_client(account_domain)
+                if account.account_id == "default"
+                else self._build_lark_client_for_account(account, account_domain)
+            )
+            event_handler = self._build_event_handler(account)
+            if event_handler is None:
+                raise RuntimeError(f"failed to build Feishu event handler for account {account.account_id}")
+            self._clients_by_account[account.account_id] = client
+            self._event_handlers_by_account[account.account_id] = event_handler
+            if account.account_id == "default":
+                self._client = client
+                self._event_handler = event_handler
+            await self._hydrate_bot_identity(account_id=account.account_id)
+            ws_client = FeishuWSClient(
+                app_id=account.app_id,
+                app_secret=account.app_secret,
+                log_level=lark.LogLevel.INFO,
+                event_handler=event_handler,
+                domain=account_domain,
+            )
+            self._ws_clients_by_account[account.account_id] = ws_client
+            ws_future = loop.run_in_executor(
+                None,
+                _run_official_feishu_ws_client,
+                ws_client,
+                self,
+                account.account_id,
+            )
+            ws_future.add_done_callback(
+                lambda finished_future, finished_account_id=account.account_id: self._handle_websocket_future_done(
+                    finished_account_id,
+                    finished_future,
+                )
+            )
+            self._ws_futures_by_account[account.account_id] = ws_future
+            self._set_transport_runtime_state(account.account_id, "connected")
+            if account.account_id == "default":
+                self._ws_client = ws_client
+                self._ws_future = ws_future
+        if self._client is None and websocket_accounts:
+            primary_account = websocket_accounts[0]
+            self._client = self._clients_by_account.get(primary_account.account_id)
+            self._event_handler = self._event_handlers_by_account.get(primary_account.account_id)
+            self._ws_client = self._ws_clients_by_account.get(primary_account.account_id)
+            self._ws_future = self._ws_futures_by_account.get(primary_account.account_id)
+        logger.info(
+            "[Feishu] Websocket transports ready for accounts: %s",
+            ", ".join(sorted(self._ws_futures_by_account.keys())) or "none",
         )
 
     async def _connect_webhook(self) -> None:
@@ -3349,16 +6574,35 @@ class FeishuAdapter(BasePlatformAdapter):
             raise RuntimeError("aiohttp not installed; webhook mode unavailable")
         domain = FEISHU_DOMAIN if self._domain_name != "lark" else LARK_DOMAIN
         self._client = self._build_lark_client(domain)
+        self._clients_by_account = {"default": self._client}
+        for account in self._accounts.values():
+            if account.account_id == "default" or not account.enabled or account.connection_mode != "webhook":
+                continue
+            account_domain = FEISHU_DOMAIN if account.domain_name != "lark" else LARK_DOMAIN
+            self._clients_by_account[account.account_id] = self._build_lark_client_for_account(account, account_domain)
         self._event_handler = self._build_event_handler()
         if self._event_handler is None:
             raise RuntimeError("failed to build Feishu event handler")
         await self._hydrate_bot_identity()
+        for account in self._accounts.values():
+            if account.account_id != "default" and account.enabled and account.connection_mode == "webhook":
+                await self._hydrate_bot_identity(account_id=account.account_id)
         app = web.Application()
-        app.router.add_post(self._webhook_path, self._handle_webhook_request)
+        webhook_paths = {self._webhook_path}
+        webhook_paths.update(
+            account.webhook_path
+            for account in self._accounts.values()
+            if account.enabled and account.connection_mode == "webhook" and account.webhook_path
+        )
+        for webhook_path in sorted(webhook_paths):
+            app.router.add_post(webhook_path, self._handle_webhook_request)
         self._webhook_runner = web.AppRunner(app)
         await self._webhook_runner.setup()
         self._webhook_site = web.TCPSite(self._webhook_runner, self._webhook_host, self._webhook_port)
         await self._webhook_site.start()
+        for account in self._accounts.values():
+            if account.enabled and account.connection_mode == "webhook":
+                self._set_transport_runtime_state(account.account_id, "connected")
 
     def _build_lark_client(self, domain: Any) -> Any:
         return (
@@ -3369,6 +6613,107 @@ class FeishuAdapter(BasePlatformAdapter):
             .log_level(lark.LogLevel.WARNING)
             .build()
         )
+
+    def _build_lark_client_for_account(self, account: FeishuAccountSettings, domain: Any) -> Any:
+        """按账号配置构造飞书客户端。"""
+        return (
+            lark.Client.builder()
+            .app_id(account.app_id)
+            .app_secret(account.app_secret)
+            .domain(domain)
+            .log_level(lark.LogLevel.WARNING)
+            .build()
+        )
+
+    def _format_account_transport_label(self, account: FeishuAccountSettings) -> str:
+        """Build a compact runtime label for one Feishu account transport."""
+        domain_name = str(account.domain_name or self._domain_name or "feishu").strip().lower() or "feishu"
+        return f"{account.account_id}@{domain_name}({account.connection_mode})"
+
+    def _set_transport_runtime_state(self, account_id: str, runtime_state: str, *, error: Optional[str] = None) -> None:
+        """Track per-account transport lifecycle state for diagnostics and runtime health checks."""
+        normalized_account_id = str(account_id or "default").strip() or "default"
+        normalized_state = str(runtime_state or "configured").strip().lower() or "configured"
+        self._transport_runtime_state_by_account[normalized_account_id] = normalized_state
+        if error:
+            self._transport_runtime_error_by_account[normalized_account_id] = str(error).strip()
+        elif normalized_state not in {"error", "connected"}:
+            self._transport_runtime_error_by_account.pop(normalized_account_id, None)
+
+    def _describe_transport_accounts(self, *, connection_mode: Optional[str] = None) -> str:
+        """Describe active Feishu accounts for logs and diagnostics."""
+        entries = [
+            self._format_account_transport_label(account)
+            for account in sorted(self._accounts.values(), key=lambda item: (item.account_id != "default", item.account_id))
+            if account.enabled and (connection_mode is None or account.connection_mode == connection_mode)
+        ]
+        return ", ".join(entries) if entries else "none"
+
+    def _handle_websocket_future_done(self, account_id: str, ws_future: Any) -> None:
+        """Track websocket worker completion so diagnostics reflect unexpected transport exits."""
+        try:
+            exc = ws_future.exception()
+        except asyncio.CancelledError:
+            self._set_transport_runtime_state(account_id, "disconnected")
+            logger.info("[Feishu] Websocket transport cancelled for account %s", account_id)
+            return
+        except Exception as exc:
+            self._set_transport_runtime_state(account_id, "error", error=str(exc))
+            logger.warning(
+                "[Feishu] Failed to inspect websocket transport result for account %s: %s",
+                account_id,
+                exc,
+                exc_info=True,
+            )
+            return
+
+        if exc is not None:
+            self._set_transport_runtime_state(account_id, "error", error=str(exc))
+            logger.warning(
+                "[Feishu] Websocket transport terminated with error for account %s: %s",
+                account_id,
+                exc,
+                exc_info=True,
+            )
+            return
+
+        current_state = str(self._transport_runtime_state_by_account.get(account_id) or "").strip().lower()
+        if current_state == "disconnecting":
+            self._set_transport_runtime_state(account_id, "disconnected")
+            logger.info("[Feishu] Websocket transport stopped for account %s", account_id)
+            return
+        if current_state not in {"disconnected", "error"}:
+            self._set_transport_runtime_state(account_id, "disconnected")
+            logger.warning("[Feishu] Websocket transport exited unexpectedly for account %s", account_id)
+
+    def get_transport_account_status(self) -> List[Dict[str, str]]:
+        """Return runtime transport status for each configured Feishu account."""
+        statuses: List[Dict[str, str]] = []
+        for account in sorted(self._accounts.values(), key=lambda item: (item.account_id != "default", item.account_id)):
+            if not account.enabled:
+                continue
+            runtime_state = str(
+                self._transport_runtime_state_by_account.get(account.account_id)
+                or ""
+            ).strip().lower()
+            if not runtime_state:
+                if account.connection_mode == "websocket":
+                    runtime_state = "connected" if account.account_id in self._ws_futures_by_account else "configured"
+                elif account.connection_mode == "webhook":
+                    runtime_state = "connected" if self._webhook_runner is not None else "configured"
+                else:
+                    runtime_state = "configured"
+            item = {
+                "account_id": account.account_id,
+                "connection_mode": account.connection_mode,
+                "domain": str(account.domain_name or self._domain_name or "feishu").strip().lower() or "feishu",
+                "runtime_state": runtime_state,
+            }
+            last_error = str(self._transport_runtime_error_by_account.get(account.account_id) or "").strip()
+            if last_error:
+                item["last_error"] = last_error
+            statuses.append(item)
+        return statuses
 
     async def _feishu_send_with_retry(
         self,
@@ -3393,7 +6738,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 # If replying to a message failed because it was withdrawn or not found,
                 # fall back to posting a new message directly to the chat.
                 if active_reply_to and not self._response_succeeded(response):
-                    code = getattr(response, "code", None)
+                    code = _extract_feishu_error_code(response)
                     if code in _FEISHU_REPLY_FALLBACK_CODES:
                         logger.warning(
                             "[Feishu] Reply to %s failed (code %s — message withdrawn/missing); "
@@ -3413,6 +6758,26 @@ class FeishuAdapter(BasePlatformAdapter):
                 return response
             except Exception as exc:
                 last_error = exc
+                fallback_code = _extract_feishu_error_code(exc)
+                if active_reply_to and fallback_code in _FEISHU_REPLY_FALLBACK_CODES:
+                    logger.warning(
+                        "[Feishu] Reply to %s raised a withdrawn/missing-target error (code %s); "
+                        "falling back to new message in chat %s",
+                        active_reply_to,
+                        fallback_code,
+                        chat_id,
+                    )
+                    try:
+                        return await self._send_raw_message(
+                            chat_id=chat_id,
+                            msg_type=msg_type,
+                            payload=payload,
+                            reply_to=None,
+                            metadata=metadata,
+                        )
+                    except Exception as fallback_exc:
+                        last_error = fallback_exc
+                        exc = fallback_exc
                 if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):
                     raise
                 if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
@@ -3429,15 +6794,67 @@ class FeishuAdapter(BasePlatformAdapter):
                 await asyncio.sleep(wait_seconds)
         raise last_error or RuntimeError("Feishu send failed")
 
+    async def _acquire_app_locks(self) -> bool:
+        """Acquire one scoped lock per active Feishu app to prevent duplicate gateways."""
+        if self._connection_mode == "websocket":
+            active_accounts = [
+                account for account in self._accounts.values() if account.enabled and account.connection_mode == "websocket"
+            ]
+            active_accounts.sort(key=lambda account: (account.account_id != "default", account.account_id))
+        else:
+            primary_account = self._accounts.get("default")
+            active_accounts = [primary_account] if primary_account is not None else []
+        app_ids = [account.app_id for account in active_accounts if account and account.app_id]
+        if not app_ids and self._app_id:
+            app_ids = [self._app_id]
+        acquired_ids: List[str] = []
+        for app_id in list(dict.fromkeys(app_ids)):
+            acquired, existing = acquire_scoped_lock(
+                _FEISHU_APP_LOCK_SCOPE,
+                app_id,
+                metadata={"platform": self.platform.value},
+            )
+            if not acquired:
+                owner_pid = existing.get("pid") if isinstance(existing, dict) else None
+                message = (
+                    "Another local Hermes gateway is already using this Feishu app_id"
+                    + (f" {app_id}" if len(app_ids) > 1 else "")
+                    + (f" (PID {owner_pid})." if owner_pid else ".")
+                    + " Stop the other gateway before starting a second Feishu websocket client."
+                )
+                logger.error("[Feishu] %s", message)
+                self._set_fatal_error("feishu_app_lock", message, retryable=False)
+                for acquired_id in reversed(acquired_ids):
+                    try:
+                        release_scoped_lock(_FEISHU_APP_LOCK_SCOPE, acquired_id)
+                    except Exception:
+                        logger.warning(
+                            "[Feishu] Failed to roll back app lock %s after acquisition failure",
+                            acquired_id,
+                            exc_info=True,
+                        )
+                self._app_lock_identity = None
+                self._app_lock_identities = []
+                return False
+            acquired_ids.append(app_id)
+        self._app_lock_identity = acquired_ids[0] if acquired_ids else None
+        self._app_lock_identities = acquired_ids
+        return True
+
     async def _release_app_lock(self) -> None:
-        if not self._app_lock_identity:
+        if self._app_lock_identities:
+            identities = list(dict.fromkeys(self._app_lock_identities))
+        elif self._app_lock_identity:
+            identities = [self._app_lock_identity]
+        else:
             return
-        try:
-            release_scoped_lock(_FEISHU_APP_LOCK_SCOPE, self._app_lock_identity)
-        except Exception as exc:
-            logger.warning("[Feishu] Failed to release app lock: %s", exc, exc_info=True)
-        finally:
-            self._app_lock_identity = None
+        for app_id in identities:
+            try:
+                release_scoped_lock(_FEISHU_APP_LOCK_SCOPE, app_id)
+            except Exception as exc:
+                logger.warning("[Feishu] Failed to release app lock %s: %s", app_id, exc, exc_info=True)
+        self._app_lock_identity = None
+        self._app_lock_identities = []
 
     # =========================================================================
     # Lark API request builders

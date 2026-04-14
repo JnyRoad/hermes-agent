@@ -61,4 +61,7 @@ mini-swe-agent/
 # Nix
 .direnv/
 result
+
+# Codex
+.codex
 website/static/api/skills-index.json

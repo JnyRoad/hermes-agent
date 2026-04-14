@@ -20,6 +20,8 @@ from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
+_SILENT_REPLY_TOKEN_PATTERN = re.compile(r"(?:^|\n)\s*NO_REPLY\s*$")
+
 
 def utf16_len(s: str) -> int:
     """Count UTF-16 code units in *s*.
@@ -285,6 +287,17 @@ def safe_url_for_log(url: str, max_len: int = 80) -> str:
     if max_len <= 3:
         return "." * max_len
     return f"{safe[:max_len - 3]}..."
+
+
+def has_silent_reply_token(response: Any) -> bool:
+    """Return True when the response ends with the control token ``NO_REPLY``.
+
+    The token must appear as a standalone final line so normal user-visible
+    text that merely mentions ``NO_REPLY`` is not suppressed.
+    """
+    if not isinstance(response, str):
+        return False
+    return bool(_SILENT_REPLY_TOKEN_PATTERN.search(response.strip()))
 
 
 async def _ssrf_redirect_guard(response):
@@ -1329,6 +1342,22 @@ class BasePlatformAdapter(ABC):
                     pass
             self._typing_paused.discard(chat_id)
 
+    def format_tool_progress_content(self, progress_lines: list[str]) -> str:
+        """将工具进度行渲染为平台可直接发送的文本内容。"""
+        return "\n".join(str(line) for line in progress_lines if str(line).strip())
+
+    @staticmethod
+    def build_reply_metadata(source: Any) -> Optional[Dict[str, Any]]:
+        """根据来源构造平台回包 metadata。"""
+        metadata: Dict[str, Any] = {}
+        thread_id = getattr(source, "thread_id", None)
+        account_id = getattr(source, "account_id", None)
+        if thread_id:
+            metadata["thread_id"] = thread_id
+        if account_id:
+            metadata["account_id"] = account_id
+        return metadata or None
+
     def pause_typing_for_chat(self, chat_id: str) -> None:
         """Pause typing indicator for a chat (e.g. during approval waits).
 
@@ -1515,7 +1544,7 @@ class BasePlatformAdapter(ABC):
                     self.name, cmd, session_key,
                 )
                 try:
-                    _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                    _thread_meta = self.build_reply_metadata(event.source)
                     response = await self._message_handler(event)
                     if response:
                         await self._send_with_retry(
@@ -1611,7 +1640,7 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         
         # Start continuous typing indicator (refreshes every 2 seconds)
-        _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        _thread_metadata = self.build_reply_metadata(event.source)
         typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id, metadata=_thread_metadata))
         
         try:
@@ -1619,11 +1648,18 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
-            
+
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or
             # when the message was queued behind an active agent.  Log at
             # DEBUG to avoid noisy warnings for expected behavior.
+            if has_silent_reply_token(response):
+                logger.info(
+                    "[%s] Suppressing automatic reply for %s due to NO_REPLY terminal token",
+                    self.name,
+                    event.source.chat_id,
+                )
+                response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
@@ -1832,7 +1868,7 @@ class BasePlatformAdapter(ABC):
             try:
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                _thread_metadata = self.build_reply_metadata(event.source)
                 await self.send(
                     chat_id=event.source.chat_id,
                     content=(
@@ -1898,6 +1934,7 @@ class BasePlatformAdapter(ABC):
         chat_topic: Optional[str] = None,
         user_id_alt: Optional[str] = None,
         chat_id_alt: Optional[str] = None,
+        account_id: Optional[str] = None,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform."""
         # Normalize empty topic to None
@@ -1914,6 +1951,7 @@ class BasePlatformAdapter(ABC):
             chat_topic=chat_topic.strip() if chat_topic else None,
             user_id_alt=user_id_alt,
             chat_id_alt=chat_id_alt,
+            account_id=str(account_id) if account_id else None,
         )
     
     @abstractmethod

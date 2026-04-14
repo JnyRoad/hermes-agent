@@ -643,11 +643,28 @@ def _read_codex_access_token() -> Optional[str]:
     fallback-to-Codex working when the pool state is stale but the stored OAuth
     token is still valid.
     """
-    pool_present, entry = _select_pool_entry("openai-codex")
-    if pool_present:
-        token = _pool_runtime_api_key(entry)
-        if token:
-            return token
+    def _is_expired_jwt(raw_token: str) -> bool:
+        """判断 Codex JWT 是否已经过期。
+
+        非 JWT 或无法解码的 token 仍视为可用，因为历史兼容路径里
+        允许 opaque token 直接透传。
+        """
+        try:
+            import base64
+
+            parts = raw_token.split(".")
+            if len(parts) < 2:
+                return False
+            payload = parts[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            exp = claims.get("exp", 0)
+            if exp and time.time() > exp:
+                logger.debug("Codex access token expired (exp=%s), skipping", exp)
+                return True
+            return False
+        except Exception:
+            return False
 
     try:
         from hermes_cli.auth import _read_codex_tokens
@@ -656,25 +673,19 @@ def _read_codex_access_token() -> Optional[str]:
         access_token = tokens.get("access_token")
         if not isinstance(access_token, str) or not access_token.strip():
             return None
-
-        # Check JWT expiry — expired tokens block the auto chain and
-        # prevent fallback to working providers (e.g. Anthropic).
-        try:
-            import base64
-            payload = access_token.split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            claims = json.loads(base64.urlsafe_b64decode(payload))
-            exp = claims.get("exp", 0)
-            if exp and time.time() > exp:
-                logger.debug("Codex access token expired (exp=%s), skipping", exp)
-                return None
-        except Exception:
-            pass  # Non-JWT token or decode error — use as-is
+        # 过期 JWT 必须跳过，否则会阻断自动回退链路。
+        if _is_expired_jwt(access_token):
+            return None
 
         return access_token.strip()
     except Exception as exc:
         logger.debug("Could not read Codex auth for auxiliary client: %s", exc)
-        return None
+    pool_present, entry = _select_pool_entry("openai-codex")
+    if pool_present:
+        token = _pool_runtime_api_key(entry)
+        if token and not _is_expired_jwt(token):
+            return token
+    return None
 
 
 def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
@@ -973,7 +984,9 @@ def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
         pass
 
     from agent.anthropic_adapter import _is_oauth_token
-    is_oauth = _is_oauth_token(token)
+    # 对于 anthropic 专用解析路径，凡是不是 Console API key 的 token
+    # 都按 OAuth / setup token 处理，避免辅助客户端错误走 x-api-key 语义。
+    is_oauth = _is_oauth_token(token) or not str(token).startswith("sk-ant-api")
     model = _API_KEY_PROVIDER_AUX_MODELS.get("anthropic", "claude-haiku-4-5-20251001")
     logger.debug("Auxiliary client: Anthropic native (%s) at %s (oauth=%s)", model, base_url, is_oauth)
     try:
@@ -1700,6 +1713,15 @@ def get_available_vision_backends() -> List[str]:
         if p not in available and _strict_vision_backend_available(p):
             available.append(p)
     return available
+
+
+def get_vision_auxiliary_client(*, provider: str = "auto", model: Optional[str] = None) -> Tuple[Optional[Any], Optional[str]]:
+    """返回视觉辅助客户端的简化接口。
+
+    兼容旧调用方对 ``(client, model)`` 二元返回值的依赖。
+    """
+    _provider, client, resolved_model = resolve_vision_provider_client(provider=provider, model=model)
+    return client, resolved_model
 
 
 def resolve_vision_provider_client(

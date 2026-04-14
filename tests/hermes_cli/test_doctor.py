@@ -12,6 +12,7 @@ import hermes_cli.doctor as doctor
 import hermes_cli.gateway as gateway_cli
 from hermes_cli import doctor as doctor_mod
 from hermes_cli.doctor import _has_provider_env_config
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 
 
 class TestDoctorPlatformHints:
@@ -90,6 +91,822 @@ class TestHonchoDoctorConfigDetection:
         )
 
         assert not doctor._honcho_is_configured_for_doctor()
+
+
+class TestFeishuDoctorChecks:
+    def test_warns_when_feishu_not_configured(self, monkeypatch, capsys):
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: GatewayConfig())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Feishu Integration" in out
+        assert "Feishu integration not configured" in out
+        assert issues == []
+
+    def test_reports_websocket_configuration(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                        "unauthorized_dm_behavior": "pair",
+                    },
+                )
+            }
+        )
+        cfg.platforms[Platform.FEISHU].home_channel = HomeChannel(
+            platform=Platform.FEISHU,
+            chat_id="oc_home",
+            name="Home",
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Feishu platform enabled" in out
+        assert "FEISHU_APP_ID configured" in out
+        assert "Connection mode: websocket" in out
+        assert "Feishu home channel configured" in out
+        assert "lark-oapi SDK" in out
+        assert issues == []
+
+    def test_reports_multi_account_webhook_configuration(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                        "verification_token": "verify_primary",
+                        "encrypt_key": "encrypt_primary",
+                        "accounts": {
+                            "feishu-cn": {
+                                "app_id": "cli_cn",
+                                "app_secret": "sec_cn",
+                                "webhook_path": "/webhook/feishu-cn",
+                            }
+                        },
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Feishu accounts configured: 2" in out
+        assert "Account `feishu-cn`" in out
+        assert "Multi-account webhook routing enabled" in out
+        assert issues == []
+
+    def test_warns_when_multi_account_uses_websocket(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                        "accounts": {
+                            "feishu-cn": {
+                                "app_id": "cli_cn",
+                                "app_secret": "sec_cn",
+                            }
+                        },
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Multi-account websocket routing enabled" in out
+        assert not any("webhook mode for multi-account Feishu" in item for item in issues)
+
+    def test_webhook_mode_warns_when_tokens_missing(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "lark",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Connection mode: webhook" in out
+        assert "FEISHU_VERIFICATION_TOKEN missing" in out
+        assert "FEISHU_ENCRYPT_KEY missing" in out
+        assert any("FEISHU_VERIFICATION_TOKEN" in item for item in issues)
+
+    def test_warns_when_feishu_platform_disabled(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=False,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Feishu platform disabled" in out
+        assert "FEISHU_APP_ID configured" in out
+        assert issues == []
+
+    def test_warns_when_connection_mode_is_unknown(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "long_polling",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Unknown connection mode: long_polling" in out
+        assert any("connection_mode" in item for item in issues)
+
+    def test_warns_when_feishu_domain_is_unknown(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "example",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Unknown Feishu domain: example" in out
+        assert issues == []
+
+    def test_websocket_mode_reports_webhook_checks_skipped(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Webhook-only checks skipped in websocket mode" in out
+        assert issues == []
+
+    def test_warns_when_lark_oapi_sdk_missing(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.delitem(sys.modules, "lark_oapi", raising=False)
+
+        real_import = __import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "lark_oapi":
+                raise ImportError("missing lark_oapi")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.__import__", fake_import)
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "lark-oapi SDK not installed" in out
+        assert any("lark-oapi" in item for item in issues)
+
+    def test_reports_app_scope_status_when_query_succeeds(self, monkeypatch, capsys):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes",
+            lambda: ["application:application:self_manage", "im:message:readonly"],
+        )
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Feishu app scopes: 2 granted" in out
+        assert "App self-manage scope available" in out
+
+    def test_warns_when_app_scope_query_cannot_run(self, monkeypatch, capsys):
+        from tools.feishu.client import FeishuAPIError
+
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes",
+            lambda: (_ for _ in ()).throw(
+                FeishuAPIError(
+                    code=99991672,
+                    message="missing application:application:self_manage",
+                    missing_scopes=["application:application:self_manage"],
+                )
+            ),
+        )
+
+        issues = []
+        doctor._check_feishu_integration(issues)
+
+        out = capsys.readouterr().out
+        assert "Unable to query Feishu app scopes" in out
+        assert any("application:application:self_manage" in item for item in issues)
+
+    def test_collect_report_scopes_user_authorization_by_account(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr("tools.feishu.client.get_app_granted_scopes", lambda: [])
+
+        captured = {}
+
+        class _Adapter:
+            def get_authorization_status(self, user_open_id, scopes=None, account_id=None):
+                captured["account_id"] = account_id
+                return {"authorized": True, "granted_scopes": ["im:chat:read"]}
+
+        report = doctor.collect_feishu_doctor_report(
+            user_open_id="ou_user",
+            adapter=_Adapter(),
+            account_id="feishu-cn",
+        )
+        assert captured["account_id"] == "feishu-cn"
+        assert any("Current user authorization (feishu-cn): 1 granted" in item["label"] for item in report["items"])
+
+    def test_collect_report_recommends_owner_batch_auth(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes",
+            lambda: ["application:application:self_manage", "offline_access"],
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_info",
+            lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes_by_token_type",
+            lambda token_type, account_id=None: ["im:chat:read", "task:task:read"],
+        )
+
+        class _Adapter:
+            def get_authorization_status(self, user_open_id, scopes=None, account_id=None):
+                return {"authorized": False, "granted_scopes": ["im:chat:read"]}
+
+        report = doctor.collect_feishu_doctor_report(
+            user_open_id="ou_owner",
+            adapter=_Adapter(),
+            account_id="feishu-cn",
+        )
+
+        assert any(item["label"] == "Current user is Feishu app owner" for item in report["items"])
+        assert any(item["label"] == "Feishu owner onboarding prerequisites ready" for item in report["items"])
+        assert any(item["label"] == "Owner batch authorization recommended" for item in report["items"])
+        assert any("/feishu auth batch" in issue for issue in report["issues"])
+
+    def test_collect_report_warns_when_offline_access_missing(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr("tools.feishu.client.get_app_granted_scopes", lambda: ["application:application:self_manage"])
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_info",
+            lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes_by_token_type",
+            lambda token_type, account_id=None: ["im:chat:read"] if token_type is None else ["im:chat:read"],
+        )
+
+        report = doctor.collect_feishu_doctor_report(user_open_id="ou_owner", account_id="feishu-cn")
+
+        assert any(item["label"] == "Feishu OAuth prerequisite missing" for item in report["items"])
+        assert any(item["label"] == "Feishu owner onboarding readiness blocked" for item in report["items"])
+        assert any("offline_access" in issue for issue in report["issues"])
+
+    def test_collect_report_warns_when_app_has_no_granted_user_scopes(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes",
+            lambda: ["application:application:self_manage", "offline_access"],
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_info",
+            lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes_by_token_type",
+            lambda token_type, account_id=None: ["application:application:self_manage", "offline_access"]
+            if token_type is None
+            else [],
+        )
+
+        report = doctor.collect_feishu_doctor_report(user_open_id="ou_owner", account_id="feishu-cn")
+
+        assert any(item["label"] == "Feishu user scopes not granted to app yet" for item in report["items"])
+        assert any(item["label"] == "Feishu owner onboarding readiness blocked" for item in report["items"])
+        assert any("Grant the required Feishu user scopes first" in issue for issue in report["issues"])
+
+    def test_collect_report_warns_missing_required_app_scopes(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr("tools.feishu.client.get_app_granted_scopes", lambda: ["application:application:self_manage"])
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_info",
+            lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes_by_token_type",
+            lambda token_type, account_id=None: [],
+        )
+
+        report = doctor.collect_feishu_doctor_report(user_open_id="ou_owner", account_id="feishu-cn")
+
+        assert any(item["label"].startswith("Feishu required app scopes missing:") for item in report["items"])
+        assert any("Grant the missing Feishu app scopes" in issue for issue in report["issues"])
+
+    def test_collect_report_includes_directory_diagnostics(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                        "directory": {
+                            "include_config_users": True,
+                            "include_config_groups": False,
+                            "include_live_users": False,
+                            "include_live_groups": True,
+                            "live_limit": 12,
+                            "live_page_size": 6,
+                        },
+                        "reply_mode": "card",
+                        "streaming": False,
+                        "block_streaming": True,
+                        "block_streaming_coalesce_ms": 850,
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr("tools.feishu.client.get_app_granted_scopes", lambda: ["application:application:self_manage"])
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_info",
+            lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes_by_token_type",
+            lambda token_type, account_id=None: [],
+        )
+        monkeypatch.setattr(
+            "gateway.channel_directory.load_directory",
+            lambda: {
+                "updated_at": "2026-01-01T00:00:00",
+                "platforms": {
+                    "feishu": [
+                        {"id": "ou_a", "name": "Alice", "type": "dm", "source": "config", "account_id": "default"},
+                        {"id": "oc_b", "name": "Backend", "type": "group", "source": "live", "account_id": "default"},
+                        {"id": "feishu-cn::oc_c", "name": "Ops", "type": "group", "source": "live", "account_id": "feishu-cn"},
+                    ]
+                },
+            },
+        )
+
+        report = doctor.collect_feishu_doctor_report(
+            user_open_id="ou_owner",
+            adapter=SimpleNamespace(
+                _get_account_live_directory_settings=lambda account_id: {
+                    "default": {
+                        "include_config_users": True,
+                        "include_config_groups": False,
+                        "include_live_users": False,
+                        "include_live_groups": True,
+                        "live_limit": 12,
+                        "live_page_size": 6,
+                    },
+                    "feishu-cn": {
+                        "include_config_users": False,
+                        "include_config_groups": True,
+                        "include_live_users": True,
+                        "include_live_groups": False,
+                        "live_limit": 20,
+                        "live_page_size": 10,
+                    },
+                }[account_id],
+                search_channel_directory_entries=lambda *args, **kwargs: [],
+                get_transport_account_status=lambda: [
+                    {
+                        "account_id": "default",
+                        "connection_mode": "webhook",
+                        "runtime_state": "connected",
+                        "domain": "feishu",
+                    },
+                    {
+                        "account_id": "feishu-cn",
+                        "connection_mode": "webhook",
+                        "runtime_state": "error",
+                        "domain": "feishu",
+                        "last_error": "ws worker failed",
+                    },
+                ],
+            ),
+            account_id="feishu-cn",
+        )
+
+        assert any(item["label"] == "Feishu directory settings" for item in report["items"])
+        assert any(
+            item["label"] == "Feishu directory settings"
+            and "config_users=True config_groups=False users=False groups=True limit=12 page_size=6" in item["detail"]
+            for item in report["items"]
+        )
+        assert any(
+            item["label"] == "Feishu directory policy (feishu-cn)"
+            and "config_users=false config_groups=true users=true groups=false limit=20 page_size=10" in item["detail"]
+            for item in report["items"]
+        )
+        assert any(
+            item["label"] == "Feishu reply and streaming settings"
+            and "reply_mode=card streaming=false block_streaming=true coalesce_ms=850" in item["detail"]
+            for item in report["items"]
+        )
+        assert any(
+            item["label"] == "Feishu effective delivery mode"
+            and "static card-style replies without streaming updates" in item["detail"]
+            and "coalesced edits at 850ms" in item["detail"]
+            for item in report["items"]
+        )
+        assert any(
+            item["label"] == "Feishu runtime transport status"
+            and "default=connected/webhook, feishu-cn=error/webhook" in item["detail"]
+            for item in report["items"]
+        )
+        assert any(
+            item["label"] == "Feishu runtime transport errors"
+            and "feishu-cn=ws worker failed" in item["detail"]
+            for item in report["items"]
+        )
+        assert any(
+            "Resolve Feishu runtime transport errors before relying on live chat delivery or directory refresh" in issue
+            for issue in report["issues"]
+        )
+        assert any(item["label"] == "Feishu cached directory targets: 3" for item in report["items"])
+        assert any(item["label"] == "Feishu cached directory accounts" for item in report["items"])
+        assert any(item["label"] == "Feishu live directory search fallback available" for item in report["items"])
+
+    def test_collect_report_marks_multi_account_websocket_as_enabled(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_primary",
+                        "app_secret": "sec_primary",
+                        "connection_mode": "websocket",
+                        "domain": "feishu",
+                        "accounts": {
+                            "feishu-cn": {
+                                "app_id": "cli_secondary",
+                                "app_secret": "sec_secondary",
+                                "connection_mode": "websocket",
+                            }
+                        },
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr("tools.feishu.client.get_app_granted_scopes", lambda: ["application:application:self_manage"])
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_info",
+            lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes_by_token_type",
+            lambda token_type, account_id=None: [],
+        )
+        monkeypatch.setattr(
+            "gateway.channel_directory.load_directory",
+            lambda: {"updated_at": "2026-01-01T00:00:00", "platforms": {"feishu": []}},
+        )
+
+        report = doctor.collect_feishu_doctor_report(user_open_id="ou_owner", account_id="feishu-cn")
+
+        assert any(item["label"] == "Multi-account websocket routing enabled" for item in report["items"])
+        assert not any(item["label"] == "Multi-account websocket support incomplete" for item in report["items"])
+        assert not any("Use webhook mode for multi-account Feishu" in issue for issue in report["issues"])
+
+    def test_collect_report_warns_when_directory_disabled_for_account(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes",
+            lambda: ["application:application:self_manage", "offline_access"],
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_info",
+            lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes_by_token_type",
+            lambda token_type, account_id=None: [],
+        )
+        monkeypatch.setattr(
+            "gateway.channel_directory.load_directory",
+            lambda: {"updated_at": "2026-01-01T00:00:00", "platforms": {"feishu": []}},
+        )
+
+        report = doctor.collect_feishu_doctor_report(
+            user_open_id="ou_owner",
+            adapter=SimpleNamespace(
+                _get_account_live_directory_settings=lambda account_id: {
+                    "include_config_users": False,
+                    "include_config_groups": False,
+                    "include_live_users": False,
+                    "include_live_groups": False,
+                    "live_limit": 50,
+                    "live_page_size": 50,
+                }
+            ),
+            account_id="feishu-cn",
+        )
+
+        assert any(item["label"] == "Feishu directory policy (feishu-cn)" for item in report["items"])
+        assert any(item["label"] == "Feishu directory disabled for account (feishu-cn)" for item in report["items"])
+        assert any("Enable at least one Feishu directory source for account `feishu-cn`" in issue for issue in report["issues"])
+
+    def test_collect_report_warns_when_owner_detection_is_unavailable(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes",
+            lambda: ["application:application:self_manage", "offline_access"],
+        )
+        monkeypatch.setattr("tools.feishu.client.get_app_info", lambda account_id=None: {})
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes_by_token_type",
+            lambda token_type, account_id=None: ["im:chat:read"],
+        )
+
+        report = doctor.collect_feishu_doctor_report(user_open_id="ou_user", account_id="feishu-cn")
+
+        assert any(item["label"] == "Feishu app owner unavailable" for item in report["items"])
+        assert any(item["label"] == "Feishu owner onboarding readiness blocked" for item in report["items"])
+        assert any(
+            "Resolve Feishu app owner detection before relying on owner-only onboarding" in issue
+            for issue in report["issues"]
+        )
+
+    def test_collect_report_tells_non_owner_to_ask_owner_for_batch_auth(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes",
+            lambda: ["application:application:self_manage", "offline_access"],
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_info",
+            lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes_by_token_type",
+            lambda token_type, account_id=None: ["im:chat:read", "task:task:read"],
+        )
+
+        class _Adapter:
+            def get_authorization_status(self, user_open_id, scopes=None, account_id=None):
+                return {"authorized": False, "granted_scopes": []}
+
+        report = doctor.collect_feishu_doctor_report(
+            user_open_id="ou_user",
+            adapter=_Adapter(),
+            account_id="feishu-cn",
+        )
+
+        assert any(item["label"] == "Current user is not the Feishu app owner" for item in report["items"])
+        assert any(
+            "Ask the Feishu app owner to run `/feishu auth batch` if owner-only onboarding is required" in issue
+            for issue in report["issues"]
+        )
 
 
 def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):

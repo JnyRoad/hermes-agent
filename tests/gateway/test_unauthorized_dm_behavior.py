@@ -50,6 +50,11 @@ def _make_event(platform: Platform, user_id: str, chat_id: str) -> MessageEvent:
         ),
     )
 
+def _make_event_with_account(platform: Platform, user_id: str, chat_id: str, account_id: str) -> MessageEvent:
+    event = _make_event(platform, user_id, chat_id)
+    event.source.account_id = account_id
+    return event
+
 
 def _make_runner(platform: Platform, config: GatewayConfig):
     from gateway.run import GatewayRunner
@@ -152,9 +157,38 @@ async def test_unauthorized_dm_pairs_by_default(monkeypatch):
         "whatsapp",
         "15551234567@s.whatsapp.net",
         "tester",
+        account_id=None,
     )
     adapter.send.assert_awaited_once()
     assert "ABC12DEF" in adapter.send.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_feishu_dm_pairs_with_account_context(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    config = GatewayConfig(
+        platforms={Platform.FEISHU: PlatformConfig(enabled=True)},
+    )
+    runner, adapter = _make_runner(Platform.FEISHU, config)
+    runner.pairing_store.generate_code.return_value = "ABC12DEF"
+
+    result = await runner._handle_message(
+        _make_event_with_account(
+            Platform.FEISHU,
+            "ou_feishu_user",
+            "oc_chat",
+            "feishu-cn",
+        )
+    )
+
+    assert result is None
+    runner.pairing_store.generate_code.assert_called_once_with(
+        "feishu",
+        "ou_feishu_user",
+        "tester",
+        account_id="feishu-cn",
+    )
+    adapter.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio

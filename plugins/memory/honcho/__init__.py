@@ -217,10 +217,8 @@ class HonchoMemoryProvider(MemoryProvider):
                 logger.debug("Honcho not configured — plugin inactive")
                 return
 
-            # Override peer_name with gateway user_id for per-user memory scoping.
-            # Only when no explicit peerName was configured — an explicit peerName
-            # means the user chose their identity; a raw user_id (e.g. Telegram
-            # chat ID) should not silently replace it.
+            # Gateway 会把真实平台用户标识传到这里。只有在用户没有显式配置
+            # peer_name 时，才使用 user_id 作为隔离标识；显式配置必须保持优先级。
             _gw_user_id = kwargs.get("user_id")
             if _gw_user_id and not cfg.peer_name:
                 cfg.peer_name = _gw_user_id

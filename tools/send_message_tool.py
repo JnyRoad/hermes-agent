@@ -11,13 +11,18 @@ import os
 import re
 import ssl
 import time
+from datetime import datetime, timezone
 
 from agent.redact import redact_sensitive_text
+from hermes_cli.config import get_hermes_home
+from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
-_FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
+_FEISHU_TARGET_RE = re.compile(
+    r"^\s*(?:(?P<account>[A-Za-z0-9._-]+)::)?(?P<target>(?:oc|ou|on|chat|open)_[\-A-Za-z0-9_]+)(?::(?P<thread>[-A-Za-z0-9_]+))?\s*$"
+)
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
 _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
@@ -33,6 +38,8 @@ _GENERIC_SECRET_ASSIGN_RE = re.compile(
     r"\b(access_token|api[_-]?key|auth[_-]?token|signature|sig)\s*=\s*([^\s,;]+)",
     re.IGNORECASE,
 )
+_RECENT_SEND_TARGETS_PATH = get_hermes_home() / "recent_send_targets.json"
+_RECENT_SEND_TARGET_LIMIT = 20
 
 
 def _sanitize_error_text(text) -> str:
@@ -68,7 +75,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567'"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Feishu also supports account-qualified IDs like 'feishu:feishu-cn::oc_xxx'. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'feishu:feishu-cn::oc_xxx'"
             },
             "message": {
                 "type": "string",
@@ -111,6 +118,44 @@ def _handle_send(args):
     target_ref = parts[1].strip() if len(parts) > 1 else None
     chat_id = None
     thread_id = None
+    account_id = None
+    config = None
+    platform = None
+    pconfig = None
+
+    from gateway.config import Platform as GatewayPlatform
+
+    platform_map = {
+        "telegram": GatewayPlatform.TELEGRAM,
+        "discord": GatewayPlatform.DISCORD,
+        "slack": GatewayPlatform.SLACK,
+        "whatsapp": GatewayPlatform.WHATSAPP,
+        "signal": GatewayPlatform.SIGNAL,
+        "bluebubbles": GatewayPlatform.BLUEBUBBLES,
+        "matrix": GatewayPlatform.MATRIX,
+        "mattermost": GatewayPlatform.MATTERMOST,
+        "homeassistant": GatewayPlatform.HOMEASSISTANT,
+        "dingtalk": GatewayPlatform.DINGTALK,
+        "feishu": GatewayPlatform.FEISHU,
+        "wecom": GatewayPlatform.WECOM,
+        "weixin": GatewayPlatform.WEIXIN,
+        "email": GatewayPlatform.EMAIL,
+        "sms": GatewayPlatform.SMS,
+    }
+    platform = platform_map.get(platform_name)
+    if not platform:
+        avail = ", ".join(platform_map.keys())
+        return tool_error(f"Unknown platform: {platform_name}. Available: {avail}")
+
+    try:
+        from gateway.config import load_gateway_config
+        config = load_gateway_config()
+    except Exception as e:
+        return json.dumps(_error(f"Failed to load gateway config: {e}"))
+
+    pconfig = config.platforms.get(platform)
+    if not pconfig or not pconfig.enabled:
+        return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
 
     if target_ref:
         chat_id, thread_id, is_explicit = _parse_target_ref(platform_name, target_ref)
@@ -120,14 +165,36 @@ def _handle_send(args):
     # Resolve human-friendly channel names to numeric IDs
     if target_ref and not is_explicit:
         try:
-            from gateway.channel_directory import resolve_channel_name
-            resolved = resolve_channel_name(platform_name, target_ref)
+            from gateway.channel_directory import explain_channel_name_resolution
+
+            preferred_account_id = _get_preferred_resolution_account_id(
+                platform_name,
+                config=config,
+                platform_config=pconfig,
+            )
+            resolution = explain_channel_name_resolution(
+                platform_name,
+                target_ref,
+                preferred_account_id=preferred_account_id,
+                preferred_target_ids=_get_preferred_resolution_target_ids(
+                    platform_name,
+                    config=config,
+                    platform_config=pconfig,
+                ),
+            )
+            resolved = resolution.get("resolved_id")
             if resolved:
                 chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
             else:
+                suggestions = resolution.get("suggestions") or []
+                suggestion_text = _format_resolution_suggestions_for_error(suggestions)
+                if resolution.get("status") == "ambiguous":
+                    return json.dumps({
+                        "error": f"Target '{target_ref}' is ambiguous on {platform_name}.{suggestion_text} Use a more specific target or an explicit channel ID."
+                    })
                 return json.dumps({
                     "error": f"Could not resolve '{target_ref}' on {platform_name}. "
-                    f"Use send_message(action='list') to see available targets."
+                    f"Use send_message(action='list') to see available targets.{suggestion_text}"
                 })
         except Exception:
             return json.dumps({
@@ -135,43 +202,12 @@ def _handle_send(args):
                 f"Try using a numeric channel ID instead."
             })
 
+    if platform_name == "feishu" and chat_id:
+        chat_id, account_id = _split_feishu_account_target(chat_id)
+
     from tools.interrupt import is_interrupted
     if is_interrupted():
         return tool_error("Interrupted")
-
-    try:
-        from gateway.config import load_gateway_config, Platform
-        config = load_gateway_config()
-    except Exception as e:
-        return json.dumps(_error(f"Failed to load gateway config: {e}"))
-
-    platform_map = {
-        "telegram": Platform.TELEGRAM,
-        "discord": Platform.DISCORD,
-        "slack": Platform.SLACK,
-        "whatsapp": Platform.WHATSAPP,
-        "signal": Platform.SIGNAL,
-        "bluebubbles": Platform.BLUEBUBBLES,
-        "matrix": Platform.MATRIX,
-        "mattermost": Platform.MATTERMOST,
-        "homeassistant": Platform.HOMEASSISTANT,
-        "dingtalk": Platform.DINGTALK,
-        "feishu": Platform.FEISHU,
-        "wecom": Platform.WECOM,
-        "wecom_callback": Platform.WECOM_CALLBACK,
-        "weixin": Platform.WEIXIN,
-        "email": Platform.EMAIL,
-        "sms": Platform.SMS,
-    }
-    platform = platform_map.get(platform_name)
-    if not platform:
-        avail = ", ".join(platform_map.keys())
-        return tool_error(f"Unknown platform: {platform_name}. Available: {avail}")
-
-    pconfig = config.platforms.get(platform)
-    if not pconfig or not pconfig.enabled:
-        return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
-
     from gateway.platforms.base import BasePlatformAdapter
 
     media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
@@ -196,18 +232,30 @@ def _handle_send(args):
 
     try:
         from model_tools import _run_async
+        send_kwargs = {
+            "thread_id": thread_id,
+            "media_files": media_files,
+        }
+        if account_id:
+            send_kwargs["account_id"] = account_id
         result = _run_async(
             _send_to_platform(
                 platform,
                 pconfig,
                 chat_id,
                 cleaned_message,
-                thread_id=thread_id,
-                media_files=media_files,
+                **send_kwargs,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
+        if isinstance(result, dict) and result.get("success"):
+            _record_recent_successful_send(
+                platform_name,
+                chat_id,
+                thread_id=thread_id,
+                account_id=account_id,
+            )
 
         # Mirror the sent message into the target's gateway session
         if isinstance(result, dict) and result.get("success") and mirror_text:
@@ -227,6 +275,181 @@ def _handle_send(args):
         return json.dumps(_error(f"Send failed: {e}"))
 
 
+def _get_preferred_resolution_account_id(platform_name: str, *, config, platform_config) -> str | None:
+    """Infer a safe account preference for human-readable target resolution.
+
+    This is intentionally conservative. For Feishu, a tool call does not carry
+    chat-local account context, so the best available hint is the configured
+    home channel account. If no explicit account is encoded there, fall back to
+    the primary default account. The resolver still only auto-selects when that
+    preferred account yields one unique match.
+    """
+    if platform_name != "feishu" or config is None or platform_config is None:
+        return None
+
+    from gateway.config import Platform as GatewayPlatform
+
+    home_channel = config.get_home_channel(GatewayPlatform.FEISHU)
+    if home_channel and getattr(home_channel, "chat_id", None):
+        _, preferred_account_id = _split_feishu_account_target(str(home_channel.chat_id))
+        if preferred_account_id:
+            return preferred_account_id
+    return "default"
+
+
+def _get_preferred_resolution_target_ids(platform_name: str, *, config, platform_config) -> list[str]:
+    """Return explicit target IDs that should rank first during resolution."""
+    if platform_name != "feishu" or config is None or platform_config is None:
+        return []
+
+    from gateway.config import Platform as GatewayPlatform
+
+    preferred_target_ids: list[str] = []
+    home_channel = config.get_home_channel(GatewayPlatform.FEISHU)
+    if home_channel and getattr(home_channel, "chat_id", None):
+        target_id = str(home_channel.chat_id or "").strip()
+        if target_id:
+            preferred_target_ids.append(target_id)
+
+    for target_id in _load_recent_successful_target_ids(platform_name):
+        if target_id not in preferred_target_ids:
+            preferred_target_ids.append(target_id)
+    return preferred_target_ids
+
+
+def _normalize_recent_send_target_id(
+    platform_name: str,
+    chat_id: str,
+    *,
+    thread_id: str | None = None,
+    account_id: str | None = None,
+) -> str:
+    """Build a stable directory target ID for recently successful sends."""
+    normalized_chat_id = str(chat_id or "").strip()
+    normalized_account_id = str(account_id or "").strip()
+    normalized_thread_id = str(thread_id or "").strip()
+
+    if platform_name == "feishu" and "::" in normalized_chat_id and not normalized_account_id:
+        normalized_chat_id, normalized_account_id = _split_feishu_account_target(normalized_chat_id)
+        normalized_account_id = normalized_account_id or ""
+
+    if platform_name == "feishu" and normalized_account_id and normalized_account_id != "default":
+        normalized_chat_id = f"{normalized_account_id}::{normalized_chat_id}"
+    if normalized_thread_id:
+        return f"{normalized_chat_id}:{normalized_thread_id}"
+    return normalized_chat_id
+
+
+def _load_recent_successful_target_ids(platform_name: str, *, limit: int = 10) -> list[str]:
+    """Return the most recent successfully delivered targets for one platform."""
+    if not _RECENT_SEND_TARGETS_PATH.exists():
+        return []
+
+    try:
+        with open(_RECENT_SEND_TARGETS_PATH, encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:
+        logger.debug("send_message: failed to load recent target history: %s", exc)
+        return []
+
+    platform_entries = payload.get("platforms", {}).get(platform_name, [])
+    if not isinstance(platform_entries, list):
+        return []
+
+    ranked_entries: list[tuple[datetime, str]] = []
+    for item in platform_entries:
+        if not isinstance(item, dict):
+            continue
+        target_id = str(item.get("id", "") or "").strip()
+        updated_at_raw = str(item.get("updated_at", "") or "").strip()
+        if not target_id or not updated_at_raw:
+            continue
+        try:
+            ranked_entries.append((datetime.fromisoformat(updated_at_raw), target_id))
+        except ValueError:
+            continue
+
+    seen_ids: set[str] = set()
+    recent_ids: list[str] = []
+    for _, target_id in sorted(ranked_entries, reverse=True):
+        if target_id in seen_ids:
+            continue
+        seen_ids.add(target_id)
+        recent_ids.append(target_id)
+        if len(recent_ids) >= limit:
+            break
+    return recent_ids
+
+
+def _record_recent_successful_send(
+    platform_name: str,
+    chat_id: str,
+    *,
+    thread_id: str | None = None,
+    account_id: str | None = None,
+) -> None:
+    """Persist a stable recency signal for later channel-name resolution."""
+    target_id = _normalize_recent_send_target_id(
+        platform_name,
+        chat_id,
+        thread_id=thread_id,
+        account_id=account_id,
+    )
+    if not target_id:
+        return
+
+    try:
+        payload: dict[str, object] = {"platforms": {}}
+        if _RECENT_SEND_TARGETS_PATH.exists():
+            with open(_RECENT_SEND_TARGETS_PATH, encoding="utf-8") as f:
+                existing_payload = json.load(f)
+            if isinstance(existing_payload, dict):
+                payload = existing_payload
+
+        platforms = payload.setdefault("platforms", {})
+        if not isinstance(platforms, dict):
+            platforms = {}
+            payload["platforms"] = platforms
+
+        current_entries = platforms.get(platform_name, [])
+        normalized_entries = [
+            item
+            for item in current_entries
+            if isinstance(item, dict) and str(item.get("id", "") or "").strip() != target_id
+        ]
+        normalized_entries.append(
+            {
+                "id": target_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        normalized_entries.sort(key=lambda item: str(item.get("updated_at", "") or ""), reverse=True)
+        platforms[platform_name] = normalized_entries[:_RECENT_SEND_TARGET_LIMIT]
+        atomic_json_write(_RECENT_SEND_TARGETS_PATH, payload)
+    except Exception as exc:
+        logger.debug("send_message: failed to persist recent target history: %s", exc)
+
+
+def _format_resolution_suggestions_for_error(suggestions: list[dict]) -> str:
+    """Format ranked directory suggestions for tool-facing error messages."""
+    if not suggestions:
+        return ""
+
+    parts: list[str] = []
+    for item in suggestions:
+        label = str(item.get("label", "") or "").strip()
+        if not label:
+            continue
+        reason = str(item.get("reason", "") or "").strip()
+        if reason:
+            parts.append(f"{label} [{reason}]")
+        else:
+            parts.append(label)
+    if not parts:
+        return ""
+    return f" Candidates: {', '.join(parts)}."
+
+
 def _parse_target_ref(platform_name: str, target_ref: str):
     """Parse a tool target into chat_id/thread_id and whether it is explicit."""
     if platform_name == "telegram":
@@ -236,7 +459,11 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     if platform_name == "feishu":
         match = _FEISHU_TARGET_RE.fullmatch(target_ref)
         if match:
-            return match.group(1), match.group(2), True
+            account_id = str(match.group("account") or "").strip()
+            chat_id = str(match.group("target") or "").strip()
+            thread_id = str(match.group("thread") or "").strip() or None
+            encoded_chat_id = f"{account_id}::{chat_id}" if account_id else chat_id
+            return encoded_chat_id, thread_id, True
     if platform_name == "discord":
         match = _NUMERIC_TOPIC_RE.fullmatch(target_ref)
         if match:
@@ -248,6 +475,19 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     if target_ref.lstrip("-").isdigit():
         return target_ref, None, True
     return None, None, False
+
+
+def _split_feishu_account_target(chat_id: str):
+    """Split an account-qualified Feishu target into raw chat_id and account_id."""
+    value = str(chat_id or "").strip()
+    if "::" not in value:
+        return value, None
+    account_id, raw_chat_id = value.split("::", 1)
+    account_id = account_id.strip()
+    raw_chat_id = raw_chat_id.strip()
+    if not account_id or not raw_chat_id:
+        return value, None
+    return raw_chat_id, account_id
 
 
 def _describe_media_for_mirror(media_files):
@@ -314,7 +554,7 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, account_id=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -421,7 +661,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         elif platform == Platform.DINGTALK:
             result = await _send_dingtalk(pconfig.extra, chat_id, chunk)
         elif platform == Platform.FEISHU:
-            result = await _send_feishu(pconfig, chat_id, chunk, thread_id=thread_id)
+            result = await _send_feishu(pconfig, chat_id, chunk, thread_id=thread_id, account_id=account_id)
         elif platform == Platform.WECOM:
             result = await _send_wecom(pconfig.extra, chat_id, chunk)
         elif platform == Platform.BLUEBUBBLES:
@@ -968,7 +1208,7 @@ async def _send_bluebubbles(extra, chat_id, message):
         return _error(f"BlueBubbles send failed: {e}")
 
 
-async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=None):
+async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=None, account_id=None):
     """Send via Feishu/Lark using the adapter's send pipeline."""
     try:
         from gateway.platforms.feishu import FeishuAdapter, FEISHU_AVAILABLE
@@ -982,10 +1222,28 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
 
     try:
         adapter = FeishuAdapter(pconfig)
-        domain_name = getattr(adapter, "_domain_name", "feishu")
-        domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
-        adapter._client = adapter._build_lark_client(domain)
-        metadata = {"thread_id": thread_id} if thread_id else None
+        adapter._clients_by_account = {}
+        for feishu_account in adapter._accounts.values():
+            if not feishu_account.enabled:
+                continue
+            domain = FEISHU_DOMAIN if feishu_account.domain_name != "lark" else LARK_DOMAIN
+            if feishu_account.account_id == "default":
+                client = adapter._build_lark_client(domain)
+                adapter._client = client
+            else:
+                client = adapter._build_lark_client_for_account(feishu_account, domain)
+            adapter._clients_by_account[feishu_account.account_id] = client
+        if adapter._client is None:
+            domain_name = getattr(adapter, "_domain_name", "feishu")
+            domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
+            adapter._client = adapter._build_lark_client(domain)
+            adapter._clients_by_account.setdefault("default", adapter._client)
+        metadata = {}
+        if thread_id:
+            metadata["thread_id"] = thread_id
+        if account_id:
+            metadata["account_id"] = account_id
+        metadata = metadata or None
 
         last_result = None
         if message.strip():

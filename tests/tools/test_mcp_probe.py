@@ -96,7 +96,9 @@ class TestProbeMcpServerTools:
         mock_tool = SimpleNamespace(name="create_issue", description="Create")
         mock_server = MagicMock()
         mock_server._tools = [mock_tool]
-        mock_server.shutdown = AsyncMock()
+        async def _shutdown():
+            return None
+        mock_server.shutdown = _shutdown
 
         async def fake_connect(name, cfg):
             if name == "broken":
@@ -132,7 +134,9 @@ class TestProbeMcpServerTools:
 
         mock_server = MagicMock()
         mock_server._tools = [mock_tool]
-        mock_server.shutdown = AsyncMock()
+        async def _shutdown():
+            return None
+        mock_server.shutdown = _shutdown
 
         async def fake_connect(name, cfg):
             return mock_server
@@ -183,7 +187,9 @@ class TestProbeMcpServerTools:
         mock_tool = SimpleNamespace(name="create_issue", description="Create")
         mock_server = MagicMock()
         mock_server._tools = [mock_tool]
-        mock_server.shutdown = AsyncMock()
+        async def _shutdown():
+            return None
+        mock_server.shutdown = _shutdown
 
         connect_calls = []
 

@@ -16,6 +16,7 @@ Credit: jobless0x (#774, #1312), OutThisLife (#798), clicksingh (#697).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import queue
 import re
@@ -87,6 +88,14 @@ class GatewayStreamConsumer:
         self._flood_strikes = 0         # Consecutive flood-control edit failures
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
+
+    def _enter_fallback_final_mode(self) -> None:
+        """Stop progressive edits and send only the unseen tail at finish."""
+        logger.debug("Edit failed, disabling streaming for this adapter")
+        self._fallback_prefix = self._visible_prefix()
+        self._fallback_final_send = True
+        self._edit_supported = False
+        self._already_sent = True
 
     @property
     def already_sent(self) -> bool:
@@ -389,24 +398,15 @@ class GatewayStreamConsumer:
         last_successful_chunk = ""
         sent_any_chunk = False
         for chunk in chunks:
-            # Try sending with one retry on flood-control errors.
-            result = None
-            for attempt in range(2):
+            try:
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=chunk,
                     metadata=self.metadata,
                 )
-                if result.success:
-                    break
-                if attempt == 0 and self._is_flood_error(result):
-                    logger.debug(
-                        "Flood control on fallback send, retrying in 3s"
-                    )
-                    await asyncio.sleep(3.0)
-                else:
-                    break  # non-flood error or second attempt failed
-
+            except Exception as exc:
+                logger.error("Fallback final send error: %s", exc)
+                result = None
             if not result or not result.success:
                 if sent_any_chunk:
                     # Some continuation text already reached the user. Suppress
@@ -507,11 +507,14 @@ class GatewayStreamConsumer:
                     if text == self._last_sent_text:
                         return True
                     # Edit existing message
-                    result = await self.adapter.edit_message(
-                        chat_id=self.chat_id,
-                        message_id=self._message_id,
-                        content=text,
-                    )
+                    edit_kwargs = {
+                        "chat_id": self.chat_id,
+                        "message_id": self._message_id,
+                        "content": text,
+                    }
+                    if self._edit_supports_metadata():
+                        edit_kwargs["metadata"] = self.metadata
+                    result = await self.adapter.edit_message(**edit_kwargs)
                     if result.success:
                         self._already_sent = True
                         self._last_sent_text = text
@@ -589,4 +592,19 @@ class GatewayStreamConsumer:
                     return False
         except Exception as e:
             logger.error("Stream send/edit error: %s", e)
+            if self._message_id is not None and self._edit_supported:
+                self._enter_fallback_final_mode()
+                await self._try_strip_cursor()
             return False
+
+    def _edit_supports_metadata(self) -> bool:
+        """Return True when the adapter's edit_message accepts metadata."""
+        candidate = self.adapter.edit_message
+        side_effect = getattr(candidate, "side_effect", None)
+        if callable(side_effect):
+            candidate = side_effect
+        try:
+            signature = inspect.signature(candidate)
+        except (TypeError, ValueError):
+            return False
+        return "metadata" in signature.parameters
