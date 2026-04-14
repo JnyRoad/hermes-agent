@@ -639,6 +639,36 @@ def _summarize_tool_progress_names(lines: List[str], *, limit: int = 3) -> str:
     return ", ".join(parts)
 
 
+def _extract_feishu_error_code(value: Any) -> Optional[int]:
+    """Best-effort extraction for Feishu-style numeric error codes.
+
+    Reply APIs may surface withdrawn/missing targets either as structured SDK
+    responses or as raised exceptions. Normalizing both forms lets the adapter
+    reuse the same reply-to-chat fallback semantics across outbound paths.
+    """
+    if value is None:
+        return None
+
+    direct_code = getattr(value, "code", None)
+    if direct_code is not None:
+        try:
+            return int(direct_code)
+        except (TypeError, ValueError):
+            pass
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    match = re.search(r"(?:^|[\s\[(=:])(?P<code>\d{6})(?:$|[\s\]) ,:])", text)
+    if not match:
+        return None
+    try:
+        return int(match.group("code"))
+    except (TypeError, ValueError):
+        return None
+
+
 def _is_style_enabled(style: Dict[str, Any] | None, key: str) -> bool:
     if not style:
         return False
@@ -6659,7 +6689,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 # If replying to a message failed because it was withdrawn or not found,
                 # fall back to posting a new message directly to the chat.
                 if active_reply_to and not self._response_succeeded(response):
-                    code = getattr(response, "code", None)
+                    code = _extract_feishu_error_code(response)
                     if code in _FEISHU_REPLY_FALLBACK_CODES:
                         logger.warning(
                             "[Feishu] Reply to %s failed (code %s — message withdrawn/missing); "
@@ -6679,6 +6709,26 @@ class FeishuAdapter(BasePlatformAdapter):
                 return response
             except Exception as exc:
                 last_error = exc
+                fallback_code = _extract_feishu_error_code(exc)
+                if active_reply_to and fallback_code in _FEISHU_REPLY_FALLBACK_CODES:
+                    logger.warning(
+                        "[Feishu] Reply to %s raised a withdrawn/missing-target error (code %s); "
+                        "falling back to new message in chat %s",
+                        active_reply_to,
+                        fallback_code,
+                        chat_id,
+                    )
+                    try:
+                        return await self._send_raw_message(
+                            chat_id=chat_id,
+                            msg_type=msg_type,
+                            payload=payload,
+                            reply_to=None,
+                            metadata=metadata,
+                        )
+                    except Exception as fallback_exc:
+                        last_error = fallback_exc
+                        exc = fallback_exc
                 if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):
                     raise
                 if attempt >= _FEISHU_SEND_ATTEMPTS - 1:

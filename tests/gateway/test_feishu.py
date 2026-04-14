@@ -3195,6 +3195,53 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(sleeps, [])
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_send_falls_back_to_new_message_when_reply_raises_withdrawn_code(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"reply_attempts": 0, "create_attempts": 0}
+
+        class _MessageAPI:
+            def reply(self, request):
+                captured["reply_attempts"] += 1
+                raise RuntimeError("Feishu API error: code=230011 msg=message has been withdrawn")
+
+            def create(self, request):
+                captured["create_attempts"] += 1
+                captured["create_request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_fallback_from_exception"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="reply fallback",
+                    reply_to="om_parent",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_fallback_from_exception")
+        self.assertEqual(captured["reply_attempts"], 1)
+        self.assertEqual(captured["create_attempts"], 1)
+        self.assertEqual(captured["create_request"].request_body.receive_id, "oc_chat")
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_document_reply_uses_thread_flag(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -3248,6 +3295,68 @@ class TestAdapterBehavior(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertTrue(captured["request"].request_body.reply_in_thread)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_document_falls_back_to_new_message_when_reply_raises_withdrawn_code(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"reply_attempts": 0, "create_attempts": 0}
+
+        class _FileAPI:
+            def create(self, request):
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(file_key="file_123"),
+                )
+
+        class _MessageAPI:
+            def reply(self, request):
+                captured["reply_attempts"] += 1
+                raise RuntimeError("[231003] reply target not found")
+
+            def create(self, request):
+                captured["create_attempts"] += 1
+                captured["create_request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_file_fallback"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    file=_FileAPI(),
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with tempfile.NamedTemporaryFile("wb", suffix=".pdf", delete=False) as tmp:
+            tmp.write(b"%PDF-1.4 test")
+            file_path = tmp.name
+
+        try:
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                result = asyncio.run(
+                    adapter.send_document(
+                        chat_id="oc_chat",
+                        file_path=file_path,
+                        reply_to="om_parent",
+                    )
+                )
+        finally:
+            os.unlink(file_path)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_file_fallback")
+        self.assertEqual(captured["reply_attempts"], 1)
+        self.assertEqual(captured["create_attempts"], 1)
+        self.assertEqual(captured["create_request"].request_body.receive_id, "oc_chat")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_document_uploads_file_and_sends_file_message(self):
