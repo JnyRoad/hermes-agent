@@ -78,6 +78,14 @@ class GatewayStreamConsumer:
         self._fallback_final_send = False
         self._fallback_prefix = ""
 
+    def _enter_fallback_final_mode(self) -> None:
+        """Stop progressive edits and send only the unseen tail at finish."""
+        logger.debug("Edit failed, disabling streaming for this adapter")
+        self._fallback_prefix = self._visible_prefix()
+        self._fallback_final_send = True
+        self._edit_supported = False
+        self._already_sent = True
+
     @property
     def already_sent(self) -> bool:
         """True if at least one message was sent/edited — signals the base
@@ -340,11 +348,25 @@ class GatewayStreamConsumer:
         last_successful_chunk = ""
         sent_any_chunk = False
         for chunk in chunks:
-            result = await self.adapter.send(
-                chat_id=self.chat_id,
-                content=chunk,
-                metadata=self.metadata,
-            )
+            try:
+                result = await self.adapter.send(
+                    chat_id=self.chat_id,
+                    content=chunk,
+                    metadata=self.metadata,
+                )
+            except Exception as exc:
+                logger.error("Fallback final send error: %s", exc)
+                if sent_any_chunk:
+                    self._already_sent = True
+                    self._message_id = last_message_id
+                    self._last_sent_text = last_successful_chunk
+                    self._fallback_prefix = ""
+                    return
+                self._already_sent = False
+                self._message_id = None
+                self._last_sent_text = ""
+                self._fallback_prefix = ""
+                return
             if not result.success:
                 if sent_any_chunk:
                     # Some continuation text already reached the user. Suppress
@@ -401,11 +423,7 @@ class GatewayStreamConsumer:
                         # If an edit fails mid-stream (especially Telegram flood control),
                         # stop progressive edits and send only the missing tail once the
                         # final response is available.
-                        logger.debug("Edit failed, disabling streaming for this adapter")
-                        self._fallback_prefix = self._visible_prefix()
-                        self._fallback_final_send = True
-                        self._edit_supported = False
-                        self._already_sent = True
+                        self._enter_fallback_final_mode()
                 else:
                     # Editing not supported — skip intermediate updates.
                     # The final response will be sent by the fallback path.
@@ -437,6 +455,8 @@ class GatewayStreamConsumer:
                     self._edit_supported = False
         except Exception as e:
             logger.error("Stream send/edit error: %s", e)
+            if self._message_id is not None and self._edit_supported:
+                self._enter_fallback_final_mode()
 
     def _edit_supports_metadata(self) -> bool:
         """Return True when the adapter's edit_message accepts metadata."""
