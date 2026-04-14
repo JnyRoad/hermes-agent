@@ -4413,6 +4413,18 @@ class TestAdapterBehavior(unittest.TestCase):
             "If the quoted content is not enough, read nearby context with Feishu document tools before answering",
             context["prompt"],
         )
+        self.assertIn(
+            "If this is a reading task such as summarization, explanation, extraction, or translation",
+            context["prompt"],
+        )
+        self.assertIn(
+            "Keep the user-visible reply in the same language as the user's comment or reply",
+            context["prompt"],
+        )
+        self.assertIn(
+            "If the comment does not require any user-visible action, end your final response with NO_REPLY.",
+            context["prompt"],
+        )
 
     def test_resolve_comment_event_context_paginates_comments_until_target(self):
         from gateway.platforms.feishu import FeishuAdapter

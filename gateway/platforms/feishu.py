@@ -3615,7 +3615,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 "For requests like summarize, explain, rewrite, continue, review, or translate this section, treat the quoted content as the primary local scope instead of defaulting to the whole document.",
                 "If the quoted content is not enough, read nearby context with Feishu document tools before answering, and do not guess document content from the comment alone.",
                 "When document edits fail or you cannot locate the anchor, explain the failure clearly in the comment thread.",
-                "If you already reply through a dedicated tool, end your final response with NO_REPLY.",
+                "If this is a reading task such as summarization, explanation, extraction, or translation, you may directly output the final answer text after confirming the local context.",
+                "Keep the user-visible reply in the same language as the user's comment or reply unless they explicitly ask for another language.",
+                "If you already completed the user-visible response through a Feishu comment tool, end your final response with NO_REPLY to avoid a duplicate automatic reply.",
+                "If the comment does not require any user-visible action, end your final response with NO_REPLY.",
             ]
         )
         preview_document_label = document_title or f"{file_type}:{file_token}"
