@@ -128,6 +128,27 @@ class TestSendOrEditMediaStripping:
         assert "MEDIA:" not in edited_text
 
     @pytest.mark.asyncio
+    async def test_edit_forwards_metadata_when_adapter_supports_it(self):
+        """Streaming edits must preserve adapter metadata for thread/account-aware platforms."""
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="msg_1")
+        edit_result = SimpleNamespace(success=True)
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        async def _edit_message(*, chat_id, message_id, content, metadata=None):
+            return edit_result
+
+        adapter.edit_message = AsyncMock(side_effect=_edit_message)
+
+        metadata = {"thread_id": "omt-thread", "account_id": "feishu-cn"}
+        consumer = GatewayStreamConsumer(adapter, "chat_123", metadata=metadata)
+        await consumer._send_or_edit("Starting response...")
+        await consumer._send_or_edit("Updated response")
+
+        assert adapter.edit_message.call_args.kwargs["metadata"] == metadata
+
+    @pytest.mark.asyncio
     async def test_media_only_skips_send(self):
         """If text is entirely MEDIA: tags, the send is skipped."""
         adapter = MagicMock()

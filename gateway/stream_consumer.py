@@ -16,6 +16,7 @@ Credit: jobless0x (#774, #1312), OutThisLife (#798), clicksingh (#697).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import queue
 import re
@@ -385,11 +386,14 @@ class GatewayStreamConsumer:
                     if text == self._last_sent_text:
                         return
                     # Edit existing message
-                    result = await self.adapter.edit_message(
-                        chat_id=self.chat_id,
-                        message_id=self._message_id,
-                        content=text,
-                    )
+                    edit_kwargs = {
+                        "chat_id": self.chat_id,
+                        "message_id": self._message_id,
+                        "content": text,
+                    }
+                    if self._edit_supports_metadata():
+                        edit_kwargs["metadata"] = self.metadata
+                    result = await self.adapter.edit_message(**edit_kwargs)
                     if result.success:
                         self._already_sent = True
                         self._last_sent_text = text
@@ -433,3 +437,15 @@ class GatewayStreamConsumer:
                     self._edit_supported = False
         except Exception as e:
             logger.error("Stream send/edit error: %s", e)
+
+    def _edit_supports_metadata(self) -> bool:
+        """Return True when the adapter's edit_message accepts metadata."""
+        candidate = self.adapter.edit_message
+        side_effect = getattr(candidate, "side_effect", None)
+        if callable(side_effect):
+            candidate = side_effect
+        try:
+            signature = inspect.signature(candidate)
+        except (TypeError, ValueError):
+            return False
+        return "metadata" in signature.parameters
