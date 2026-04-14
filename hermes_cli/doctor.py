@@ -162,6 +162,7 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
     """汇总飞书集成诊断结果，供 CLI doctor 与网关命令复用。"""
     items: list[dict[str, str]] = []
     issues: list[str] = []
+    resolved_account_id = str(account_id or "").strip() or None
 
     def _record(status: str, label: str, detail: str = "") -> None:
         items.append({"status": status, "label": label, "detail": detail})
@@ -335,17 +336,66 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
         include_live_groups = raw_directory_settings.get("include_live_groups")
         live_limit = raw_directory_settings.get("live_limit", 50)
         live_page_size = raw_directory_settings.get("live_page_size", 50)
+        global_directory_detail = (
+            f"config_users={include_config_users if include_config_users is not None else 'default'} "
+            f"config_groups={include_config_groups if include_config_groups is not None else 'default'} "
+            f"users={include_live_users if include_live_users is not None else 'default'} "
+            f"groups={include_live_groups if include_live_groups is not None else 'default'} "
+            f"limit={live_limit} page_size={live_page_size}"
+        )
         _record(
             "info",
             "Feishu directory settings",
-            (
-                f"config_users={include_config_users if include_config_users is not None else 'default'} "
-                f"config_groups={include_config_groups if include_config_groups is not None else 'default'} "
-                f"users={include_live_users if include_live_users is not None else 'default'} "
-                f"groups={include_live_groups if include_live_groups is not None else 'default'} "
-                f"limit={live_limit} page_size={live_page_size}"
-            ),
+            global_directory_detail,
         )
+        if adapter is not None and hasattr(adapter, "_get_account_live_directory_settings"):
+            inspected_accounts: list[str] = []
+            if resolved_account_id:
+                inspected_accounts.append(resolved_account_id)
+            else:
+                inspected_accounts.append("default")
+                inspected_accounts.extend(
+                    item["account_id"]
+                    for item in enabled_accounts
+                    if item.get("account_id") and item["account_id"] != "default"
+                )
+            seen_accounts: set[str] = set()
+            for inspected_account in inspected_accounts:
+                normalized_account = str(inspected_account or "default").strip() or "default"
+                if normalized_account in seen_accounts:
+                    continue
+                seen_accounts.add(normalized_account)
+                try:
+                    account_settings = adapter._get_account_live_directory_settings(normalized_account) or {}
+                except Exception as exc:
+                    _record(
+                        "warn",
+                        f"Feishu directory policy ({normalized_account}) unavailable",
+                        str(exc),
+                    )
+                    continue
+                config_users = bool(account_settings.get("include_config_users"))
+                config_groups = bool(account_settings.get("include_config_groups"))
+                live_users = bool(account_settings.get("include_live_users"))
+                live_groups = bool(account_settings.get("include_live_groups"))
+                account_detail = (
+                    f"config_users={str(config_users).lower()} "
+                    f"config_groups={str(config_groups).lower()} "
+                    f"users={str(live_users).lower()} "
+                    f"groups={str(live_groups).lower()} "
+                    f"limit={account_settings.get('live_limit', live_limit)} "
+                    f"page_size={account_settings.get('live_page_size', live_page_size)}"
+                )
+                _record("info", f"Feishu directory policy ({normalized_account})", account_detail)
+                if not any([config_users, config_groups, live_users, live_groups]):
+                    _record(
+                        "warn",
+                        f"Feishu directory disabled for account ({normalized_account})",
+                        "no config-based or live directory sources are enabled",
+                    )
+                    issues.append(
+                        f"Enable at least one Feishu directory source for account `{normalized_account}`"
+                    )
 
         directory = load_directory()
         feishu_entries = directory.get("platforms", {}).get("feishu", []) or []
@@ -435,7 +485,6 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
         else:
             _record("ok", "Feishu required app scopes configured")
 
-        resolved_account_id = str(account_id or "").strip() or None
         app_info = get_app_info(account_id=resolved_account_id)
         owner_open_id = str(app_info.get("effective_owner_open_id", "") or "").strip()
         if owner_open_id:

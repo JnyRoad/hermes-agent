@@ -649,6 +649,24 @@ class TestFeishuDoctorChecks:
         report = doctor.collect_feishu_doctor_report(
             user_open_id="ou_owner",
             adapter=SimpleNamespace(
+                _get_account_live_directory_settings=lambda account_id: {
+                    "default": {
+                        "include_config_users": True,
+                        "include_config_groups": False,
+                        "include_live_users": False,
+                        "include_live_groups": True,
+                        "live_limit": 12,
+                        "live_page_size": 6,
+                    },
+                    "feishu-cn": {
+                        "include_config_users": False,
+                        "include_config_groups": True,
+                        "include_live_users": True,
+                        "include_live_groups": False,
+                        "live_limit": 20,
+                        "live_page_size": 10,
+                    },
+                }[account_id],
                 search_channel_directory_entries=lambda *args, **kwargs: [],
                 get_transport_account_status=lambda: [
                     {
@@ -673,6 +691,11 @@ class TestFeishuDoctorChecks:
         assert any(
             item["label"] == "Feishu directory settings"
             and "config_users=True config_groups=False users=False groups=True limit=12 page_size=6" in item["detail"]
+            for item in report["items"]
+        )
+        assert any(
+            item["label"] == "Feishu directory policy (feishu-cn)"
+            and "config_users=false config_groups=true users=true groups=false limit=20 page_size=10" in item["detail"]
             for item in report["items"]
         )
         assert any(
@@ -742,6 +765,58 @@ class TestFeishuDoctorChecks:
         assert any(item["label"] == "Multi-account websocket routing enabled" for item in report["items"])
         assert not any(item["label"] == "Multi-account websocket support incomplete" for item in report["items"])
         assert not any("Use webhook mode for multi-account Feishu" in issue for issue in report["issues"])
+
+    def test_collect_report_warns_when_directory_disabled_for_account(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes",
+            lambda: ["application:application:self_manage", "offline_access"],
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_info",
+            lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes_by_token_type",
+            lambda token_type, account_id=None: [],
+        )
+        monkeypatch.setattr(
+            "gateway.channel_directory.load_directory",
+            lambda: {"updated_at": "2026-01-01T00:00:00", "platforms": {"feishu": []}},
+        )
+
+        report = doctor.collect_feishu_doctor_report(
+            user_open_id="ou_owner",
+            adapter=SimpleNamespace(
+                _get_account_live_directory_settings=lambda account_id: {
+                    "include_config_users": False,
+                    "include_config_groups": False,
+                    "include_live_users": False,
+                    "include_live_groups": False,
+                    "live_limit": 50,
+                    "live_page_size": 50,
+                }
+            ),
+            account_id="feishu-cn",
+        )
+
+        assert any(item["label"] == "Feishu directory policy (feishu-cn)" for item in report["items"])
+        assert any(item["label"] == "Feishu directory disabled for account (feishu-cn)" for item in report["items"])
+        assert any("Enable at least one Feishu directory source for account `feishu-cn`" in issue for issue in report["issues"])
 
 
 def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):
