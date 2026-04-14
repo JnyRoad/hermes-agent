@@ -3503,6 +3503,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 f"file_token: {file_token}\n"
                 f"file_type: {file_type}\n"
                 f"comment_id: {comment_id}\n"
+                f"Primary document tools: feishu_fetch_doc(file_token={file_token}, file_type={file_type}), "
+                f"feishu_doc_comments(file_token={file_token}, file_type={file_type}), "
+                f"feishu_update_doc(file_token={file_token}).\n"
                 "Reply in the current comment thread.\n"
                 "If you already reply through a dedicated tool, end your final response with NO_REPLY."
             )
@@ -3606,6 +3609,22 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         if reply_id:
             prompt_lines.append(f"reply_id: {reply_id}")
+        prompt_lines.extend(
+            [
+                (
+                    f"Primary document target: file_token={file_token}, file_type={file_type}. "
+                    f"Use feishu_fetch_doc with this target to read the document."
+                ),
+                (
+                    f"If you need the comment thread, use feishu_doc_comments with "
+                    f"file_token={file_token} and file_type={file_type}."
+                ),
+                (
+                    f"If the request requires editing document content, use feishu_update_doc "
+                    f"against file_token={file_token} before replying."
+                ),
+            ]
+        )
         prompt_lines.extend(
             [
                 "This is a Feishu document comment-thread event, not a Feishu IM conversation. Your final text reply will be posted automatically to the current comment thread.",

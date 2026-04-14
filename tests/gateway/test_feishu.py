@@ -4418,11 +4418,45 @@ class TestAdapterBehavior(unittest.TestCase):
             context["prompt"],
         )
         self.assertIn(
+            "Primary document target: file_token=doc_token, file_type=docx. Use feishu_fetch_doc with this target to read the document.",
+            context["prompt"],
+        )
+        self.assertIn(
+            "If you need the comment thread, use feishu_doc_comments with file_token=doc_token and file_type=docx.",
+            context["prompt"],
+        )
+        self.assertIn(
+            "If the request requires editing document content, use feishu_update_doc against file_token=doc_token before replying.",
+            context["prompt"],
+        )
+        self.assertIn(
             "Keep the user-visible reply in the same language as the user's comment or reply",
             context["prompt"],
         )
         self.assertIn(
             "If the comment does not require any user-visible action, end your final response with NO_REPLY.",
+            context["prompt"],
+        )
+
+    def test_resolve_comment_event_context_fallback_includes_primary_tool_targets(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        responses = [
+            {"data": {"metas": [{"title": "Project Spec"}]}},
+            {"data": {"items": [], "has_more": False, "page_token": ""}},
+        ]
+
+        with patch("tools.feishu.client.feishu_api_request", side_effect=responses):
+            context = FeishuAdapter._resolve_comment_event_context(
+                file_token="doc_token",
+                file_type="docx",
+                comment_id="comment_missing",
+            )
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertIn(
+            "Primary document tools: feishu_fetch_doc(file_token=doc_token, file_type=docx), feishu_doc_comments(file_token=doc_token, file_type=docx), feishu_update_doc(file_token=doc_token).",
             context["prompt"],
         )
 
