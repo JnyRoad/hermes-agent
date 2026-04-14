@@ -3129,6 +3129,23 @@ def test_feishu_scope_mapping_matches_official_granularity():
 
     assert get_required_scopes("feishu_calendar_event", "delete") == ["calendar:calendar.event:delete"]
     assert get_required_scopes("feishu_drive_file", "delete") == ["space:document:delete"]
+    assert get_required_scopes("feishu_doc_comments", "reply") == ["wiki:node:read", "docs:document.comment:create"]
+    assert get_required_scopes("feishu_doc_media", "insert") == ["docx:document:write_only", "docs:document.media:upload"]
+    assert get_required_scopes("feishu_fetch_doc", "default") == ["docx:document:readonly", "wiki:node:read"]
+    assert "docx:document:create" in get_required_scopes("feishu_create_doc", "default")
+    assert get_required_scopes("feishu_wiki_space_node", "move") == ["wiki:node:move"]
+    assert get_required_scopes("feishu_sheet", "write") == [
+        "sheets:spreadsheet.meta:read",
+        "sheets:spreadsheet:read",
+        "sheets:spreadsheet:create",
+        "sheets:spreadsheet:write_only",
+    ]
+    assert get_required_scopes("feishu_sheet", "export") == ["docs:document:export"]
+    assert get_required_scopes("feishu_bitable_app", "copy") == ["base:app:copy"]
+    assert get_required_scopes("feishu_bitable_app_table", "batch_create") == ["base:table:create"]
+    assert get_required_scopes("feishu_bitable_app_table_field", "update") == ["base:field:read", "base:field:update"]
+    assert get_required_scopes("feishu_bitable_app_table_view", "patch") == ["base:view:write_only"]
+    assert get_required_scopes("feishu_bitable_app_table_record", "batch_delete") == ["base:record:delete"]
     assert get_required_scopes("feishu_im_user_message", "send") == ["im:message", "im:message.send_as_user"]
     assert "search:message" in get_required_scopes("feishu_im_user_search_messages", "default")
 
