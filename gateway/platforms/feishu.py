@@ -721,9 +721,12 @@ def _render_code_block_element(element: Dict[str, Any]) -> str:
 
 def _strip_markdown_to_plain_text(text: str) -> str:
     plain = text.replace("\r\n", "\n")
+    plain = re.sub(r"\\([\\`*_{}\[\]()#+\-!|>~])", r"\1", plain)
     plain = _MARKDOWN_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2).strip()})", plain)
     plain = re.sub(r"^#{1,6}\s+", "", plain, flags=re.MULTILINE)
     plain = re.sub(r"^>\s?", "", plain, flags=re.MULTILINE)
+    plain = re.sub(r"^\s*[-*]\s+", "", plain, flags=re.MULTILINE)
+    plain = re.sub(r"^\s*\d+\.\s+", "", plain, flags=re.MULTILINE)
     plain = re.sub(r"^\s*---+\s*$", "---", plain, flags=re.MULTILINE)
     plain = re.sub(r"```(?:[^\n]*\n)?([\s\S]*?)```", lambda m: m.group(1).strip("\n"), plain)
     plain = re.sub(r"`([^`\n]+)`", r"\1", plain)
@@ -732,7 +735,7 @@ def _strip_markdown_to_plain_text(text: str) -> str:
     plain = re.sub(r"~~([^~\n]+)~~", r"\1", plain)
     plain = re.sub(r"<u>([\s\S]*?)</u>", r"\1", plain)
     plain = re.sub(r"\n{3,}", "\n\n", plain)
-    return plain.strip()
+    return _WHITESPACE_RE.sub(" ", plain).strip()
 
 
 def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -> Optional[int]:
@@ -6289,12 +6292,16 @@ class FeishuAdapter(BasePlatformAdapter):
             raise RuntimeError("Not connected")
         comment_target = self._parse_comment_target(chat_id)
         if comment_target is not None:
-            text_payload = payload
-            if msg_type == "text":
-                try:
-                    text_payload = json.loads(payload).get("text", "")
-                except Exception:
-                    text_payload = payload
+            normalized_comment_content = normalize_feishu_message(
+                message_type=msg_type,
+                raw_content=payload,
+            )
+            text_payload = _strip_markdown_to_plain_text(normalized_comment_content.text_content)
+            if not text_payload:
+                text_payload = str(
+                    (normalized_comment_content.metadata or {}).get("placeholder_text")
+                    or payload
+                )
             return await self._send_comment_message(
                 comment_target=comment_target,
                 content=str(text_payload or ""),

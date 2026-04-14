@@ -4084,6 +4084,44 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_send_comment_target_extracts_plain_text_from_post_payload(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"reply_mode": "card"}))
+        adapter._client = object()
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("tools.feishu.client.feishu_api_request", return_value={"data": {}}) as api_request, patch(
+            "gateway.platforms.feishu.asyncio.to_thread",
+            side_effect=_direct,
+        ):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="feishu-comment://docx/doc_token/comment_123",
+                    content="## Summary\n- Item one\n- Item two",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            api_request.call_args.args[:2],
+            ("POST", "/open-apis/drive/v1/files/doc_token/comments/comment_123/replies"),
+        )
+        sent_elements = api_request.call_args.kwargs["json_body"]["content"]["elements"]
+        self.assertEqual(
+            sent_elements,
+            [
+                {
+                    "type": "text_run",
+                    "text_run": {"text": "Summary Item one Item two"},
+                }
+            ],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_comment_target_routes_by_account_metadata(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
