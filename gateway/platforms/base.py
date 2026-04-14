@@ -20,6 +20,8 @@ from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
+_SILENT_REPLY_TOKEN_PATTERN = re.compile(r"(?:^|\n)\s*NO_REPLY\s*$")
+
 
 def is_network_accessible(host: str) -> bool:
     """Return True if *host* would expose the server beyond loopback.
@@ -232,6 +234,17 @@ def safe_url_for_log(url: str, max_len: int = 80) -> str:
     if max_len <= 3:
         return "." * max_len
     return f"{safe[:max_len - 3]}..."
+
+
+def has_silent_reply_token(response: Any) -> bool:
+    """Return True when the response ends with the control token ``NO_REPLY``.
+
+    The token must appear as a standalone final line so normal user-visible
+    text that merely mentions ``NO_REPLY`` is not suppressed.
+    """
+    if not isinstance(response, str):
+        return False
+    return bool(_SILENT_REPLY_TOKEN_PATTERN.search(response.strip()))
 
 
 async def _ssrf_redirect_guard(response):
@@ -1553,11 +1566,18 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
-            
+
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or
             # when the message was queued behind an active agent.  Log at
             # DEBUG to avoid noisy warnings for expected behavior.
+            if has_silent_reply_token(response):
+                logger.info(
+                    "[%s] Suppressing automatic reply for %s due to NO_REPLY terminal token",
+                    self.name,
+                    event.source.chat_id,
+                )
+                response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
