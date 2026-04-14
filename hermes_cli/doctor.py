@@ -445,6 +445,13 @@ def collect_feishu_doctor_report(*, user_open_id: str | None = None, adapter=Non
 
         granted_user_scopes = list(get_app_granted_scopes_by_token_type("user", account_id=resolved_account_id))
         _record("info", f"Feishu user scopes granted: {len(granted_user_scopes)}")
+        if not granted_user_scopes:
+            _record(
+                "warn",
+                "Feishu user scopes not granted to app yet",
+                "batch authorization cannot proceed until the app is granted user-token scopes",
+            )
+            issues.append("Grant the required Feishu user scopes first, then retry `/feishu auth batch`")
         if granted_scopes and "offline_access" not in set(granted_scopes):
             _record(
                 "warn",

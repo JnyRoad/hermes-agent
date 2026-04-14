@@ -528,6 +528,42 @@ class TestFeishuDoctorChecks:
         assert any(item["label"] == "Feishu OAuth prerequisite missing" for item in report["items"])
         assert any("offline_access" in issue for issue in report["issues"])
 
+    def test_collect_report_warns_when_app_has_no_granted_user_scopes(self, monkeypatch):
+        cfg = GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_id": "cli_aid",
+                        "app_secret": "cli_secret",
+                        "connection_mode": "webhook",
+                        "domain": "feishu",
+                    },
+                )
+            }
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+        monkeypatch.setitem(sys.modules, "lark_oapi", types.SimpleNamespace())
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes",
+            lambda: ["application:application:self_manage", "offline_access"],
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_info",
+            lambda account_id=None: {"effective_owner_open_id": "ou_owner"},
+        )
+        monkeypatch.setattr(
+            "tools.feishu.client.get_app_granted_scopes_by_token_type",
+            lambda token_type, account_id=None: ["application:application:self_manage", "offline_access"]
+            if token_type is None
+            else [],
+        )
+
+        report = doctor.collect_feishu_doctor_report(user_open_id="ou_owner", account_id="feishu-cn")
+
+        assert any(item["label"] == "Feishu user scopes not granted to app yet" for item in report["items"])
+        assert any("Grant the required Feishu user scopes first" in issue for issue in report["issues"])
+
     def test_collect_report_warns_missing_required_app_scopes(self, monkeypatch):
         cfg = GatewayConfig(
             platforms={
