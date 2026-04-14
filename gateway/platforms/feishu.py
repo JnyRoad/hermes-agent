@@ -1981,6 +1981,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if not client:
             return SendResult(success=False, error="Not connected")
 
+        msg_type = "text"
         try:
             msg_type, payload = self._build_outbound_payload(content)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
@@ -2000,6 +2001,21 @@ class FeishuAdapter(BasePlatformAdapter):
                 result.message_id = message_id
             return result
         except Exception as exc:
+            if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc) or ""):
+                logger.warning("[Feishu] Post update raised invalid payload error; falling back to plain text")
+                try:
+                    fallback_body = self._build_update_message_body(
+                        msg_type="text",
+                        content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
+                    )
+                    fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
+                    fallback_response = await asyncio.to_thread(client.im.v1.message.update, fallback_request)
+                    fallback_result = self._finalize_send_result(fallback_response, "update failed")
+                    if fallback_result.success:
+                        fallback_result.message_id = message_id
+                    return fallback_result
+                except Exception as fallback_exc:
+                    exc = fallback_exc
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
