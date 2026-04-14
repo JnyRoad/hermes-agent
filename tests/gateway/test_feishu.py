@@ -4698,6 +4698,27 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertIn("_Some tool steps need attention before the request is fully complete._", rendered)
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_feishu_tool_progress_summary_counts_full_trace_when_visible_window_is_truncated(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        progress_lines = [
+            *[f'✅ feishu_fetch_doc: "completed {index}"' for index in range(5)],
+            *[f'⏳ feishu_doc_update: "running {index}"' for index in range(4)],
+            *[f'❌ feishu_doc_comment: "failed {index}"' for index in range(4)],
+        ]
+
+        rendered = adapter.format_tool_progress_content(progress_lines)
+
+        self.assertIn("_Summary: 13 steps, 4 running, 5 completed, 4 need attention._", rendered)
+        self.assertIn("_Showing the most recent 12 steps._", rendered)
+        self.assertIn('_Active tools: feishu_doc_update ×4._', rendered)
+        self.assertIn('_Needs attention: feishu_doc_comment ×4._', rendered)
+        self.assertNotIn('- ✅ feishu_fetch_doc: "completed 0"', rendered)
+        self.assertIn('- ✅ feishu_fetch_doc: "completed 1"', rendered)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_feishu_tool_progress_summary_mentions_recent_window(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -4708,7 +4729,7 @@ class TestAdapterBehavior(unittest.TestCase):
             [f'⏳ tool_{index}: "step"' for index in range(15)]
         )
 
-        self.assertIn("_Summary: 15 steps, 12 running, 0 completed, 0 need attention._", rendered)
+        self.assertIn("_Summary: 15 steps, 15 running, 0 completed, 0 need attention._", rendered)
         self.assertIn("_Active tools: tool_10, tool_11, tool_12._", rendered)
         self.assertIn("_Showing the most recent 12 steps._", rendered)
         self.assertNotIn('- ⏳ tool_0: "step"', rendered)

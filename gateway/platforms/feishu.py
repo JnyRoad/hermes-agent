@@ -6120,10 +6120,18 @@ class FeishuAdapter(BasePlatformAdapter):
             "completed": [],
             "failed": [],
         }
+        visible_grouped_lines: Dict[str, List[str]] = {
+            "running": [],
+            "completed": [],
+            "failed": [],
+        }
         visible_lines = cleaned_lines[-12:]
-        for line in visible_lines:
+        for line in cleaned_lines:
             status, normalized_line = _classify_tool_progress_line(line)
             grouped_lines.setdefault(status, []).append(normalized_line)
+        for line in visible_lines:
+            status, normalized_line = _classify_tool_progress_line(line)
+            visible_grouped_lines.setdefault(status, []).append(normalized_line)
 
         overall_status = "recent activity"
         if grouped_lines["running"]:
@@ -6143,26 +6151,26 @@ class FeishuAdapter(BasePlatformAdapter):
                 f"{len(grouped_lines['failed'])} need attention._"
             )
         )
-        active_tool_summary = _summarize_tool_progress_names(grouped_lines["running"])
+        active_tool_summary = _summarize_tool_progress_names(visible_grouped_lines["running"])
         if active_tool_summary:
             rendered_lines.append(f"_Active tools: {active_tool_summary}._")
-        attention_tool_summary = _summarize_tool_progress_names(grouped_lines["failed"])
+        attention_tool_summary = _summarize_tool_progress_names(visible_grouped_lines["failed"])
         if attention_tool_summary:
             rendered_lines.append(f"_Needs attention: {attention_tool_summary}._")
         if total_steps > len(visible_lines):
             rendered_lines.append(f"_Showing the most recent {len(visible_lines)} steps._")
         rendered_lines.append("")
-        if grouped_lines["running"]:
+        if visible_grouped_lines["running"]:
             rendered_lines.append("**Running**")
-            rendered_lines.extend(f"- {line}" for line in grouped_lines["running"])
+            rendered_lines.extend(f"- {line}" for line in visible_grouped_lines["running"])
             rendered_lines.append("")
-        if grouped_lines["completed"]:
+        if visible_grouped_lines["completed"]:
             rendered_lines.append("**Completed**")
-            rendered_lines.extend(f"- {line}" for line in grouped_lines["completed"])
+            rendered_lines.extend(f"- {line}" for line in visible_grouped_lines["completed"])
             rendered_lines.append("")
-        if grouped_lines["failed"]:
+        if visible_grouped_lines["failed"]:
             rendered_lines.append("**Needs Attention**")
-            rendered_lines.extend(f"- {line}" for line in grouped_lines["failed"])
+            rendered_lines.extend(f"- {line}" for line in visible_grouped_lines["failed"])
             rendered_lines.append("")
         if grouped_lines["running"]:
             rendered_lines.append("_Running tools for this request..._")
